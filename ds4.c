@@ -2339,7 +2339,7 @@ static const gguf_type_info gguf_types[] = {
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
     [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2365,6 +2365,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ4_NL   = 20,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
@@ -2795,10 +2796,19 @@ static void model_unmap_engram(ds4_model *m) {
     m->size = start;
 }
 
+/* A main-only Qwen GGUF can read an IQ4_NL n-gram table from a second GGUF,
+ * such as shard 2 of ISTA-DASLab's GSQ-RCO release, named by
+ * DS4_QWEN_NGRAM_GGUF. That file is opened once and keeps only its header
+ * mapped. */
+static ds4_model g_qwen_ngram_sidecar;
+static bool g_qwen_ngram_sidecar_opening;
+static void model_attach_qwen_ngram_sidecar(ds4_model *m);
+
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
  * prevents warming or a future whole-model GPU view from faulting it in. */
 static void model_unmap_qwen_ngrams(ds4_model *m, const char *path) {
     ds4_str arch = {0};
+    if (g_qwen_ngram_sidecar_opening) return;
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "qwen4exp")) return;
     const ds4_tensor *table = NULL;
@@ -2900,6 +2910,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
     model_unmap_engram(m);
     model_unmap_qwen_ngrams(m, path);
+    model_attach_qwen_ngram_sidecar(m);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -3246,6 +3257,38 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
         }
     }
     return NULL;
+}
+
+static void model_attach_qwen_ngram_sidecar(ds4_model *m) {
+    const char *path = getenv("DS4_QWEN_NGRAM_GGUF");
+    ds4_str arch = {0};
+    if (!path || !*path || m->ngram_tensor || g_qwen_ngram_sidecar_opening ||
+        !model_get_string(m, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen4exp")) return;
+    ds4_model *s = &g_qwen_ngram_sidecar;
+    if (!s->tensors) {
+        g_qwen_ngram_sidecar_opening = true;
+        model_open(s, path, false, false);
+        g_qwen_ngram_sidecar_opening = false;
+        const ds4_tensor *t = model_find_tensor(s, "per_layer_token_embd.weight");
+        if (!t || t->type != DS4_TENSOR_IQ4_NL || t->ndim != 2 ||
+            !t->dim[0] || t->dim[0] > 160 || t->dim[0] % 32 || !t->dim[1] || t->dim[1] > UINT32_MAX)
+            ds4_die("DS4_QWEN_NGRAM_GGUF needs an IQ4_NL per_layer_token_embd table");
+        const long page = sysconf(_SC_PAGESIZE);
+        const uint64_t keep = (t->abs_offset + (uint64_t)page - 1) / (uint64_t)page * (uint64_t)page;
+        if (page <= 0) ds4_die("cannot read the page size");
+        if (keep < s->size && munmap((void *)(s->map + keep), (size_t)(s->size - keep)))
+            ds4_die_errno("cannot unmap disk-only n-grams", path);
+        if (keep < s->size) s->size = keep;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) ds4_die_errno("cannot open n-gram table", path);
+#ifdef __APPLE__
+    if (fcntl(fd, F_NOCACHE, 1) || fcntl(fd, F_RDAHEAD, 0))
+        ds4_die_errno("cannot configure n-gram disk reads", path);
+#endif
+    m->ngram_fd = fd;
+    m->ngram_tensor = model_find_tensor(s, "per_layer_token_embd.weight");
 }
 
 static const char *support_kind_name(ds4_support_kind kind) {
@@ -5532,8 +5575,8 @@ static void weights_validate_qwen4_layout(
         ds4_die("Qwen GGUF lacks its n-grams; repack with gguf-tools/qwen4_native_ngrams.py");
     if (w->ple_embd) {
         const uint32_t t = w->ple_embd->type;
-        if (t != DS4_TENSOR_BF16) {
-            fprintf(stderr, "ds4: n-gram embeddings must use original BF16, got type %u\n", t);
+        if (t != DS4_TENSOR_BF16 && t != DS4_TENSOR_IQ4_NL) {
+            fprintf(stderr, "ds4: n-gram embeddings must use BF16 or IQ4_NL, got type %u\n", t);
             exit(1);
         }
         if (w->ple_embd->ndim != 2 || w->ple_embd->dim[0] != DS4_N_PLE_HEAD_DIM ||
@@ -7933,6 +7976,7 @@ static void weights_bind(
     }
     if (ds4_model_is_qwen4()) {
         w->ple_embd = model_find_tensor(m, "per_layer_token_embd.weight");
+        if (!w->ple_embd) w->ple_embd = (ds4_tensor *)m->ngram_tensor;
     }
     weights_bind_output(w, m, require_output, optional_output);
 
@@ -57344,15 +57388,34 @@ static int generate_glm_metal_argmax(
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out);
 static void qwen4_ple_step(int token, int *prev, uint32_t *rows);
 
+/* IQ4_NL: blocks of 32 values, an F16 scale and 16 bytes of nibbles that
+ * index this table (low nibbles are values 0-15, high nibbles 16-31). */
+static const int8_t qwen4_iq4_nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+static void qwen4_ngram_iq4_nl_row(const uint8_t *raw, uint32_t width, float *out) {
+    for (uint32_t b = 0; b < width / 32u; b++) {
+        const uint8_t *block = raw + b * 18u;
+        const float d = f16_to_f32((uint16_t)(block[0] | (block[1] << 8)));
+        for (uint32_t j = 0; j < 16; j++) {
+            out[b * 32u + j] = d * (float)qwen4_iq4_nl_values[block[2 + j] & 15u];
+            out[b * 32u + j + 16u] = d * (float)qwen4_iq4_nl_values[block[2 + j] >> 4];
+        }
+    }
+}
+
 static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
     const ds4_tensor *t = m->ngram_tensor;
+    const bool iq4_nl = t && t->type == DS4_TENSOR_IQ4_NL;
     if (!t || m->ngram_fd < 0 || !out || row >= t->dim[1] ||
-        t->type != DS4_TENSOR_BF16 || !t->dim[0] || t->dim[0] > 160) {
+        (t->type != DS4_TENSOR_BF16 && !iq4_nl) || !t->dim[0] || t->dim[0] > 160 ||
+        (iq4_nl && t->dim[0] % 32)) {
         errno = EINVAL;
         return false;
     }
     uint8_t raw[320];
-    const uint32_t bytes = (uint32_t)t->dim[0] * 2u;
+    const uint32_t bytes = iq4_nl ? (uint32_t)t->dim[0] / 32u * 18u : (uint32_t)t->dim[0] * 2u;
     const uint64_t offset = t->abs_offset + (uint64_t)row * bytes;
     uint32_t done = 0;
     while (done < bytes) {
@@ -57363,6 +57426,10 @@ static bool qwen4_ngram_row(const ds4_model *m, uint32_t row, float *out) {
             return false;
         }
         done += (uint32_t)n;
+    }
+    if (iq4_nl) {
+        qwen4_ngram_iq4_nl_row(raw, (uint32_t)t->dim[0], out);
+        return true;
     }
     for (size_t i = 0; i < t->dim[0]; i++) {
         uint32_t bits = ((uint32_t)raw[2*i] | ((uint32_t)raw[2*i+1] << 8)) << 16;
@@ -57686,8 +57753,9 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
         return false;
     }
-    if (!w->ple_embd || w->ple_embd->type != DS4_TENSOR_BF16) {
-        fprintf(stderr, "ds4: Qwen3.8 requires original BF16 n-grams in the model GGUF\n");
+    if (!w->ple_embd ||
+        (w->ple_embd->type != DS4_TENSOR_BF16 && w->ple_embd->type != DS4_TENSOR_IQ4_NL)) {
+        fprintf(stderr, "ds4: Qwen3.8 requires BF16 or IQ4_NL n-grams\n");
         return false;
     }
     if (DS4_N_NEXTN_PREDICT != 0) {
@@ -70731,7 +70799,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_output,
                  load_output_optional);
     if (e->model.ngram_tensor) {
-        fprintf(stderr, "ds4: Qwen BF16 n-grams: %.2f GiB, disk reads only\n",
+        fprintf(stderr, "ds4: Qwen %s n-grams: %.2f GiB, disk reads only\n",
+                tensor_type_name(e->model.ngram_tensor->type),
                 (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
     }
     if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {

@@ -2251,7 +2251,44 @@ static inline void qwen4_attn_decode_tile(
 #pragma unroll
         for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
     }
-    for (uint idx = k0; idx < k1; idx++) {
+    /* four keys per round: their K/V loads are all in flight before the
+     * first score, and one running-max correction covers the four */
+    uint idx = k0;
+    for (; idx + 4u <= k1; idx += 4u) {
+        float kv[4][NPT], vv[4][NPT];
+#pragma unroll
+        for (uint j = 0; j < 4u; j++) {
+            const uint p = use_sel ? (uint)sel[idx + j] : idx + j;
+            device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+            device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) { kv[j][i] = (float)kr[i]; vv[j][i] = (float)vr[i]; }
+        }
+#pragma unroll
+        for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+            if (g < ng) {
+                float s[4];
+#pragma unroll
+                for (uint j = 0; j < 4u; j++) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) d += qv[g][i] * kv[j][i];
+                    s[j] = simd_sum(d);
+                }
+                const float m_new = max(m[g], max(max(s[0], s[1]), max(s[2], s[3])));
+                const float corr = exp(m[g] - m_new);
+                float w[4];
+#pragma unroll
+                for (uint j = 0; j < 4u; j++) w[j] = exp(s[j] - m_new);
+                l[g] = l[g] * corr + ((w[0] + w[1]) + (w[2] + w[3]));
+#pragma unroll
+                for (uint i = 0; i < NPT; i++)
+                    acc[g][i] = acc[g][i] * corr + ((w[0] * vv[0][i] + w[1] * vv[1][i]) + (w[2] * vv[2][i] + w[3] * vv[3][i]));
+                m[g] = m_new;
+            }
+        }
+    }
+    for (; idx < k1; idx++) {
         const uint p = use_sel ? (uint)sel[idx] : idx;
         device const half *kr = k_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
         device const half *vr = v_cache + ((uint64_t)p * Hkv + kvh) * D + tiisg * NPT;
@@ -4976,6 +5013,7 @@ template [[host_name("kernel_qwen4_hc_combine_norm_" #SUFFIX)]] \
 kernel void kernel_qwen4_hc_combine_norm<W>(constant ds4_metal_args_qwen4_hc_norm &, device const float *, \
         device const float *, device const char *, device float *, device float *, device float *, device const float *, device const float *, uint3, ushort, ushort3, ushort, ushort);
 QWEN4_HC_COMBINE_NORM_INSTANCE(f16, qwen4_w_f16)
+QWEN4_HC_COMBINE_NORM_INSTANCE(bf16, qwen4_w_bf16)
 
 /* Disjoint output grids retain the standalone Q8 reduction trees. */
 kernel void kernel_qwen4_q8_concat(

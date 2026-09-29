@@ -808,13 +808,32 @@ kernel void ds4q_mul_mv_bf16(
     }
 
     float sumf[NT][NR0] = {{0.f}};
-    const int n4 = args.ne00/4;
-    for (int i = sgitg*N_SIMDWIDTH + tiisg; i < n4; i += NSG*N_SIMDWIDTH) {
-        float4 y[NT];
-        FOR_UNROLL (short t = 0; t < NT; t++) y[t] = y4[t][i];
-        FOR_UNROLL (short row = 0; row < NR0; row++) {
-            const float4 w = as_type<float4>(uint4(ax[row][i]) << 16);
-            FOR_UNROLL (short t = 0; t < NT; t++) sumf[t][row] += dot(w, y[t]);
+    if ((args.ne00 & 7) == 0) {
+        /* 16-byte weight loads: eight bf16 per lane and row, the rows'
+         * loads issued before any of them is used */
+        const int n8 = args.ne00/8;
+        for (int i = sgitg*N_SIMDWIDTH + tiisg; i < n8; i += NSG*N_SIMDWIDTH) {
+            uint4 w[NR0];
+            FOR_UNROLL (short row = 0; row < NR0; row++) w[row] = ((device const uint4 *)ax[row])[i];
+            FOR_UNROLL (short t = 0; t < NT; t++) {
+                const float4 y0 = y4[t][2*i], y1 = y4[t][2*i + 1];
+                FOR_UNROLL (short row = 0; row < NR0; row++) {
+                    const uint4 q = w[row];
+                    const float4 w0 = as_type<float4>(uint4(q.x << 16, q.x & 0xFFFF0000u, q.y << 16, q.y & 0xFFFF0000u));
+                    const float4 w1 = as_type<float4>(uint4(q.z << 16, q.z & 0xFFFF0000u, q.w << 16, q.w & 0xFFFF0000u));
+                    sumf[t][row] += dot(w0, y0) + dot(w1, y1);
+                }
+            }
+        }
+    } else {
+        const int n4 = args.ne00/4;
+        for (int i = sgitg*N_SIMDWIDTH + tiisg; i < n4; i += NSG*N_SIMDWIDTH) {
+            float4 y[NT];
+            FOR_UNROLL (short t = 0; t < NT; t++) y[t] = y4[t][i];
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                const float4 w = as_type<float4>(uint4(ax[row][i]) << 16);
+                FOR_UNROLL (short t = 0; t < NT; t++) sumf[t][row] += dot(w, y[t]);
+            }
         }
     }
 

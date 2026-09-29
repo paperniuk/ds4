@@ -58988,7 +58988,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         }
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
-            l->hc_ffn_inject->type == DS4_TENSOR_F16) {
+            (l->hc_ffn_inject->type == DS4_TENSOR_F16 || l->hc_ffn_inject->type == DS4_TENSOR_BF16)) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
                 g->xn, g->inj_alt, g->R, m->map, m->size, l->hc_ffn_norm->abs_offset,
                 l->hc_ffn_inject->abs_offset, l->hc_ffn_inject->type, T, DS4_N_EMBD, DS4_N_HC, DS4_N_HC, DS4_RMS_EPS);

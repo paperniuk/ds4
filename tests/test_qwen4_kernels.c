@@ -3173,6 +3173,73 @@ static int bench_p_moe_mm_q4k_lo(void *ud) { static ds4_gpu_tensor *st[6]; stati
 static int bench_gdn_scan(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_gdn_scan2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 2, 16, 48, 128, NULL, 0u, NULL, 0u); }
 
+/* QWEN4_COLD_BENCH=1: decode matvecs cycling through ~160 MB of weight
+ * copies, more than the system level cache holds, so every dispatch streams
+ * its weights from DRAM as in the model.  Reports effective GB/s. */
+typedef struct {
+    arena_t *a;
+    uint64_t off0, stride;
+    uint32_t copies, i, type, in_dim, out_dim;
+    ds4_gpu_tensor *x, *y, *lo;
+    int mix;
+} cold_ctx;
+
+static int bench_cold_fn(void *ud) {
+    cold_ctx *c = ud;
+    const uint64_t off = c->off0 + (uint64_t)(c->i++ % c->copies) * c->stride;
+    if (c->mix) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->y, c->x, c->lo, c->a->base, c->a->size, off, c->type,
+                                                        1, 2560, 4, 320);
+    return ds4_gpu_matmul_quant_tensor(c->y, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim, c->x, 1);
+}
+
+static void bench_cold(arena_t *a) {
+    static const struct { const char *name; uint32_t type, in_dim, out_dim; double bpw; int mix; } cases[] = {
+        { "bf16 hc down 10240->320", 30u, 10240, 320, 16.0, 0 },
+        { "bf16 router 2560->512", 30u, 2560, 512, 16.0, 0 },
+        { "bf16 hc_gate_mix 320->4x2560", 30u, 320, 10240, 16.0, 1 },
+        { "q3_K 2560->10240", 11u, 2560, 10240, 3.4375, 0 },
+        { "iq4_xs 2560->10240", 23u, 2560, 10240, 4.25, 0 },
+        { "iq4_xs 6144->2560", 23u, 6144, 2560, 4.25, 0 },
+        { "q5_K 2560->12288", 13u, 2560, 12288, 5.5, 0 },
+        { "q2_0 2560->6144", 42u, 2560, 6144, 2.125, 0 },
+        { "bf16 big 2560->12288", 30u, 2560, 12288, 16.0, 0 },
+        { "q3_K big 2560->49152", 11u, 2560, 49152, 3.4375, 0 },
+        { "iq4_xs big 2560->49152", 23u, 2560, 49152, 4.25, 0 },
+    };
+    const uint64_t span = 160ull << 20;
+    const uint64_t off0 = arena_alloc(a, span + (16ull << 20));
+    memset(a->base + off0, 0x11, span + (16ull << 20));   /* small finite weights, pages resident */
+    cold_ctx c = { .a = a, .off0 = off0 };
+    c.x = upload(NULL, 4ull * 10240);
+    c.y = upload(NULL, 4ull * 12288);
+    c.lo = upload(NULL, 320);
+    for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
+        const uint64_t bytes = (uint64_t)((double)cases[k].in_dim * cases[k].out_dim * cases[k].bpw / 8.0);
+        c.stride = (bytes + 16383u) & ~16383ull;
+        c.copies = (uint32_t)(span / c.stride);
+        c.type = cases[k].type; c.in_dim = cases[k].in_dim; c.out_dim = cases[k].out_dim; c.mix = cases[k].mix;
+        const char *only = getenv("QWEN4_BENCH_ONLY");
+        if (only && only[0] && !strstr(cases[k].name, only)) continue;
+        /* the GPU clocks ramp with load: warm for ~0.3 s, then best of 3 */
+        const double t_warm = bench_now();
+        while (bench_now() - t_warm < 0.3) {
+            require_ok(ds4_gpu_begin_commands(), "begin");
+            for (uint32_t r = 0; r < c.copies; r++) require_ok(bench_cold_fn(&c), "warm");
+            require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "warm sync");
+        }
+        double best = 1e30;
+        for (int rep = 0; rep < 3; rep++) {
+            const double t0 = bench_now();
+            require_ok(ds4_gpu_begin_commands(), "begin");
+            for (uint32_t r = 0; r < 4 * c.copies; r++) require_ok(bench_cold_fn(&c), cases[k].name);
+            require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "sync");
+            const double us = 1e6 * (bench_now() - t0) / (4 * c.copies);
+            if (us < best) best = us;
+        }
+        printf("  cold %-36s %7.1f us %6.1f GB/s (%.2f MB)\n", cases[k].name, best, bytes / best / 1e3, bytes / 1e6);
+    }
+}
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -3649,6 +3716,10 @@ int main(void) {
     const char *hc_norm_bench = getenv("DS4_TEST_QWEN4_HC_NORM_REUSE_BENCH");
     if (hc_norm_bench && hc_norm_bench[0] && strcmp(hc_norm_bench, "0") != 0) {
         bench_hc_norm_reuse(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_COLD_BENCH")) {
+        bench_cold(&arena);
         return 0;
     }
     if (getenv("QWEN4_BENCH")) {

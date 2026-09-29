@@ -48277,6 +48277,7 @@ enum {
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
     QWEN4_K_MOE_REDUCE,
     QWEN4_K_HC_COMBINE_NORM,
+    QWEN4_K_HC_COMBINE_NORM_BF16,
     QWEN4_K_ARGMAX,
     QWEN4_K_MTP_STAGE,
     QWEN4_K_MTP_COMBINE,
@@ -48391,6 +48392,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_down_mxfp4_grouped",
     "kernel_qwen4_moe_reduce",
     "kernel_qwen4_hc_combine_norm_f16",
+    "kernel_qwen4_hc_combine_norm_bf16",
     "kernel_qwen4_argmax",
     "kernel_qwen4_mtp_stage",
     "kernel_qwen4_mtp_combine",
@@ -48662,7 +48664,7 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     struct { uint32_t n_tokens, n_embd, n_hc, n_inject; float eps; uint32_t pad0, pad1, pad2; } args =
         { n_tokens, n_embd, n_hc, n_inject, eps, 0, 0, 0 };
     qwen4_bind b[8];
-    if (n_tokens != 1u || weight_type != 1u || n_inject != n_hc) return 0;
+    if (n_tokens != 1u || (weight_type != 1u && weight_type != 30u) || n_inject != n_hc) return 0;
     if (ds4_gpu_tensor_buffer(next_R) == ds4_gpu_tensor_buffer(R) ||
         ds4_gpu_tensor_buffer(inj_part) == ds4_gpu_tensor_buffer(old_inj)) return 0;
     if (n_tokens == 0 || n_embd == 0 || n_hc == 0 || n_hc > 8 || n_inject > 4 || wrow == 0 || (dim % 32) != 0 ||
@@ -48685,7 +48687,8 @@ int ds4_gpu_qwen4_hc_combine_norm_tensor(
     if (!qwen4_bind_tensor(&b[5], next_R, dim * sizeof(float), "combine norm next R") ||
         !qwen4_bind_tensor(&b[6], blk, n_embd * sizeof(float), "combine norm block") ||
         !qwen4_bind_tensor(&b[7], old_inj, n_hc * DS4_QWEN4_HC_CHUNKS * n_hc * sizeof(float), "combine norm old inject")) return 0;
-    return qwen4_dispatch(QWEN4_K_HC_COMBINE_NORM, &args, sizeof(args), b, 8,
+    return qwen4_dispatch(weight_type == 30u ? QWEN4_K_HC_COMBINE_NORM_BF16 : QWEN4_K_HC_COMBINE_NORM,
+                          &args, sizeof(args), b, 8,
         MTLSizeMake(n_hc * DS4_QWEN4_HC_CHUNKS, 1, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
@@ -49386,10 +49389,12 @@ int ds4_gpu_qwen4_idx_expand_tensor(
 
 /* keys per split of the partial-softmax decode path (DS4_QWEN4_ATTN_SPLIT_KEYS overrides) */
 /* Read per call, not cached, so an A/B harness can switch it per step. */
+/* 64 on pre-M5 parts: with four keys per round the decode kernel keeps up
+ * and the merge has half the splits to fold (M1 Max, 4k-128k). */
 static uint32_t qwen4_attn_split_keys(void) {
     const char *env = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
     const int v = env ? atoi(env) : 0;
-    return v > 0 ? (uint32_t)v : 32u;
+    return v > 0 ? (uint32_t)v : ds4_gpu_device_is_m5_apple_silicon() ? 32u : 64u;
 }
 
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
@@ -49461,10 +49466,10 @@ int ds4_gpu_qwen4_attn_decode_tensor(
     if (n_splits == 1) return 1;
     qwen4_bind mb[3] = { b[7], b[1], b[6] };
     /* One thread per dim merges the same split chain with eight times the
-     * threads; measured on M5, other devices keep the simdgroup merge. */
+     * threads and sixteen splits in flight: bit-identical, faster on M5 and
+     * on M1 Max (0.42 to 0.31 ms per token at 64 keys per split). */
     const int wide_override = ds4_gpu_env_bool("DS4_QWEN4_ATTN_MERGE_WIDE");
-    const bool wide = head_dim >= 128u &&
-        (wide_override >= 0 ? wide_override != 0 : ds4_gpu_device_is_m5_apple_silicon());
+    const bool wide = head_dim >= 128u && (wide_override >= 0 ? wide_override != 0 : true);
     if (wide) {
         return qwen4_dispatch(head_dim == 256u ? QWEN4_K_ATTN_MERGE_WIDE_NPT8 : QWEN4_K_ATTN_MERGE_WIDE_NPT4,
                               &args, sizeof(args), mb, 3,

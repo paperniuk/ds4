@@ -2809,6 +2809,26 @@ static void model_unmap_engram(ds4_model *m) {
 static ds4_model g_qwen_ngram_sidecar;
 static bool g_qwen_ngram_sidecar_opening;
 static void model_attach_qwen_ngram_sidecar(ds4_model *m);
+static void model_attach_qwen_mtp_sidecar(ds4_model *m);
+
+/* DS4_QWEN_MTP_GGUF (see model_attach_qwen_mtp_sidecar) needs free address
+ * space right after the main weights: reserve it with the main mapping. */
+#define DS4_QWEN_MTP_RESERVE ((uint64_t)8 << 30)
+static uint8_t *g_qwen_mtp_reserve;       /* the reservation's base, while held */
+static uint64_t g_qwen_mtp_reserve_bytes;
+
+static void *model_mtp_sidecar_reserve(bool metal_mapping, uint64_t file_size) {
+    const char *path = getenv("DS4_QWEN_MTP_GGUF");
+    const long page = sysconf(_SC_PAGESIZE);
+    if (!metal_mapping || !path || !*path || g_qwen_ngram_sidecar_opening || g_qwen_mtp_reserve || page <= 0)
+        return NULL;
+    const uint64_t bytes = align_up(file_size, (uint64_t)page) + DS4_QWEN_MTP_RESERVE;
+    void *hold = mmap(NULL, (size_t)bytes, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (hold == MAP_FAILED) ds4_die_errno("cannot reserve MTP address space", path);
+    g_qwen_mtp_reserve = hold;
+    g_qwen_mtp_reserve_bytes = bytes;
+    return hold;
+}
 
 /* Like V4.1 Engram, the n-gram table must trail the resident weights. This
  * prevents warming or a future whole-model GPU view from faulting it in. */
@@ -2894,7 +2914,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
      * avoids that VM accounting path while preserving normal file-backed reads.
      */
     const int mmap_flags = metal_mapping ? MAP_SHARED : MAP_PRIVATE;
-    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, mmap_flags, fd, 0);
+    void *at = model_mtp_sidecar_reserve(metal_mapping, (uint64_t)st.st_size);
+    void *map = mmap(at, (size_t)st.st_size, PROT_READ, mmap_flags | (at ? MAP_FIXED : 0), fd, 0);
     if (map == MAP_FAILED) ds4_die_errno("cannot mmap model", path);
 
     m->fd = fd;
@@ -2917,6 +2938,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     model_unmap_engram(m);
     model_unmap_qwen_ngrams(m, path);
     model_attach_qwen_ngram_sidecar(m);
+    model_attach_qwen_mtp_sidecar(m);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -3295,6 +3317,74 @@ static void model_attach_qwen_ngram_sidecar(ds4_model *m) {
 #endif
     m->ngram_fd = fd;
     m->ngram_tensor = model_find_tensor(s, "per_layer_token_embd.weight");
+}
+
+/* A Qwen GGUF without the MTP block can borrow one: DS4_QWEN_MTP_GGUF names a
+ * Qwen3.8 GGUF that carries it as blk.<block_count>. Only that block's byte
+ * range is mapped, right after the main weights, so the model stays a single
+ * addressable mapping for Metal. The block is the checkpoint's own MTP head,
+ * whatever quantization the trunk uses. Its tensors are resident only: SSD
+ * expert streaming reads the main file descriptor. */
+static ds4_model g_qwen_mtp_sidecar;
+static bool g_qwen_mtp_sidecar_attached;
+
+static void model_attach_qwen_mtp_sidecar(ds4_model *m) {
+    const char *path = getenv("DS4_QWEN_MTP_GGUF");
+    ds4_str arch = {0};
+    uint32_t nextn = 0, n_layer = 0;
+    if (g_qwen_ngram_sidecar_opening || !g_qwen_mtp_reserve || g_qwen_mtp_reserve != m->map) return;
+    uint8_t *target = (uint8_t *)m->map + align_up(m->size, (uint64_t)sysconf(_SC_PAGESIZE));
+    uint8_t *const hold_end = g_qwen_mtp_reserve + g_qwen_mtp_reserve_bytes;
+    g_qwen_mtp_reserve = NULL;
+    if (!model_get_string(m, "general.architecture", &arch) || !ds4_streq(arch, "qwen4exp") ||
+        (model_get_u32(m, "qwen4exp.nextn_predict_layers", &nextn) && nextn) ||
+        !model_get_u32(m, "qwen4exp.block_count", &n_layer)) {
+        if (munmap(target, (size_t)(hold_end - target))) ds4_die_errno("cannot release the MTP reservation", path);
+        return;
+    }
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+
+    ds4_model *s = &g_qwen_mtp_sidecar;
+    g_qwen_ngram_sidecar_opening = true;
+    model_open(s, path, false, false);
+    g_qwen_ngram_sidecar_opening = false;
+
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "blk.%u.", n_layer);
+    const size_t plen = strlen(prefix);
+    uint64_t lo = UINT64_MAX, hi = 0, count = 0;
+    for (uint64_t i = 0; i < s->n_tensors; i++) {
+        const ds4_tensor *t = &s->tensors[i];
+        if (t->name.len <= plen || memcmp(t->name.ptr, prefix, plen)) continue;
+        if (!t->bytes) ds4_die("unsupported tensor type in the DS4_QWEN_MTP_GGUF block");
+        if (t->abs_offset < lo) lo = t->abs_offset;
+        if (t->abs_offset + t->bytes > hi) hi = t->abs_offset + t->bytes;
+        count++;
+    }
+    if (!count) ds4_die("DS4_QWEN_MTP_GGUF has no MTP block after the main layers");
+    lo = lo / page * page;
+    const uint64_t len = align_up(hi - lo, page);
+    if (len > (uint64_t)(hold_end - target)) ds4_die("the DS4_QWEN_MTP_GGUF block is larger than its reservation");
+    if (mmap(target, (size_t)len, PROT_READ, MAP_SHARED | MAP_FIXED, s->fd, (off_t)lo) == MAP_FAILED)
+        ds4_die_errno("cannot map the MTP block", path);
+    if (target + len < hold_end && munmap(target + len, (size_t)(hold_end - target - len)))
+        ds4_die_errno("cannot release the MTP reservation", path);
+
+    const uint64_t base = (uint64_t)(target - m->map);
+    m->tensors = xrealloc(m->tensors, (size_t)(m->n_tensors + count) * sizeof(m->tensors[0]));
+    for (uint64_t i = 0; i < s->n_tensors; i++) {
+        const ds4_tensor *t = &s->tensors[i];
+        if (t->name.len <= plen || memcmp(t->name.ptr, prefix, plen)) continue;
+        ds4_tensor *d = &m->tensors[m->n_tensors++];
+        *d = *t;
+        d->abs_offset = base + (t->abs_offset - lo);
+        d->rel_offset = d->abs_offset - m->tensor_data_pos;
+        if (d->bytes > m->max_tensor_bytes) m->max_tensor_bytes = d->bytes;
+    }
+    m->size = base + len;
+    g_qwen_mtp_sidecar_attached = true;
+    fprintf(stderr, "ds4: MTP block %s* from %s (%" PRIu64 " tensors, %.2f GiB)\n",
+            prefix, path, count, (double)len / (1024.0 * 1024.0 * 1024.0));
 }
 
 static const char *support_kind_name(ds4_support_kind kind) {
@@ -7098,6 +7188,7 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     /* upstream files carry no MTP block: trim the profile to the trunk */
     uint32_t nextn = 0;
     (void)model_get_u32(m, "qwen4exp.nextn_predict_layers", &nextn);
+    if (g_qwen_mtp_sidecar_attached) nextn = 1;
     if (nextn > DS4_N_NEXTN_PREDICT) {
         fprintf(stderr, "ds4: qwen4exp.nextn_predict_layers %u exceeds %u\n",
                 nextn, DS4_N_NEXTN_PREDICT);
@@ -7106,7 +7197,9 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     g_ds4_shape.n_layer -= DS4_N_NEXTN_PREDICT - nextn;
     g_ds4_shape.n_nextn_predict = nextn;
 
-    config_expect_u32("block_count", required_u32(m, "qwen4exp.block_count"), DS4_N_LAYER);
+    config_expect_u32("block_count",
+                      required_u32(m, "qwen4exp.block_count") + (g_qwen_mtp_sidecar_attached ? 1u : 0u),
+                      DS4_N_LAYER);
     config_expect_u32("attention.head_count",
                       required_u32(m, "qwen4exp.attention.head_count"), DS4_N_HEAD);
     config_expect_u32("attention.head_count_kv",
@@ -7156,6 +7249,7 @@ static void config_validate_qwen4_model(const ds4_model *m) {
         uint64_t ratios[DS4_MAX_LAYER];
         uint32_t n = 0;
         config_read_qwen4_u64_array(m, "qwen4exp.attention.compress_ratios", ratios, DS4_MAX_LAYER, &n);
+        if (g_qwen_mtp_sidecar_attached && n + 1u == DS4_N_LAYER) ratios[n++] = 4u;
         if (n < DS4_N_LAYER) ds4_die("qwen4exp.attention.compress_ratios is shorter than the layer count");
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             const uint32_t expected = ds4_qwen4_layer_is_linear(il) ? 0u : 4u;

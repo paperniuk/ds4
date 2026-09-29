@@ -1610,6 +1610,43 @@ struct ds4_metal_args_qwen4_idx_score {
     uint32_t pad1;
 };
 
+/* sum over indexer heads of relu(q_h . key).  With four heads the head
+ * dots run as independent chains over one read of the key, each in index
+ * order.  The scalar and vector scorers both call this, so their sums are
+ * bit-identical whatever the compiler does with the chains. */
+template <typename QPtr>
+static inline float qwen4_idx_block_score(QPtr q, device const half *key_h, uint n_head, uint Di) {
+    device const half4 *key = (device const half4 *)key_h;
+    float sum = 0.0f;
+    if (n_head == 4u && (Di & 3u) == 0u) {
+        const uint n4 = Di >> 2;
+        float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+        for (uint i = 0; i < n4; i++) {
+            const float4 k = float4(key[i]);
+            const uint d = i << 2;
+            const float4 a = float4(q[d], q[d + 1], q[d + 2], q[d + 3]);
+            const float4 c = float4(q[Di + d], q[Di + d + 1], q[Di + d + 2], q[Di + d + 3]);
+            const float4 e = float4(q[2 * Di + d], q[2 * Di + d + 1], q[2 * Di + d + 2], q[2 * Di + d + 3]);
+            const float4 g = float4(q[3 * Di + d], q[3 * Di + d + 1], q[3 * Di + d + 2], q[3 * Di + d + 3]);
+            dot0 = fma(a.w, k.w, fma(a.z, k.z, fma(a.y, k.y, fma(a.x, k.x, dot0))));
+            dot1 = fma(c.w, k.w, fma(c.z, k.z, fma(c.y, k.y, fma(c.x, k.x, dot1))));
+            dot2 = fma(e.w, k.w, fma(e.z, k.z, fma(e.y, k.y, fma(e.x, k.x, dot2))));
+            dot3 = fma(g.w, k.w, fma(g.z, k.z, fma(g.y, k.y, fma(g.x, k.x, dot3))));
+        }
+        sum += max(dot0, 0.0f);
+        sum += max(dot1, 0.0f);
+        sum += max(dot2, 0.0f);
+        sum += max(dot3, 0.0f);
+        return sum;
+    }
+    for (uint h = 0; h < n_head; h++) {
+        float dot = 0.0f;
+        for (uint d = 0; d < Di; d++) dot = fma(q[h * Di + d], (float)key_h[d], dot);
+        sum += max(dot, 0.0f);
+    }
+    return sum;
+}
+
 /* score[tok][b] = sum over indexer heads of relu(q_h . key_b); blocks not
  * yet complete for the token's position score -inf.  One lane per block. */
 kernel void kernel_qwen4_idx_score(
@@ -1629,20 +1666,14 @@ kernel void kernel_qwen4_idx_score(
         score[(uint64_t)tok * args.n_blocks + b] = -3.0e38f;
         return;
     }
-    device const half *key = block_key + (uint64_t)b * Di;
-    device const float *q = iq + (uint64_t)tok * args.n_idx_head * Di;
-    float sum = 0.0f;
-    for (uint h = 0; h < args.n_idx_head; h++) {
-        float dot = 0.0f;
-        for (uint d = 0; d < Di; d++) dot += q[h * Di + d] * (float)key[d];
-        sum += max(dot, 0.0f);
-    }
-    score[(uint64_t)tok * args.n_blocks + b] = sum;
+    score[(uint64_t)tok * args.n_blocks + b] =
+        qwen4_idx_block_score(iq + (uint64_t)tok * args.n_idx_head * Di, block_key + (uint64_t)b * Di,
+                              args.n_idx_head, Di);
 }
 
-/* Same scores with the token's query rows staged once per threadgroup and
- * the block key read as half4 vectors; every dot still adds its 128 terms
- * in index order, so the sums are bit-identical to kernel_qwen4_idx_score. */
+/* Same scores with the token's query rows staged once per threadgroup;
+ * the shared block scorer keeps the sums bit-identical to
+ * kernel_qwen4_idx_score. */
 static inline void qwen4_idx_score_vec_row(
         constant ds4_metal_args_qwen4_idx_score &args, uint b, uint n_blocks, uint visible,
         device const float *q, device const half *block_key, device float *score, device uint *tile_max,
@@ -1653,22 +1684,8 @@ static inline void qwen4_idx_score_vec_row(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool live = b < n_blocks && b < visible;
     float sum = -3.0e38f;
-    if (live) {
-        device const half4 *key = (device const half4 *)(block_key + (uint64_t)b * Di);
-        sum = 0.0f;
-        for (uint h = 0; h < args.n_idx_head; h++) {
-            const threadgroup float *qh = qs + h * Di;
-            float dot = 0.0f;
-            for (uint d = 0; d < Di; d += 4) {
-                const half4 k = key[d >> 2];
-                dot += qh[d] * (float)k.x;
-                dot += qh[d + 1] * (float)k.y;
-                dot += qh[d + 2] * (float)k.z;
-                dot += qh[d + 3] * (float)k.w;
-            }
-            sum += max(dot, 0.0f);
-        }
-    }
+    if (live) sum = qwen4_idx_block_score((const threadgroup float *)qs, block_key + (uint64_t)b * Di,
+                                          args.n_idx_head, Di);
     if (b < n_blocks) score[b] = sum;
     /* the selector's key of this block (-inf and missing blocks map to 0),
      * reduced over the aligned eight-lane group; every lane joins the
@@ -1826,16 +1843,24 @@ kernel void kernel_qwen4_idx_select(
         const uint mask_hi = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
         for (uint i = tid; i < 256; i += nth) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        /* 16 loads per thread in flight before the counting */
+        /* 16 loads per thread in flight before the counting.  Scores share
+         * a few exponents, so the first digits pile onto a few bins: count
+         * runs of one digit in a register and add each run once. */
+        uint run_d = 0u, run_n = 0u;
         for (uint b = tid; b < n; b += 16u * nth) {
             float v[16];
             for (uint u = 0; u < 16; u++) { const uint i = b + u * nth; v[u] = i < n ? row[i] : -1.0f; }
             for (uint u = 0; u < 16; u++) {
                 if (b + u * nth >= n) break;
                 const uint key = as_type<uint>(max(v[u], 0.0f));
-                if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
+                if ((key & mask_hi) != prefix) continue;
+                const uint d = (key >> shift) & 0xFFu;
+                if (d != run_d && run_n) { atomic_fetch_add_explicit(&hist[run_d], run_n, memory_order_relaxed); run_n = 0u; }
+                run_d = d;
+                run_n++;
             }
         }
+        if (run_n) atomic_fetch_add_explicit(&hist[run_d], run_n, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         /* suffix sums from the top digit down: the first 256 threads hold one
          * digit each, higher threads contribute zeros */
@@ -1919,13 +1944,19 @@ static inline void qwen4_idx_radix(device const uint *tm, threadgroup const uint
         const uint mask_hi = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
         for (uint i = tid; i < 256; i += nth) atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint run_d = 0u, run_n = 0u;   /* runs of one digit, as in kernel_qwen4_idx_select */
         for (uint e = tid; e < n; e += nth) {
             uint key;
             if (MODE == 0) key = tm[e];
             else if (MODE == 1) { if (qwen4_idx_pre_block(tiles, e) >= n_blocks) continue; key = keys[e]; }
             else key = as_type<uint>(max(row[e], 0.0f));
-            if ((key & mask_hi) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 0xFFu], 1u, memory_order_relaxed);
+            if ((key & mask_hi) != prefix) continue;
+            const uint d = (key >> shift) & 0xFFu;
+            if (d != run_d && run_n) { atomic_fetch_add_explicit(&hist[run_d], run_n, memory_order_relaxed); run_n = 0u; }
+            run_d = d;
+            run_n++;
         }
+        if (run_n) atomic_fetch_add_explicit(&hist[run_d], run_n, memory_order_relaxed);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const uint c = tid < 256 ? atomic_load_explicit(&hist[255 - tid], memory_order_relaxed) : 0u;
         const uint p = simd_prefix_inclusive_sum(c);

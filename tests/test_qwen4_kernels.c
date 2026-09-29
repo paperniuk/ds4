@@ -156,6 +156,29 @@ static uint64_t arena_bf16(arena_t *a, uint64_t n, double **shadow, float scale)
 }
 
 /* q4_0 rows: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
+/* Q2_0: f16 d and 64 two-bit codes per block, value (q - 1) * d */
+static uint64_t arena_q2_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
+    const uint64_t blocks = cols / 64;
+    const uint64_t off = arena_alloc(a, rows * blocks * 18u);
+    uint8_t *w = a->base + off;
+    *shadow = malloc(rows * cols * sizeof(double));
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *blk = w + (r * blocks + b) * 18u;
+            const uint16_t dh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
+            const float d = f16_to_f32(dh);
+            memcpy(blk, &dh, 2);
+            memset(blk + 2, 0, 16);
+            for (int j = 0; j < 64; j++) {
+                const uint32_t q = (uint32_t)(frand() * 2.0f + 2.0f) & 3u;
+                blk[2 + j / 4] |= (uint8_t)(q << ((j % 4) * 2));
+                (*shadow)[r * cols + b * 64 + j] = ((double)q - 1.0) * d;
+            }
+        }
+    }
+    return off;
+}
+
 static uint64_t arena_q4_0(arena_t *a, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     const uint64_t blocks = cols / 32;
     const uint64_t off = arena_alloc(a, rows * blocks * 18u);
@@ -507,20 +530,23 @@ static float *rand_vec(uint64_t n, float scale) {
 /* ---- hyper-connections ---- */
 
 static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t wtype) {
-    const bool f16 = wtype == 1u, q8 = wtype == 8u;
+    const bool f16 = wtype == 1u, q8 = wtype == 8u, bf16 = wtype == 30u;
     const uint32_t hc = 4, dim = E * hc, CH = DS4_QWEN4_HC_CHUNKS;
     const float eps = 1e-6f;
     double *g_gamma, *g_down, *g_up, *g_inj;
     const uint64_t gamma_off = arena_f32(a, dim, &g_gamma, 0.5f, 1.5f);
     const uint64_t down_off = q8 ? arena_q8_0(a, rank, dim, &g_down, 0.05f)
+                            : bf16 ? arena_bf16(a, (uint64_t)rank * dim, &g_down, 0.05f)
                             : f16 ? arena_f16(a, (uint64_t)rank * dim, &g_down, 0.05f)
                                   : arena_f32(a, (uint64_t)rank * dim, &g_down, -0.05f, 0.05f);
     /* q8 up rows need rank % 32; smaller ranks keep f16 like the converter does */
     const uint32_t up_type = q8 && (rank % 32) == 0 ? 8u : q8 ? 1u : wtype;
     const uint64_t up_off = up_type == 8u ? arena_q8_0(a, dim, rank, &g_up, 0.2f)
                           : up_type == 1u ? arena_f16(a, (uint64_t)dim * rank, &g_up, 0.2f)
+                          : up_type == 30u ? arena_bf16(a, (uint64_t)dim * rank, &g_up, 0.2f)
                                           : arena_f32(a, (uint64_t)dim * rank, &g_up, -0.2f, 0.2f);
     const uint64_t inj_off = q8 ? arena_q8_0(a, hc, dim, &g_inj, 0.05f)
+                           : bf16 ? arena_bf16(a, (uint64_t)hc * dim, &g_inj, 0.05f)
                            : f16 ? arena_f16(a, (uint64_t)hc * dim, &g_inj, 0.05f)
                                  : arena_f32(a, (uint64_t)hc * dim, &g_inj, -0.05f, 0.05f);
     float *R = rand_vec((uint64_t)T * dim, 1.0f);
@@ -582,6 +608,7 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
                "hc norm");
 #ifdef __APPLE__
     require_ok(q8 ? ds4_gpu_matmul_q8_0_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
+             : bf16 ? ds4_gpu_matmul_quant_tensor(glo, a->base, a->size, down_off, wtype, dim, rank, gxn, T)
              : f16 ? ds4_gpu_matmul_f16_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T)
                    : ds4_gpu_matmul_f32_tensor(glo, a->base, a->size, down_off, dim, rank, gxn, T), "hc down gemv");
 #else
@@ -592,7 +619,7 @@ static void test_hc(arena_t *a, uint32_t E, uint32_t rank, uint32_t T, uint32_t 
                "hc gate mix");
     require_ok(ds4_gpu_qwen4_hc_combine_tensor(gR, gblk, ginj, T, E, hc), "hc combine");
     char name[96];
-    const char *tname = q8 ? "q8_0" : f16 ? "f16" : "f32";
+    const char *tname = q8 ? "q8_0" : bf16 ? "bf16" : f16 ? "f16" : "f32";
     snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: xn", E, rank, T, tname);
     check_tensor(name, gxn, xn, (uint64_t)T * dim, 1e-5);
     snprintf(name, sizeof(name), "hc E=%u rank=%u T=%u %s: lowrank", E, rank, T, tname);
@@ -1534,6 +1561,7 @@ static void test_attention_rows(arena_t *a) {
 
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
+    if (wtype == 42u) return arena_q2_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
            wtype == 10u ? arena_q2_K(a, rows, cols, shadow, 0.05f) :
            wtype == 16u ? arena_iq2_xxs(a, rows, cols, shadow, 0.05f) : arena_q8_0(a, rows, cols, shadow, 0.05f);
@@ -1648,7 +1676,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
     const bool q8 = wtype != 0u;
-    const char *tier_name = wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : wtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *tier_name = wtype == 42u ? "q2_0" : wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : wtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     if (q8) {
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
         up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &up_w);
@@ -1787,7 +1815,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     ds4_gpu_tensor *gR = upload(R0, (uint64_t)T * 4 * E);
     ds4_gpu_tensor *ginj = upload(injv, (uint64_t)T * 4 * CH * 4);
     require_ok(ds4_gpu_qwen4_moe_reduce_tensor(gout, gpart, gw, gsg, NULL, gR, ginj, T, slots, n_out, E, 4), "moe reduce");
-    const char *dname = dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+    const char *dname = dtype == 42u ? "q2_0" : dtype == 10u ? "q2_K" : dtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     snprintf(name, sizeof(name), "moe %s E=%u F=%u slots=%u T=%u: reduce+combine", dname, E, F, slots, T);
     check_tensor(name, gR, R_ref, (uint64_t)T * 4 * E, 2e-5);
     ds4_gpu_tensor_free(ginj); ds4_gpu_tensor_free(gR); free(R_ref); free(injv); free(R0);
@@ -3000,6 +3028,10 @@ static int bench_hc_norm(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_
 static int bench_hc_down(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_f16_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 10240, 320, c->t[4], 1); }
 static int bench_hc_mix(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 1u, 1, 2560, 4, 320); }
 static int bench_hc_mix2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 1u, 2, 2560, 4, 320); }
+static int bench_hc_mix_bf16(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 30u, 1, 2560, 4, 320); }
+static int bench_hc_mix_bf16_2(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_hc_gate_mix_tensor(c->t[0], c->t[4], c->t[5], c->a->base, c->a->size, c->off[5], 30u, 2, 2560, 4, 320); }
+static int bench_hc_down_bf16_2(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 2); }
+static int bench_hc_down_bf16(void *ud) { bench_ctx *c = ud; return ds4_gpu_matmul_quant_tensor(c->t[5], c->a->base, c->a->size, c->off[3], 30u, 10240, 320, c->t[4], 1); }
 static int bench_attn(void *ud) {
     bench_ctx *c = ud;
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[6], c->t[7], c->t[7], c->t[8], c->t[9], NULL, NULL, c->n[1] ? c->t[10] : NULL,
@@ -3267,6 +3299,10 @@ static void bench_dispatch(arena_t *a) {
     bench_run("hc down gemv f16 320x10240", bench_hc_down, &c, 200);
     bench_run("hc_gate_mix f16", bench_hc_mix, &c, 200);
     bench_run("hc_gate_mix f16 T=2", bench_hc_mix2, &c, 200);
+    bench_run("hc_gate_mix bf16", bench_hc_mix_bf16, &c, 200);
+    bench_run("hc down gemv bf16 320x10240", bench_hc_down_bf16, &c, 200);
+    bench_run("hc_gate_mix bf16 T=2", bench_hc_mix_bf16_2, &c, 200);
+    bench_run("hc down gemv bf16 320x10240 T=2", bench_hc_down_bf16_2, &c, 200);
     c.n[0] = 110; c.n[1] = 0; bench_run("attn_decode pos=110 no split", bench_attn, &c, 100);
     c.n[0] = 110; c.n[1] = 1; bench_run("attn_decode pos=110 split", bench_attn, &c, 100);
     c.n[0] = 2000; c.n[1] = 0; bench_run("attn_decode pos=2000 no split", bench_attn, &c, 50);
@@ -3614,6 +3650,7 @@ int main(void) {
     test_hc(&arena, 64, 8, 2, 0u);
     test_hc(&arena, 64, 8, 1, 8u);
     test_hc(&arena, 64, 8, 3, 8u);
+    for (uint32_t T = 1; T <= 5; T++) test_hc(&arena, 2560, 320, T, 30u);
     printf("gated delta net\n");
     test_gdn(&arena, 16, 48, 128, 5);
     test_gdn(&arena, 16, 48, 128, 40);
@@ -3659,6 +3696,13 @@ int main(void) {
     test_moe(&arena, 16, 10, 2560, 640, 100, 12u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 10u);
     test_moe(&arena, 16, 10, 2560, 640, 37, 16u);
+    test_moe(&arena, 16, 10, 2560, 640, 1, 42u);
+    test_moe(&arena, 16, 10, 2560, 640, 2, 42u);
+    test_moe(&arena, 16, 10, 2560, 640, 37, 42u);
+    test_moe(&arena, 16, 10, 2560, 640, 100, 42u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 1, 42u, 42u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 2, 42u, 42u);
+    test_moe_types(&arena, 16, 10, 2560, 640, 100, 42u, 42u);
     test_moe(&arena, 8, 10, 2560, 640, 1, 0u);
     test_moe(&arena, 32, 10, 64, 32, 3, 8u);
     test_moe(&arena, 32, 10, 64, 32, 3, 0u);

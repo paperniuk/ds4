@@ -39,15 +39,75 @@
 
 enum {
     DS4_METAL_TENSOR_Q4_0    = 2,
+    DS4_METAL_TENSOR_Q5_0    = 6,
     DS4_METAL_TENSOR_Q8_0    = 8,
     DS4_METAL_TENSOR_Q2_K    = 10,
+    DS4_METAL_TENSOR_Q3_K    = 11,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_Q5_K    = 13,
     DS4_METAL_TENSOR_Q6_K    = 14,
     DS4_METAL_TENSOR_Q8_K    = 15,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_IQ4_NL  = 20,
+    DS4_METAL_TENSOR_IQ4_XS  = 23,
+    DS4_METAL_TENSOR_BF16    = 30,
     DS4_METAL_TENSOR_MXFP4   = 39,
+    DS4_METAL_TENSOR_Q2_0    = 42,
 };
+
+/* Weight types of mixed-precision GGUFs, such as ISTA-DASLab's Qwen3.8
+ * release (BF16 among them), that run through the generic quant matmul with
+ * the llama.cpp kernels in metal/quants.metal.  The one-token matvec covers nr0 * nsg
+ * rows per threadgroup, or nr0 rows with K split across the simdgroups when
+ * ksplit is set; mv_ext is the 2-5 row family (NULL: the one-token kernel runs
+ * once per row).  The mv kernels also come as "_nt2" and "_nt3", which read
+ * the weights once for that many tokens (MTP verification); batches of up to
+ * nt_max tokens take them rather than mv_ext. */
+typedef struct {
+    uint32_t type;
+    uint32_t block;
+    uint32_t block_bytes;
+    uint16_t nr0;
+    uint16_t nsg;
+    uint16_t shmem;
+    const char *mv;
+    const char *mv_ext;
+    const char *mm;
+    bool ksplit;
+    uint16_t nt_max;
+} ds4_gpu_quant_kind;
+
+static const ds4_gpu_quant_kind ds4_gpu_quant_kinds[] = {
+    { DS4_METAL_TENSOR_Q2_0,    64,  18, 8, 2,  32, "kernel_mul_mv_q2_0_dense_f32",
+      "kernel_mul_mv_ext_q2_0_f32_r1_",   "kernel_mul_mm_q2_0_f32", false, 8 },
+    { DS4_METAL_TENSOR_Q5_0,    32,  22, 4, 2,  32, "kernel_mul_mv_q5_0_dense_f32",
+      "kernel_mul_mv_ext_q5_0_f32_r1_",   "kernel_mul_mm_q5_0_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ4_NL,  32,  18, 2, 2, 128, "kernel_mul_mv_iq4_nl_dense_f32",
+      "kernel_mul_mv_ext_iq4_nl_f32_r1_", "kernel_mul_mm_iq4_nl_f32", false, 8 },
+    { DS4_METAL_TENSOR_Q3_K,   256, 110, 2, 2,  32, "kernel_mul_mv_q3_K_dense_f32",
+      "kernel_mul_mv_ext_q3_K_f32_r1_",   "kernel_mul_mm_q3_K_f32", false, 8 },
+    { DS4_METAL_TENSOR_Q5_K,   256, 176, 2, 4,  32, "kernel_mul_mv_q5_K_dense_f32",
+      "kernel_mul_mv_ext_q5_K_f32_r1_",   "kernel_mul_mm_q5_K_f32", false, 8 },
+    { DS4_METAL_TENSOR_Q6_K,   256, 210, 2, 2,  32, "kernel_mul_mv_q6_K_dense_f32",
+      "kernel_mul_mv_ext_q6_K_f32_r1_",   "kernel_mul_mm_q6_K_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ4_XS, 256, 136, 2, 2, 128, "kernel_mul_mv_iq4_xs_dense_f32",
+      NULL,                               "kernel_mul_mm_iq4_xs_f32", false, 8 },
+    { DS4_METAL_TENSOR_BF16,     1,   2, 2, 4, 256, "kernel_mul_mv_bf16_dense_f32",
+      "kernel_mul_mv_ext_bf16_f32_r1_",   "kernel_mul_mm_bf16_f32", true, 3 },
+};
+
+/* Q4_K keeps ds4's own kernels for row sizes and GEMM; this only replaces
+ * its small-batch matvec off M5, where ds4's kernel was tuned. */
+static const ds4_gpu_quant_kind ds4_gpu_q4_K_mixed_kind =
+    { DS4_METAL_TENSOR_Q4_K,   256, 144, 2, 2,  32, "kernel_mul_mv_q4_K_mixed_f32",
+      NULL,                               "kernel_mul_mm_q4_K_f32", false, 8 };
+
+static const ds4_gpu_quant_kind *ds4_gpu_quant_kind_find(uint32_t type) {
+    for (size_t i = 0; i < sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0]); i++) {
+        if (ds4_gpu_quant_kinds[i].type == type) return &ds4_gpu_quant_kinds[i];
+    }
+    return NULL;
+}
 
 @class DS4MetalQ4ExpertTable;
 
@@ -4767,6 +4827,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_DEEPSEEK4_VISION_SOURCE", @"metal/deepseek4_vision.metal"],
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
+        @[@"DS4_METAL_QUANTS_SOURCE",     @"metal/quants.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
         @[@"DS4_METAL_UNARY_SOURCE",      @"metal/unary.metal"],
         @[@"DS4_METAL_DSV4_KV_SOURCE",    @"metal/dsv4_kv.metal"],
@@ -11957,8 +12018,12 @@ static int ds4_gpu_quant_row_bytes(
         if ((n_embd % 256u) != 0) return 0;
         *row_bytes_out = ((uint64_t)n_embd / 256u) * 144u;
         return 1;
-    default:
-        return 0;
+    default: {
+        const ds4_gpu_quant_kind *k = ds4_gpu_quant_kind_find(type);
+        if (!k || (n_embd % k->block) != 0) return 0;
+        *row_bytes_out = ((uint64_t)n_embd / k->block) * k->block_bytes;
+        return 1;
+    }
     }
 }
 
@@ -19775,8 +19840,31 @@ static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
     case DS4_METAL_TENSOR_Q4_K: return "kernel_mul_mm_q4_K_f32";
-    default: return NULL;
+    default: {
+        const ds4_gpu_quant_kind *k = ds4_gpu_quant_kind_find(weight_type);
+        return k ? k->mm : NULL;
     }
+    }
+}
+
+/* The matvec of a mixed-precision type for nt tokens, e.g. "..._nt2". */
+static const char *ds4_gpu_quant_mv_name(const ds4_gpu_quant_kind *k, uint32_t nt) {
+    static char names[sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0]) + 1][2][64];
+    if (nt <= 1u || nt > 3u) return k->mv;
+    const size_t ki = k == &ds4_gpu_q4_K_mixed_kind ? sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0])
+                                                     : (size_t)(k - ds4_gpu_quant_kinds);
+    char *name = names[ki][nt - 2u];
+    if (!name[0]) snprintf(name, sizeof(names[0][0]), "%s_nt%u", k->mv, nt);
+    return name;
+}
+
+/* The 2-5 row matvec of a mixed-precision type, e.g. "..._r1_3". */
+static const char *ds4_gpu_quant_mv_ext_name(const ds4_gpu_quant_kind *k, int16_t r1ptg) {
+    static char names[sizeof(ds4_gpu_quant_kinds) / sizeof(ds4_gpu_quant_kinds[0])][4][64];
+    if (!k || !k->mv_ext || r1ptg < 2 || r1ptg > 5) return NULL;
+    char *name = names[k - ds4_gpu_quant_kinds][r1ptg - 2];
+    if (!name[0]) snprintf(name, sizeof(names[0][0]), "%s%d", k->mv_ext, (int)r1ptg);
+    return name;
 }
 
 static const char *ds4_gpu_q4_nax_name(uint32_t weight_type, uint64_t tile_n) {
@@ -19861,6 +19949,60 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
+        /* Mixed-precision types: one token, or a small batch of a type
+         * without a 2-5 row kernel, streams through the classic matvec once
+         * per row; larger batches take mv_ext or the tiled GEMM below. */
+        const ds4_gpu_quant_kind *kind = ds4_gpu_quant_kind_find(weight_type);
+        if (!kind && weight_type == DS4_METAL_TENSOR_Q4_K && n_tok <= 8u &&
+            !ds4_gpu_device_is_m5_apple_silicon() && getenv("DS4_METAL_NO_Q4_K_MIXED") == NULL) {
+            kind = &ds4_gpu_q4_K_mixed_kind;
+        }
+        if (kind && (n_tok == 1u || (n_tok <= 8u && (n_tok <= kind->nt_max || !kind->mv_ext)))) {
+            /* four tokens as two pairs: four-token kernels would spill */
+            const uint32_t nt = n_tok == 1u || n_tok > kind->nt_max ? 1u : n_tok == 2u || n_tok == 4u ? 2u : 3u;
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_ext_pipeline(ds4_gpu_quant_mv_name(kind, nt), (int16_t)kind->nsg, 8);
+            if (!pipeline) return 0;
+            ds4_gpu_q8_0_matvec_args args = {
+                .ne00 = (int32_t)in_dim,
+                .ne01 = (int32_t)out_dim,
+                .ne02 = 1,
+                .nb00 = 1,
+                .nb01 = row_bytes,
+                .nb02 = row_bytes * out_dim,
+                .nb03 = row_bytes * out_dim,
+                .ne10 = (int32_t)in_dim,
+                .ne11 = (int32_t)n_tok,
+                .ne12 = 1,
+                .nb10 = sizeof(float),
+                .nb11 = in_dim * sizeof(float),
+                .nb12 = in_dim * n_tok * sizeof(float),
+                .nb13 = in_dim * n_tok * sizeof(float),
+                .ne0 = (int32_t)out_dim,
+                .ne1 = (int32_t)n_tok,
+                .nr0 = kind->nr0,
+                .r2 = 1,
+                .r3 = 1,
+            };
+            /* three or four tokens' inputs leave room for half of Q2_0's eight rows */
+            const uint32_t nr0 = nt > 2u && kind->nr0 > 4u ? kind->nr0 / 2u : kind->nr0;
+            args.nr0 = (int32_t)nr0;
+            const uint64_t rows_ptg = (uint64_t)nr0 * (kind->ksplit ? 1u : kind->nsg);
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setThreadgroupMemoryLength:kind->shmem * (kind->ksplit ? nt : 1u) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
+                                                  ((NSUInteger)n_tok + nt - 1u) / nt,
+                                                  1)
+                 threadsPerThreadgroup:MTLSizeMake(32, kind->nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "quant mul_mv") ? 1 : 0;
+        }
+
         /*
          * Small-batch Q4_K goes to the classic (llama.cpp-style) matvec:
          * the mul_mv_ext family tops out around 220 GB/s on M5 for the GLM
@@ -19920,7 +20062,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = (n_tok == 1u) ? 1 : ds4_gpu_mv_ext_r1ptg(n_tok);
-            const char *fn_name = ds4_gpu_q4_mv_ext_name(weight_type, r1ptg);
+            const char *fn_name = kind ? ds4_gpu_quant_mv_ext_name(kind, r1ptg)
+                                       : ds4_gpu_q4_mv_ext_name(weight_type, r1ptg);
             id<MTLComputePipelineState> pipeline =
                 fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
             if (pipeline) {
@@ -48185,6 +48328,15 @@ enum {
     QWEN4_K_VIS_ATTENTION,
     QWEN4_K_VIS_BIAS_RESIDUAL,
     QWEN4_K_VIS_BIAS_ACT,
+    QWEN4_K_HC_NORM_BF16,
+    QWEN4_K_HC_NORM_REUSE_BF16,
+    QWEN4_K_HC_GATE_MIX_BF16,
+    QWEN4_K_HC_GATE_MIX_PAIR_BF16,
+    QWEN4_K_MOE_MID_Q2_0,
+    QWEN4_K_MOE_DOWN_Q2_0,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2,
+    QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3,
     QWEN4_K_COUNT,
 };
 
@@ -48290,6 +48442,15 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_vis_attention",
     "kernel_qwen4_vis_bias_residual",
     "kernel_qwen4_vis_bias_act",
+    "kernel_qwen4_hc_norm_bf16",
+    "kernel_qwen4_hc_norm_reuse_bf16",
+    "kernel_qwen4_hc_gate_mix_bf16",
+    "kernel_qwen4_hc_gate_mix_pair_bf16",
+    "kernel_qwen4_moe_mid_q2_0",
+    "kernel_qwen4_moe_down_q2_0",
+    "kernel_qwen4_hc_gate_mix_bf16_rows",
+    "kernel_qwen4_hc_gate_mix_bf16_rows_nt2",
+    "kernel_qwen4_hc_gate_mix_bf16_rows_nt3",
 };
 
 typedef struct {
@@ -48459,11 +48620,12 @@ static int qwen4_dispatch(int kernel, const void *args, size_t args_len,
 
 /* bytes of one hc mixer row of n elements: f16, f32 or q8_0 */
 static uint64_t qwen4_hc_row_bytes(uint32_t weight_type, uint64_t n) {
-    return weight_type == 1u ? n * 2u : weight_type == 0u ? n * 4u : weight_type == 8u ? (n / 32u) * 34u : 0u;
+    return weight_type == 1u || weight_type == 30u ? n * 2u : weight_type == 0u ? n * 4u :
+           weight_type == 8u ? (n / 32u) * 34u : 0u;
 }
 
-static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8) {
-    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : kq8;
+static int qwen4_hc_kernel(uint32_t weight_type, int k16, int k32, int kq8, int kbf16) {
+    return weight_type == 1u ? k16 : weight_type == 0u ? k32 : weight_type == 30u ? kbf16 : kq8;
 }
 
 static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
@@ -48478,7 +48640,10 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 1u:  return in_dim * 2u;            /* f16 */
     case 30u: return in_dim * 2u;            /* bf16 */
     case 0u:  return in_dim * 4u;            /* f32 */
-    default:  return 0;
+    default: {
+        const ds4_gpu_quant_kind *k = ds4_gpu_quant_kind_find(weight_type);
+        return k && (in_dim % k->block) == 0 ? (in_dim / k->block) * k->block_bytes : 0u;
+    }
     }
 }
 
@@ -48563,8 +48728,10 @@ int ds4_gpu_qwen4_hc_norm_tensor(
         }
     }
     const int kernel = reuse
-        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8)
-        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8);
+        ? qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_REUSE_F16, QWEN4_K_HC_NORM_REUSE_F32, QWEN4_K_HC_NORM_REUSE_Q8,
+                          QWEN4_K_HC_NORM_REUSE_BF16)
+        : qwen4_hc_kernel(weight_type, QWEN4_K_HC_NORM_F16, QWEN4_K_HC_NORM_F32, QWEN4_K_HC_NORM_Q8,
+                          QWEN4_K_HC_NORM_BF16);
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
                           MTLSizeMake(reuse ? n_hc : n_hc * DS4_QWEN4_HC_CHUNKS, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
@@ -48592,10 +48759,23 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         (prefetch_override >= 0 ? prefetch_override > 0 : ds4_gpu_device_is_m5_apple_silicon());
     const int kernel = pair ? (prefetch ? QWEN4_K_HC_GATE_MIX_PAIR_F16_PF
                                         : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_PAIR_F16,
-                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8))
+                                              QWEN4_K_HC_GATE_MIX_PAIR_F32, QWEN4_K_HC_GATE_MIX_PAIR_Q8,
+                                              QWEN4_K_HC_GATE_MIX_PAIR_BF16))
                             : prefetch ? QWEN4_K_HC_GATE_MIX_F16_PF
                             : qwen4_hc_kernel(weight_type, QWEN4_K_HC_GATE_MIX_F16, QWEN4_K_HC_GATE_MIX_F32,
-                                       QWEN4_K_HC_GATE_MIX_Q8);
+                                       QWEN4_K_HC_GATE_MIX_Q8, QWEN4_K_HC_GATE_MIX_BF16);
+    /* BF16 rows: the activated low-rank inputs sit in threadgroup memory
+     * and each simdgroup streams QWEN4_HC_MIX_ROWS output rows for up to
+     * three tokens (MTP verification) per weight read. */
+    if (weight_type == 30u && getenv("DS4_QWEN4_NO_HC_MIX_ROWS") == NULL) {
+        const uint32_t rows_ptg = 4u * 4u;
+        const uint32_t nt = n_tokens == 2u || n_tokens == 4u ? 2u : n_tokens >= 3u ? 3u : 1u;
+        const int rows_kernel = nt == 3u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3 :
+                                nt == 2u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2 : QWEN4_K_HC_GATE_MIX_BF16_ROWS;
+        return qwen4_dispatch(rows_kernel, &args, sizeof(args), b, 4,
+                              MTLSizeMake((n_embd + rows_ptg - 1u) / rows_ptg, (n_tokens + nt - 1u) / nt, 1),
+                              MTLSizeMake(128, 1, 1), (NSUInteger)nt * n_rank * sizeof(float));
+    }
     /* More independent output rows share the activated inputs in MTP.
      * Keep the per-row lane mapping and reduction order unchanged. */
     const uint32_t default_nsg = n_embd == 2560u && n_rank == 320u &&
@@ -49572,6 +49752,13 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         (specialize ? qwen4_moe_mv_groups(weight_type) : 4u);
     const uint32_t rows_per_tg = nr * nsg;
     const int kernel = !q4k ? QWEN4_K_MOE_MID : nr == 1u ? QWEN4_K_MOE_MID_Q4K_NR1 : QWEN4_K_MOE_MID_Q4K;
+    if (weight_type == 42u && (in_dim % 64u) == 0 && getenv("DS4_QWEN4_NO_Q2_0_MOE") == NULL) {
+        /* Q2_0 experts: four gate and four up rows per SIMD group */
+        /* a non-Q2_0 shared expert spreads over one extra slot (metal/qwen4.metal) */
+        const uint32_t split = has_shared && shared_type != 42u ? 2u : 1u;
+        return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
+    }
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -49606,6 +49793,12 @@ int ds4_gpu_qwen4_moe_down_tensor(
         if (!qwen4_bind_weight(&b[4], model_map, model_size, shared_down_offset, shared_bytes, "shared down")) return 0;
     } else {
         b[4] = b[0];
+    }
+    if (weight_type == 42u && (ff_dim % 64u) == 0 && getenv("DS4_QWEN4_NO_Q2_0_MOE") == NULL) {
+        /* Q2_0 experts: sixteen short down rows per SIMD group */
+        const uint32_t split = has_shared && shared_type != 42u ? 4u : 1u;
+        return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q2_0, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + 63u) / 64u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
     const uint32_t rows_per_tg = nsg * (qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_rows() : 2u);
@@ -49881,7 +50074,8 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u &&
+         weight_type != 42u) ||
         (in_dim % 64) != 0 || ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
@@ -49964,7 +50158,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u &&
+         weight_type != 42u) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||

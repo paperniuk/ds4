@@ -2037,40 +2037,47 @@ static inline void qwen4_idx_select_pre_row(
     /* Missing blocks of the last tile carry key 0 and must not count as
      * equals when the k-th key is 0; the block test excludes them below. */
 
-    /* 4. gather: contiguous entry chunk per thread, ranks by exclusive scan */
-    const uint chunk = (n_c + nth - 1) / nth;
-    const uint e0 = min((uint)tid * chunk, n_c), e1 = min(e0 + chunk, n_c);
-    uint n_gt = 0, n_eq = 0;
-    for (uint e = e0; e < e1; e++) {
+    /* 4. gather in entry order (ascending blocks), as in
+     *    kernel_qwen4_idx_select: coalesced simdgroup segments, counts in the
+     *    now idle histogram, ranks by simd prefix sums */
+    const uint nsg = nth / 32;
+    const uint seg = (n_c + nsg - 1) / nsg;
+    const uint s0 = min((uint)sgitg * seg, n_c), s1 = min(s0 + seg, n_c);
+    uint c_gt = 0, c_eq = 0;
+    for (uint e = s0 + tiisg; e < s1; e += 32) {
         const uint b = compact ? qwen4_idx_pre_block(tiles, e) : e;
         if (b >= n) continue;
         const uint key = compact ? keys[e] : as_type<uint>(max(row[e], 0.0f));
-        n_gt += key > prefix; n_eq += key == prefix;
+        c_gt += key > prefix;
+        c_eq += key == prefix;
     }
-    uint r_gt, r_eq;
-    for (uint which = 0; which < 2; which++) {
-        const uint v = which == 0 ? n_gt : n_eq;
-        const uint p = simd_prefix_exclusive_sum(v);
-        if (tiisg == 31) scan[sgitg] = p + v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgitg == 0) {
-            const uint nsg = (nth + 31) / 32;
-            const uint sv = tiisg < nsg ? scan[tiisg] : 0u;
-            const uint sp = simd_prefix_exclusive_sum(sv);
-            if (tiisg < nsg) scan[tiisg] = sp;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (which == 0) r_gt = p + scan[sgitg]; else r_eq = p + scan[sgitg];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    c_gt = simd_sum(c_gt);
+    c_eq = simd_sum(c_eq);
+    if (tiisg == 0) {
+        atomic_store_explicit(&hist[sgitg], c_gt, memory_order_relaxed);
+        atomic_store_explicit(&hist[32 + sgitg], c_eq, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r_gt = 0, r_eq = 0;
+    for (uint g = 0; g < sgitg; g++) {
+        r_gt += atomic_load_explicit(&hist[g], memory_order_relaxed);
+        r_eq += atomic_load_explicit(&hist[32 + g], memory_order_relaxed);
     }
     const uint eq_base = top_k - need;
-    for (uint e = e0; e < e1; e++) {
-        const uint b = compact ? qwen4_idx_pre_block(tiles, e) : e;
-        if (b >= n) continue;
-        const uint key = compact ? keys[e] : as_type<uint>(max(row[e], 0.0f));
-        if (key > prefix) out[r_gt++] = (int32_t)b;
-        else if (key == prefix) { if (r_eq < need) out[eq_base + r_eq] = (int32_t)b; r_eq++; }
+    for (uint e0 = s0; e0 < s1; e0 += 32) {
+        const uint e = e0 + tiisg;
+        const uint b = e < s1 ? (compact ? qwen4_idx_pre_block(tiles, e) : e) : n;
+        const uint key = b < n ? (compact ? keys[e] : as_type<uint>(max(row[e], 0.0f))) : 0u;
+        const uint gt = b < n && key > prefix, eq = b < n && key == prefix;
+        const uint pg = simd_prefix_exclusive_sum(gt), pe = simd_prefix_exclusive_sum(eq);
+        if (gt) out[r_gt + pg] = (int32_t)b;
+        if (eq && r_eq + pe < need) out[eq_base + r_eq + pe] = (int32_t)b;
+        r_gt += simd_sum(gt);
+        r_eq += simd_sum(eq);
     }
+    /* the histogram is cleared before its next use; keep a later row's
+     * radix from racing these reads */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 kernel void kernel_qwen4_idx_select_pre(

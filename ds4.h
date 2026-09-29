@@ -392,6 +392,7 @@ bool ds4_token_is_stop_for_think_mode(ds4_engine *e,
                                       ds4_think_mode mode);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+int ds4_token_turn_start(ds4_engine *e);
 
 /* Tensor-parallel binding: allocates the GPU gate slab, registers it with
  * the transport and arms the per-layer gate machinery.  Call once, after
@@ -590,6 +591,12 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Qwen3.8 prompt anchor: save the recurrent state at the current position,
+ * query it (-1 when absent or no longer a prefix of the checkpoint), or
+ * rewind the session to it.  Other families return false / -1. */
+bool ds4_session_anchor_save(ds4_session *s);
+int ds4_session_anchor_pos(const ds4_session *s);
+bool ds4_session_anchor_restore(ds4_session *s);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);

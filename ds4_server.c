@@ -10023,6 +10023,11 @@ struct server_slot {
     char *live_text;
     size_t live_text_len;
     int live_text_pos;              /* checkpoint.len at render time; 0 = stale */
+    /* Rendered text of checkpoint[0, anchor_pos) when the session holds a
+     * Qwen3.8 prompt anchor there (see slot_save_prompt_anchor). */
+    char *anchor_text;
+    size_t anchor_text_len;
+    int anchor_pos;
 
     job *assigned;
     job *running;
@@ -11526,7 +11531,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *
  *   responses-visible -> responses-tool-output -> anthropic-tool-output ->
  *   memory-rewind (GLM only) -> memory-token -> thinking-visible ->
- *   memory-text
+ *   memory-text -> prompt-anchor (Qwen3.8 only)
  *
  * Both slot routing (job_slot_score, under dispatch) and the execution
  * ladder consume this probe, so routing decisions and execution-time reuse
@@ -11581,6 +11586,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_PROMPT_ANCHOR,
 } slot_reuse_kind;
 
 typedef struct {
@@ -11723,6 +11729,21 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
+    /* The live transcript went past what the client replays (a retried or
+     * cancelled turn, or a different spelling of the last reply), but the
+     * prompt still agrees with it up to the anchor of an earlier prompt. */
+    if (ptext && req->image_count == 0 && slot->anchor_text &&
+        slot->anchor_pos > 0 && slot->anchor_pos <= live_pos &&
+        ds4_session_anchor_pos(slot->session) == slot->anchor_pos &&
+        slot->anchor_text_len < plen &&
+        byte_prefix_match(ptext, plen, slot->anchor_text, slot->anchor_text_len))
+    {
+        pr.kind = REUSE_PROMPT_ANCHOR;
+        pr.reuse_tokens = slot->anchor_pos;
+        pr.suffix_off = slot->anchor_text_len;
+        return pr;
+    }
+
     return pr;
 }
 
@@ -11766,6 +11787,49 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
     if (!live || live->len <= 0) return;
     slot->live_text = render_tokens_text(s->engine, live, &slot->live_text_len);
     if (slot->live_text) slot->live_text_pos = live->len;
+}
+
+/* Prompts shorter than this are cheap enough to replay. */
+#define PROMPT_ANCHOR_MIN_TOKENS 1024
+
+/* A Qwen3.8 prompt anchor sits on the last turn marker the prefill will
+ * reach, just before the assistant header the client appended: whatever a
+ * later request renders after it, the transcript up to it stays the same.
+ * Returns -1 when the prompt has no marker past the prefill start. */
+static int prompt_anchor_split(server *s, const ds4_tokens *prompt, int start) {
+    const int marker = ds4_token_turn_start(s->engine);
+    if (marker < 0 || !prompt || prompt->len < PROMPT_ANCHOR_MIN_TOKENS) return -1;
+    for (int i = prompt->len - 1; i >= start && i >= PROMPT_ANCHOR_MIN_TOKENS; i--) {
+        if (prompt->v[i] == marker) return i;
+    }
+    return -1;
+}
+
+/* Called with the session at prompt[0, pos).  The anchor text must be a byte
+ * prefix of the request's rendered prompt, so live tiers that keep reasoning
+ * the client did not replay never leave an anchor behind. */
+static void slot_save_prompt_anchor(server *s, server_slot *slot,
+                                    const request *req,
+                                    const ds4_tokens *prompt, int pos) {
+    free(slot->anchor_text);
+    slot->anchor_text = NULL;
+    slot->anchor_text_len = 0;
+    slot->anchor_pos = 0;
+    pthread_mutex_lock(&s->inference_mu);
+    const bool saved = ds4_session_anchor_save(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    if (!saved || !req->prompt_text) return;
+    ds4_tokens head = *prompt;
+    head.len = pos;
+    size_t len = 0;
+    char *text = render_tokens_text(s->engine, &head, &len);
+    if (!text || !byte_prefix_match(req->prompt_text, strlen(req->prompt_text), text, len)) {
+        free(text);
+        return;
+    }
+    slot->anchor_text = text;
+    slot->anchor_text_len = len;
+    slot->anchor_pos = pos;
 }
 
 /* =========================================================================
@@ -13558,6 +13622,27 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
         break;
+    case REUSE_PROMPT_ANCHOR: {
+        pthread_mutex_lock(&s->inference_mu);
+        const bool restored = ds4_session_anchor_restore(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (!restored ||
+            !build_live_prompt_suffix(s, slot, &j->req,
+                                      j->req.prompt_text + reuse.suffix_off,
+                                      &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
+        live_materialized = true;
+        cache_source = "prompt-anchor";
+        cache_diag.rewind_to = reuse.reuse_tokens;
+        prompt_for_sync = &effective_prompt;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: rewound live kv to prompt anchor %d (live %d, prompt %d)",
+                   reuse.reuse_tokens, old_pos, effective_prompt.len);
+        break;
+    }
     case REUSE_NONE:
     default:
         cached = 0;
@@ -13754,11 +13839,32 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    int prompt_sync_rc = multimodal ?
-        server_session_sync_multimodal(s, slot, prompt_for_sync,
-                                       j->req.images, j->req.image_count,
-                                       err, sizeof(err)) :
-        server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+    int prompt_sync_rc = 0;
+    if (!multimodal) {
+        /* Stop the prefill at the prompt anchor to save the state there. */
+        pthread_mutex_lock(&s->inference_mu);
+        int start = ds4_session_pos(slot->session);
+        if (ds4_session_common_prefix(slot->session, prompt_for_sync) != start) start = 0;
+        const int held = ds4_session_anchor_pos(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        const int split = prompt_anchor_split(s, prompt_for_sync, start);
+        if (split > start) {
+            ds4_tokens head = *prompt_for_sync;
+            head.len = split;
+            prompt_sync_rc = server_session_sync(s, slot, &head, err, sizeof(err));
+            if (prompt_sync_rc == 0)
+                slot_save_prompt_anchor(s, slot, &j->req, prompt_for_sync, split);
+        } else if (split == start && held != split) {
+            slot_save_prompt_anchor(s, slot, &j->req, prompt_for_sync, split);
+        }
+    }
+    if (prompt_sync_rc == 0) {
+        prompt_sync_rc = multimodal ?
+            server_session_sync_multimodal(s, slot, prompt_for_sync,
+                                           j->req.images, j->req.image_count,
+                                           err, sizeof(err)) :
+            server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+    }
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
@@ -15511,6 +15617,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
         free(slot->live_text);
+        free(slot->anchor_text);
         if (slot->session) ds4_session_free(slot->session);
     }
     free(s->slot_threads);

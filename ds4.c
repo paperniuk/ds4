@@ -44113,6 +44113,11 @@ int ds4_token_assistant(ds4_engine *e) {
     return e->vocab.assistant_id;
 }
 
+/* <|im_start|> for ChatML families, -1 otherwise. */
+int ds4_token_turn_start(ds4_engine *e) {
+    return e->vocab.im_start_id;
+}
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,
@@ -57820,6 +57825,16 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t snap0_pos;
     int32_t snap0_mrope_delta;
     bool snap0_valid;
+    /* Prompt anchor: the recurrent state at a server-chosen prompt position.
+     * Attention rows are only appended, so restoring this set rewinds the
+     * session to anchor_pos without replaying the transcript. */
+    ds4_gpu_tensor *anchor_lin_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *anchor_lin_hist[DS4_MAX_LAYER];
+    ds4_gpu_tensor *anchor_ple_hist;
+    int anchor_ple_prev[DS4_MAX_PLE_NGRAM];
+    uint32_t anchor_pos;
+    int32_t anchor_mrope_delta;
+    bool anchor_valid;
     uint32_t mtp_pos;
     uint32_t n_logit_rows;
     bool snap_after_first;   /* set by the caller for a 2-token verify: snapshot the state after row 0 */
@@ -57938,7 +57953,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
-        &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
+        &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->anchor_ple_hist, &g->pos3,
         &g->draft_head, &g->steer_dirs,
     };
     if (g->owns_scratch) {
@@ -57982,6 +57997,8 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->snap2_lin_hist[il]);
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
         ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
+        ds4_gpu_tensor_free(g->anchor_lin_state[il]);
+        ds4_gpu_tensor_free(g->anchor_lin_hist[il]);
     }
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
@@ -58318,6 +58335,7 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap_valid = false;
     g->snap2_valid = false;
     g->snap0_valid = false;
+    g->anchor_valid = false;
     g->snap_after_first = false;
     g->snap_after_second = false;
 }
@@ -59131,6 +59149,36 @@ static bool qwen4_graph_state_copy0(ds4_qwen4_gpu_graph *g, bool save) {
     return qwen4_graph_state_copy_set(g, save, g->snap0_lin_state, g->snap0_lin_hist,
                                       &g->snap0_ple_hist, g->snap0_ple_prev,
                                       &g->snap0_pos, &g->snap0_mrope_delta);
+}
+
+static bool qwen4_graph_state_copy_anchor(ds4_qwen4_gpu_graph *g, bool save) {
+    return qwen4_graph_state_copy_set(g, save, g->anchor_lin_state, g->anchor_lin_hist,
+                                      &g->anchor_ple_hist, g->anchor_ple_prev,
+                                      &g->anchor_pos, &g->anchor_mrope_delta);
+}
+
+/* The anchor set is allocated on first use, independently of MTP: about
+ * 120 MB for Flash Next, all of it GDN state. */
+static bool qwen4_graph_ensure_anchor(ds4_qwen4_gpu_graph *g) {
+    if (g->anchor_ple_hist) return true;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t hist_n = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!g->layer_lin_state[il]) continue;
+        g->anchor_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
+        g->anchor_lin_hist[il] = qwen4_graph_alloc_f32(hist_n);
+        ok = g->anchor_lin_state[il] && g->anchor_lin_hist[il];
+    }
+    if (ok) g->anchor_ple_hist = qwen4_graph_alloc_f32((uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
+                                                       (uint64_t)DS4_N_EMBD * DS4_N_HC);
+    if (ok && g->anchor_ple_hist) return true;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->anchor_lin_state[il]);
+        ds4_gpu_tensor_free(g->anchor_lin_hist[il]);
+        g->anchor_lin_state[il] = g->anchor_lin_hist[il] = NULL;
+    }
+    return false;
 }
 
 /* A rejected draft returns to the state the verify snapshotted after row 0,
@@ -62946,6 +62994,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     }
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const uint32_t rows = h[7];
+    g->anchor_valid = false;
     if (h[12] != DS4_QWEN4_PAYLOAD_TAG || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
         h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB || h[6] != DS4_N_EMBD * DS4_N_HC) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
@@ -85370,7 +85419,70 @@ void ds4_session_invalidate(ds4_session *s) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (s->ds41_graph_ready) ds41_graph_reset(&s->ds41_graph);
 #endif
+#ifdef DS4_HAS_QWEN4_GPU
+    s->qwen4_graph.anchor_valid = false;
+#endif
     ds4_session_glm_reset_dense_cache(s);
+#endif
+}
+
+/* Qwen3.8 cannot rewind its GDN layers, so a prompt that shares only part of
+ * the live transcript would otherwise be replayed from token zero.  The server
+ * saves the state at a prompt anchor (the last turn marker) before generation;
+ * a later request that agrees with the transcript up to the anchor restores
+ * it and prefills only the rest. */
+bool ds4_session_anchor_save(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_GPU)
+    if (!s || !ds4_session_is_qwen4(s) || !s->qwen4_graph_ready || !s->checkpoint_valid ||
+        s->qwen4_rewound || s->engine->tp.active || s->distributed) return false;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    g->anchor_valid = false;
+    if (g->pos != (uint32_t)s->checkpoint.len || !qwen4_graph_ensure_anchor(g)) return false;
+    g->anchor_valid = qwen4_graph_state_copy_anchor(g, true);
+    return g->anchor_valid;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+int ds4_session_anchor_pos(const ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_GPU)
+    if (s && ds4_session_is_qwen4(s) && s->checkpoint_valid && s->qwen4_graph.anchor_valid &&
+        s->qwen4_graph.anchor_pos <= (uint32_t)s->checkpoint.len)
+        return (int)s->qwen4_graph.anchor_pos;
+#else
+    (void)s;
+#endif
+    return -1;
+}
+
+/* The restored session keeps checkpoint[0, anchor) and is marked rewound, so
+ * the next sync must evaluate at least one token: an equal-length sync falls
+ * back to a full replay instead of reusing stale logits. */
+bool ds4_session_anchor_restore(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_GPU)
+    const int pos = ds4_session_anchor_pos(s);
+    if (pos <= 0) return false;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (!qwen4_graph_state_copy_anchor(g, false)) {
+        qwen4_graph_reset(g);
+        s->checkpoint_valid = false;
+        s->checkpoint.len = 0;
+        return false;
+    }
+    s->checkpoint.len = pos;
+    s->qwen4_rewound = true;
+    s->mtp_draft_valid = false;
+    g->snap_valid = false;
+    g->snap2_valid = false;
+    g->snap0_valid = false;
+    g->mtp_last_rows = 0;
+    if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
+    return true;
+#else
+    (void)s;
+    return false;
 #endif
 }
 

@@ -1880,43 +1880,35 @@ kernel void kernel_qwen4_idx_select(
         prefix = found[0]; need = found[1];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    /* gather: contiguous chunk per thread, ranks by exclusive scan */
-    const uint chunk = (n + nth - 1) / nth;
-    const uint b0 = min((uint)tid * chunk, n), b1 = min(b0 + chunk, n);
-    uint n_gt = 0, n_eq = 0;
-    for (uint b = b0; b < b1; b += 8) {
-        float v[8];
-        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
-        for (uint u = 0; u < 8 && b + u < b1; u++) {
-            const uint key = as_type<uint>(max(v[u], 0.0f));
-            n_gt += key > prefix; n_eq += key == prefix;
-        }
+    /* gather in index order: each simdgroup owns a contiguous segment that
+     * its lanes read coalesced, counting first, then placing its elements
+     * after the earlier segments' by simd prefix sums */
+    const uint nsg = nth / 32;
+    const uint seg = (n + nsg - 1) / nsg;
+    const uint s0 = min((uint)sgitg * seg, n), s1 = min(s0 + seg, n);
+    uint c_gt = 0, c_eq = 0;
+    for (uint b = s0 + tiisg; b < s1; b += 32) {
+        const uint key = as_type<uint>(max(row[b], 0.0f));
+        c_gt += key > prefix;
+        c_eq += key == prefix;
     }
-    uint r_gt, r_eq;
-    for (uint which = 0; which < 2; which++) {
-        const uint v = which == 0 ? n_gt : n_eq;
-        const uint p = simd_prefix_exclusive_sum(v);
-        if (tiisg == 31) scan[sgitg] = p + v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sgitg == 0) {
-            const uint nsg = (nth + 31) / 32;
-            const uint sv = tiisg < nsg ? scan[tiisg] : 0u;
-            const uint sp = simd_prefix_exclusive_sum(sv);
-            if (tiisg < nsg) scan[tiisg] = sp;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (which == 0) r_gt = p + scan[sgitg]; else r_eq = p + scan[sgitg];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    threadgroup uint seg_gt[32], seg_eq[32];
+    c_gt = simd_sum(c_gt);
+    c_eq = simd_sum(c_eq);
+    if (tiisg == 0) { seg_gt[sgitg] = c_gt; seg_eq[sgitg] = c_eq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r_gt = 0, r_eq = 0;
+    for (uint g = 0; g < sgitg; g++) { r_gt += seg_gt[g]; r_eq += seg_eq[g]; }
     const uint eq_base = args.top_k - need;
-    for (uint b = b0; b < b1; b += 8) {
-        float v[8];
-        for (uint u = 0; u < 8; u++) v[u] = b + u < b1 ? row[b + u] : -1.0f;
-        for (uint u = 0; u < 8 && b + u < b1; u++) {
-            const uint key = as_type<uint>(max(v[u], 0.0f));
-            if (key > prefix) out[r_gt++] = (int32_t)(b + u);
-            else if (key == prefix) { if (r_eq < need) out[eq_base + r_eq] = (int32_t)(b + u); r_eq++; }
-        }
+    for (uint b0 = s0; b0 < s1; b0 += 32) {
+        const uint b = b0 + tiisg;
+        const uint key = b < s1 ? as_type<uint>(max(row[b], 0.0f)) : 0u;
+        const uint gt = b < s1 && key > prefix, eq = b < s1 && key == prefix;
+        const uint pg = simd_prefix_exclusive_sum(gt), pe = simd_prefix_exclusive_sum(eq);
+        if (gt) out[r_gt + pg] = (int32_t)b;
+        if (eq && r_eq + pe < need) out[eq_base + r_eq + pe] = (int32_t)b;
+        r_gt += simd_sum(gt);
+        r_eq += simd_sum(eq);
     }
 }
 

@@ -3205,8 +3205,11 @@ static void bench_cold(arena_t *a) {
         { "bf16 big 2560->12288", 30u, 2560, 12288, 16.0, 0 },
         { "q3_K big 2560->49152", 11u, 2560, 49152, 3.4375, 0 },
         { "iq4_xs big 2560->49152", 23u, 2560, 49152, 4.25, 0 },
+        { "q2_0 big 2560->49152", 42u, 2560, 49152, 2.25, 0 },
     };
-    const uint64_t span = 160ull << 20;
+    /* QWEN4_COLD_SPAN_MB=8 keeps the copies SLC-resident for a hot baseline */
+    const char *span_env = getenv("QWEN4_COLD_SPAN_MB");
+    const uint64_t span = (span_env && atoi(span_env) > 0 ? (uint64_t)atoi(span_env) : 160ull) << 20;
     const uint64_t off0 = arena_alloc(a, span + (16ull << 20));
     memset(a->base + off0, 0x11, span + (16ull << 20));   /* small finite weights, pages resident */
     cold_ctx c = { .a = a, .off0 = off0 };
@@ -3216,7 +3219,7 @@ static void bench_cold(arena_t *a) {
     for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
         const uint64_t bytes = (uint64_t)((double)cases[k].in_dim * cases[k].out_dim * cases[k].bpw / 8.0);
         c.stride = (bytes + 16383u) & ~16383ull;
-        c.copies = (uint32_t)(span / c.stride);
+        c.copies = span / c.stride ? (uint32_t)(span / c.stride) : 1u;
         c.type = cases[k].type; c.in_dim = cases[k].in_dim; c.out_dim = cases[k].out_dim; c.mix = cases[k].mix;
         const char *only = getenv("QWEN4_BENCH_ONLY");
         if (only && only[0] && !strstr(cases[k].name, only)) continue;

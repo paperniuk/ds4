@@ -437,6 +437,13 @@ static char *json_minify_raw_value(const char *json) {
 
 #define SERVER_IMAGE_MARKER_BYTES 64
 
+/* Agent clients resend every screenshot of a session with each request. Past
+ * SERVER_MAX_IMAGES the oldest ones become a text note. They are dropped in
+ * steps of half the limit, so the rendered prefix, and with it the live KV,
+ * changes once per step instead of on every new image. */
+#define SERVER_MAX_IMAGES 64
+#define SERVER_IMAGE_OMITTED "[image omitted]"
+
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
     uint8_t *encoded;
@@ -3641,6 +3648,30 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+static size_t server_images_to_drop(size_t count) {
+    if (count <= SERVER_MAX_IMAGES) return 0;
+    const size_t step = SERVER_MAX_IMAGES / 2;
+    return (count - SERVER_MAX_IMAGES + step - 1) / step * step;
+}
+
+/* Replace the markers of the first n images, in prompt order, with a note. */
+static char *prompt_omit_images(const char *text, server_image_input **images, size_t n) {
+    buf b = {0};
+    const char *cursor = text;
+    for (size_t i = 0; i < n; i++) {
+        const char *marker = strstr(cursor, images[i]->marker);
+        if (!marker) {
+            buf_free(&b);
+            return NULL;
+        }
+        buf_append(&b, cursor, (size_t)(marker - cursor));
+        buf_puts(&b, SERVER_IMAGE_OMITTED);
+        cursor = marker + strlen(images[i]->marker);
+    }
+    buf_puts(&b, cursor);
+    return buf_take(&b);
+}
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3651,23 +3682,32 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
-        return false;
-    }
     if (!e || !s || !ds4_engine_has_vision(e)) {
         snprintf(err, errlen, "image input requires starting ds4-server with --vision FILE");
         return false;
     }
 
-    server_image_input **inputs = xmalloc(count * sizeof(inputs[0]));
-    ds4_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
-    memset(embeddings, 0, count * sizeof(embeddings[0]));
+    server_image_input **all = xmalloc(count * sizeof(all[0]));
     size_t next = 0;
     for (int i = 0; i < msgs->len; i++) {
         for (size_t j = 0; j < msgs->v[i].images.len; j++)
-            inputs[next++] = &msgs->v[i].images.v[j];
+            all[next++] = &msgs->v[i].images.v[j];
     }
+    const size_t drop = server_images_to_drop(count);
+    if (drop) {
+        char *text = prompt_omit_images(r->prompt_text, all, drop);
+        if (!text) {
+            snprintf(err, errlen, "image marker was lost while rendering the request");
+            free(all);
+            return false;
+        }
+        free(r->prompt_text);
+        r->prompt_text = text;
+        count -= drop;
+    }
+    server_image_input **inputs = all + drop;
+    ds4_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
+    memset(embeddings, 0, count * sizeof(embeddings[0]));
 
     bool ok = true;
     server_inference_lock(s);
@@ -3709,7 +3749,7 @@ done:
     for (size_t i = 0; i < count; i++)
         ds4_vision_embedding_free(&embeddings[i]);
     free(embeddings);
-    free(inputs);
+    free(all);
     if (!ok) {
         ds4_tokens_free(&r->prompt);
         for (size_t i = 0; i < r->image_count; i++)
@@ -9939,13 +9979,13 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t offsets[SERVER_MAX_IMAGES];
 } visible_image_key;
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
         (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     const char *cursor = text;
@@ -10045,8 +10085,10 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
-#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
+/* A 1024-token Qwen3.8 screenshot is ~10 MB of embedding, so this keeps a
+ * whole agent session of screenshots from being re-encoded on every turn. */
+#define SERVER_IMAGE_CACHE_ENTRIES SERVER_MAX_IMAGES
+#define SERVER_IMAGE_CACHE_BYTES (768u * 1024u * 1024u)
 
 typedef struct {
     uint8_t *encoded;
@@ -11477,8 +11519,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES) return false;
+    ds4_vision_span spans[SERVER_MAX_IMAGES];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
@@ -22735,6 +22777,24 @@ static void test_visible_image_key(void) {
     free(visible);
 }
 
+static void test_old_images_are_omitted_in_steps(void) {
+    TEST_ASSERT(server_images_to_drop(SERVER_MAX_IMAGES) == 0);
+    for (size_t n = SERVER_MAX_IMAGES + 1; n <= SERVER_MAX_IMAGES * 3; n++) {
+        const size_t drop = server_images_to_drop(n);
+        TEST_ASSERT(n - drop <= SERVER_MAX_IMAGES && n - drop > SERVER_MAX_IMAGES / 2);
+        /* The dropped prefix changes only once per half limit. */
+        if (n > SERVER_MAX_IMAGES + 1 && (n - SERVER_MAX_IMAGES - 1) % (SERVER_MAX_IMAGES / 2))
+            TEST_ASSERT(drop == server_images_to_drop(n - 1));
+    }
+
+    server_image_input images[3] = {{.marker = "<A>"}, {.marker = "<B>"}, {.marker = "<C>"}};
+    server_image_input *order[3] = {&images[0], &images[1], &images[2]};
+    char *text = prompt_omit_images("a<A>b<B>c<C>d", order, 2);
+    TEST_ASSERT(text && !strcmp(text, "a" SERVER_IMAGE_OMITTED "b" SERVER_IMAGE_OMITTED "c<C>d"));
+    free(text);
+    TEST_ASSERT(prompt_omit_images("a<B>b<A>", order, 2) == NULL);
+}
+
 static void test_anthropic_tool_image_output(void) {
     buf json = {0};
     buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
@@ -23030,6 +23090,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_visible_image_key();
+    test_old_images_are_omitted_in_steps();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();

@@ -779,7 +779,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes,tf_nll,tf_top1\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -814,6 +814,11 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        /* A teacher-forced decode leaves the session on the prompt itself, so
+         * the next interval starts where the decode stopped. */
+        if (cfg.teacher_forced_decode && ds4_session_pos(session) > previous &&
+            ds4_session_pos(session) <= frontier)
+            previous = ds4_session_pos(session);
         const double prefill_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
         const bool cuda_profile_prefill =
@@ -844,7 +849,8 @@ int main(int argc, char **argv) {
         }
 
         const bool need_restore_after_generation =
-            cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
+            cfg.gen_tokens > 0 && frontier < cfg.ctx_max &&
+            !(cfg.teacher_forced_decode && !distributed);
         bool have_snapshot = false;
         if (need_restore_after_generation && !distributed &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
@@ -895,6 +901,8 @@ int main(int argc, char **argv) {
             cuda_profile_tokens = 0;
         }
         bool generation_stop = false;
+        double tf_nll = 0.0;
+        int tf_scored = 0, tf_hits = 0;
         while (gen_done < cfg.gen_tokens && !generation_stop) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -908,6 +916,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ds4-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
+            }
+            ds4_token_score tf_score;
+            if (cfg.teacher_forced_decode && !speculative &&
+                ds4_session_token_logprob(session, token, &tf_score)) {
+                tf_nll -= (double)tf_score.logprob;
+                tf_hits += ds4_session_argmax(session) == token;
+                tf_scored++;
             }
             const double token_t0 = bench_now_sec();
 #if defined(DS4_BENCH_HAVE_CUDA_PROFILER)
@@ -1018,7 +1033,7 @@ int main(int argc, char **argv) {
         const int gen_steady_tokens = gen_done > gen_first_tokens ?
             gen_done - gen_first_tokens : 0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%.6f,%.4f\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -1027,7 +1042,9 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                tf_scored ? tf_nll / (double)tf_scored : 0.0,
+                tf_scored ? (double)tf_hits / (double)tf_scored : 0.0);
         fflush(out);
 
         previous = frontier;

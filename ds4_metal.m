@@ -50060,10 +50060,12 @@ static ds4_gpu_tensor *qwen4_nax_half_operand(ds4_gpu_tensor **slot, uint64_t *s
 }
 
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
-    /* Remainder tiles measured on M3 Ultra for the low-bit experts and on M5
-     * for Q4_K gate/up with MXFP4 down. */
+    /* Remainder tiles measured on M3 Ultra for the low-bit experts, on M5
+     * for Q4_K gate/up with MXFP4 down, and on M1 Max for Q2_0 experts, where
+     * a 300-token prefill gains 22% and a 2048-token chunk 3 to 6%. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
+        (type == 42u && ds4_gpu_device_name_contains("M1")) ||
         ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
 }

@@ -19411,6 +19411,14 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            /* A row of at most 1024 inputs is 32 Q8_0 blocks, a single pass
+             * of one simdgroup, so with many such rows more simdgroups per
+             * threadgroup only add the cross-group reduction.  In DeepSeek
+             * V4 Flash this is attn_q_b (1024 -> 32768). */
+            if (in_dim <= 1024u && out_dim >= 8192u && out_dim <= 65536u &&
+                getenv("DS4_METAL_Q8_MV_NSG") == NULL) {
+                mv_dispatch.nsg = 1;
+            }
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);

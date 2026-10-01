@@ -23652,6 +23652,7 @@ typedef struct metal_graph_selected_async_load {
     const ds4_layer_weights  *layer;
     uint32_t                  il;
     uint64_t                  event_value;
+    uint64_t                  poll_seq;
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
@@ -23668,6 +23669,121 @@ static bool g_metal_graph_selected_async_load_thread_started = false;
 static bool g_metal_graph_selected_async_load_has_job = false;
 static bool g_metal_graph_selected_async_load_done = false;
 static metal_graph_selected_async_load g_metal_graph_selected_async_load_job;
+
+/* Selected-id poller, enabled with DS4_METAL_SELECTED_ID_POLL=1.
+ *
+ * The load worker normally learns that the router ids are ready from a Metal
+ * shared event, which reaches it more than 100 microseconds after the GPU
+ * wrote them.  The ids live in shared memory, so a thread can instead watch
+ * them change from a sentinel.  The watcher runs at background QoS to stay on
+ * an efficiency core: a spinning performance core slows the GPU on Apple
+ * Silicon, an efficiency core does not.
+ *
+ * This relies on the routed MoE kernels taking the ids from the host, as the
+ * default streaming kernels do, since the sentinel overwrites the ids of the
+ * previous layer. */
+static uint64_t g_selected_poll_next_seq;
+static uint32_t g_selected_poll_synced_layer = UINT32_MAX;
+
+#ifdef __APPLE__
+#define DS4_SELECTED_POLL_SPIN_SEC 0.050
+#define DS4_SELECTED_POLL_WAIT_NSEC (4 * 1000 * 1000)
+
+static pthread_mutex_t g_selected_poll_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_selected_poll_req_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_selected_poll_ready_cond = PTHREAD_COND_INITIALIZER;
+static volatile int32_t *g_selected_poll_ids;
+static uint64_t g_selected_poll_req;
+static uint64_t g_selected_poll_ready;
+static bool g_selected_poll_ready_ok;
+static bool g_selected_poll_started;
+
+static void *metal_graph_selected_poll_main(void *arg) {
+    (void)arg;
+    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+    uint64_t seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&g_selected_poll_mutex);
+        while (g_selected_poll_req == seen) {
+            pthread_cond_wait(&g_selected_poll_req_cond, &g_selected_poll_mutex);
+        }
+        seen = g_selected_poll_req;
+        volatile int32_t *ids = g_selected_poll_ids;
+        pthread_mutex_unlock(&g_selected_poll_mutex);
+
+        const double t_end = now_sec() + DS4_SELECTED_POLL_SPIN_SEC;
+        bool ready = false;
+        for (uint32_t spins = 0; !ready; spins++) {
+            ready = true;
+            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                if (ids[i] < 0) ready = false;
+            }
+            if ((spins & 1023u) == 1023u && now_sec() > t_end) break;
+        }
+
+        pthread_mutex_lock(&g_selected_poll_mutex);
+        g_selected_poll_ready = seen;
+        g_selected_poll_ready_ok = ready;
+        pthread_cond_broadcast(&g_selected_poll_ready_cond);
+        pthread_mutex_unlock(&g_selected_poll_mutex);
+    }
+    return NULL;
+}
+
+/* Called before the router command buffer is committed, and only when no
+ * earlier command can still write the ids.  Returns 0 if not armed. */
+static uint64_t metal_graph_selected_poll_arm(ds4_gpu_tensor *router_selected) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_METAL_SELECTED_ID_POLL") != NULL;
+    if (!enabled || !router_selected) return 0;
+    int32_t *ids = ds4_gpu_tensor_contents(router_selected);
+    if (!ids) return 0;
+    if (!g_selected_poll_started) {
+        pthread_t th;
+        if (pthread_create(&th, NULL, metal_graph_selected_poll_main, NULL) != 0) {
+            enabled = 0;
+            return 0;
+        }
+        pthread_detach(th);
+        g_selected_poll_started = true;
+    }
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) ids[i] = -1;
+    pthread_mutex_lock(&g_selected_poll_mutex);
+    g_selected_poll_ids = ids;
+    const uint64_t seq = ++g_selected_poll_req;
+    pthread_cond_signal(&g_selected_poll_req_cond);
+    pthread_mutex_unlock(&g_selected_poll_mutex);
+    return seq;
+}
+
+/* True when the poller saw the ids of request seq.  On false the caller
+ * waits for the Metal event as usual. */
+static bool metal_graph_selected_poll_wait(uint64_t seq) {
+    if (seq == 0) return false;
+    struct timespec rel = { 0, DS4_SELECTED_POLL_WAIT_NSEC };
+    pthread_mutex_lock(&g_selected_poll_mutex);
+    while (g_selected_poll_ready < seq) {
+        if (pthread_cond_timedwait_relative_np(&g_selected_poll_ready_cond,
+                                               &g_selected_poll_mutex,
+                                               &rel) != 0) {
+            break;
+        }
+    }
+    const bool ok = g_selected_poll_ready == seq && g_selected_poll_ready_ok;
+    pthread_mutex_unlock(&g_selected_poll_mutex);
+    return ok;
+}
+#else
+static uint64_t metal_graph_selected_poll_arm(ds4_gpu_tensor *router_selected) {
+    (void)router_selected;
+    return 0;
+}
+
+static bool metal_graph_selected_poll_wait(uint64_t seq) {
+    (void)seq;
+    return false;
+}
+#endif
 
 static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
@@ -23691,7 +23807,8 @@ static void metal_graph_selected_async_load_run(
             return;
         }
 #else
-        if (ds4_gpu_wait_selected_readback_ready(job->event_value,
+        if (!metal_graph_selected_poll_wait(job->poll_seq) &&
+            ds4_gpu_wait_selected_readback_ready(job->event_value,
                                                  "selected-id async expert load") == 0) {
             return;
         }
@@ -23801,6 +23918,8 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->layer = layer;
     job->il = il;
     job->event_value = event_value;
+    job->poll_seq = g_selected_poll_next_seq;
+    g_selected_poll_next_seq = 0;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
 
@@ -27042,6 +27161,14 @@ static bool metal_graph_encode_decode_layer_phase(
         const bool async_early_commit =
             async_selected_load &&
             metal_graph_use_iq2_selected_async_early_commit(g);
+        /* The poll sentinel is only safe once every earlier writer of the
+         * ids has finished, that is when this thread waited for the router
+         * result of the previous layer. */
+        if (ok && async_selected_load && il != 0 &&
+            g_selected_poll_synced_layer == il - 1) {
+            g_selected_poll_next_seq =
+                metal_graph_selected_poll_arm(metal_graph_router_selected(g));
+        }
         if (ok && async_selected_load) {
             ok = metal_graph_selected_async_load_start(&async_load,
                                                        g,
@@ -27101,6 +27228,7 @@ static bool metal_graph_encode_decode_layer_phase(
             const bool flush_ok = ds4_gpu_flush_commands() != 0;
             bool finish_ok =
                 metal_graph_selected_async_load_finish(&async_load);
+            g_selected_poll_synced_layer = finish_ok ? il : UINT32_MAX;
             if (!finish_ok && async_load.ids_ok) {
                 /* The worker read valid ids but could not stage the load
                  * (it is not allowed to wait on in-flight cache entries).

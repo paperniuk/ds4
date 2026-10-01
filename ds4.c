@@ -7187,6 +7187,7 @@ static float g_qwen4_rope_freq[32];
 static float g_qwen4_rope_mscale = 1.0f;
 static uint32_t g_qwen4_native_ctx = 0;
 static bool g_qwen4_rope_yarn = false;
+static float g_qwen4_rope_factor = 1.0f;
 
 /* Rotary inverse frequencies of the DS4_N_ROT/2 pairs.  DS4_QWEN4_YARN_FACTOR=f
  * (f > 1) applies static YaRN over the native context (HF
@@ -7216,6 +7217,7 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
     g_qwen4_rope_mscale = yarn ? (float)(0.1 * log(factor) + 1.0) : 1.0f;
     g_qwen4_native_ctx = native_ctx;
     g_qwen4_rope_yarn = yarn;
+    g_qwen4_rope_factor = yarn ? (float)factor : 1.0f;
     if (yarn) {
         fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
                 factor, native_ctx, low, high, g_qwen4_rope_mscale);
@@ -63142,6 +63144,16 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * family tag so a DeepSeek payload is never read as a Qwen one. */
 #define DS4_QWEN4_PAYLOAD_TAG 0x51573802u
 
+/* The cached keys carry their rotation, so a checkpoint only fits a session
+ * with the same YaRN factor: fold the factor into the tag.  Without YaRN the
+ * tag is unchanged and older checkpoints still load. */
+static uint32_t qwen4_payload_tag(void) {
+    uint32_t bits = 0;
+    if (!g_qwen4_rope_yarn) return DS4_QWEN4_PAYLOAD_TAG;
+    memcpy(&bits, &g_qwen4_rope_factor, sizeof(bits));
+    return DS4_QWEN4_PAYLOAD_TAG ^ (bits | 1u);
+}
+
 static uint64_t qwen4_payload_lin_state_bytes(void) {
     return (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM * sizeof(float);
 }
@@ -63207,7 +63219,7 @@ static int qwen4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_
         DS4_N_HEAD_DIM,
         DS4_N_INDEXER_HEAD_DIM,
         DS4_N_VOCAB,
-        DS4_QWEN4_PAYLOAD_TAG,
+        qwen4_payload_tag(),
     };
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
@@ -63265,9 +63277,13 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
     const uint32_t rows = h[7];
     g->anchor_valid = false;
-    if (h[12] != DS4_QWEN4_PAYLOAD_TAG || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM ||
-        h[10] != DS4_N_INDEXER_HEAD_DIM || h[11] != DS4_N_VOCAB || h[6] != DS4_N_EMBD * DS4_N_HC) {
+    if (h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM || h[10] != DS4_N_INDEXER_HEAD_DIM ||
+        h[11] != DS4_N_VOCAB || h[6] != DS4_N_EMBD * DS4_N_HC) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (h[12] != qwen4_payload_tag()) {
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or YaRN factor");
         return 1;
     }
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {

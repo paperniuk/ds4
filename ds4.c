@@ -27168,6 +27168,9 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      NULL,
                                                      il,
                                                      false) != 0;
+        /* The experts are staged, so start them now: otherwise the GPU sits
+         * idle while this thread encodes the next layer up to its router. */
+        if (ok && async_load_started) ok = ds4_gpu_flush_commands() != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),

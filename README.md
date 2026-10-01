@@ -1,3 +1,134 @@
+# ds4 for M1/M2 Macs: Qwen3.8-Flash-Next at 262K context
+
+A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) tuned for
+Apple7/Apple8 GPUs, that is M1 and M2 Macs, which do not get the Metal 4
+tensor API that stock ds4 uses on M5.
+
+It runs **Qwen3.8-Flash-Next** (the ISTA-DASLab GSQ-RCO Q2_0 GGUF) on a
+**64 GB M1 Max** with the **full 262K context**, MTP speculative decoding and
+vision, as a local OpenAI/Anthropic compatible server for OpenCode, Claude
+Code, Pi or any other agent.
+
+## Numbers
+
+M1 Max, 32-core GPU, 64 GB. Greedy decoding, `--prefill-chunk 2048`.
+
+| Context | Decode | Decode with MTP | Prefill |
+|---|---|---|---|
+| 4K | 35.5 tok/s | 39 to 47 tok/s | ~290 tok/s |
+| 128K | 33.8 tok/s | 39 tok/s | ~270 tok/s |
+| 262K | 29.7 tok/s | 36.1 tok/s | ~269 tok/s |
+
+MTP gains depend on the text: about +30% on code, about +10% on prose.
+
+Same machine, plain decode, before this fork:
+
+| Engine | Short context | Long context | 262K |
+|---|---|---|---|
+| llama.cpp 0.5.0 | 27 tok/s | 13 tok/s at 64K | not measured |
+| stock ds4 (*) | 21 to 23 tok/s | 22.7 tok/s at 128K | 17.7 tok/s |
+| **this fork** | **35.5 tok/s** | **33.8 tok/s at 128K** | **29.7 tok/s** |
+
+(*) Stock ds4 plus the n-gram sidecar patch, which it needs to load this
+model. The short context figure was measured with the DS4-IQ2 weights.
+
+Quality is unchanged: every kernel is checked against the reference path,
+and `score_official` on the Alibaba fixtures gives the same average NLL and
+top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
+0.17410 vs 0.17410 long).
+
+## What changed
+
+- **Apple7 matvec kernels** for the mixed precision ISTA GGUF: Q2_0, Q5_0,
+  IQ4_NL/XS, Q3_K, Q4_K, Q5_K, Q6_K and split-K BF16, plus variants that read
+  the weights once for 2 or 3 tokens, used by MTP verification.
+- **Indexer and attention on long context**: the vector block scorer runs on
+  every Apple GPU (it was M5 only), the decode attention folds four keys per
+  round, and the top-k selection gathers with coalesced simdgroup segments.
+  At 128K this took decode from 23.8 to 33.8 tok/s with byte-identical output.
+- **n-gram table from a sidecar**: the 26.8 GiB IQ4_NL n-gram table is read
+  from the second GGUF shard on disk, one small read per token, and the
+  IQ4_NL block size is fixed.
+- **MTP block from another GGUF**, since the ISTA release has none.
+- **Prompt anchor for agents**: Qwen3.8's recurrent layers cannot be rewound,
+  so a retried or edited agent turn used to prefill the whole transcript
+  again. The server now keeps a copy of the state at the last turn marker. A
+  retried turn on a 31K prompt went from 109 s to 0.3 s.
+- **Cold cache anchor for ChatML**: the disk KV checkpoint now ends right
+  before the first user message, so a new agent session with the same system
+  prompt and tools loads it instead of prefilling the shared prefix again.
+- **Remainder tiles in prefill**: the expert GEMMs use 8 and 16 token tiles
+  for the leftover tokens of each expert. Small prefills, which is what an
+  agent sends after every tool call, gain the most: 182 to 223 tok/s at 300
+  tokens, 231 to 268 at 600, with identical output.
+- **Vision in agent sessions**: up to 64 images per request, older ones are
+  replaced by a short note instead of failing the request.
+
+Each change is a separate commit with a test.
+
+## Requirements
+
+- An M1/M2 Mac (Max or Ultra) with 64 GB of RAM. Only the M1 Max has been
+  measured so far; reports from other chips are welcome.
+- About 67 GB of disk for the model (both shards) and 45 GB more for the
+  GGUF that provides the MTP block. A fast internal SSD, since the n-gram
+  table is read from disk on every token.
+- 262K context needs a higher GPU wired memory limit, reset at every reboot:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=57344
+```
+
+Without it, use `--ctx 131072` or less.
+
+## Quick start
+
+```sh
+git clone -b m1-flash-next https://github.com/paperniuk/ds4.git
+cd ds4 && make
+
+# Model: both shards of the Q2_0 release
+hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "Q2_0/*" --local-dir ~/models/flash-next
+# MTP block (optional, for --mtp)
+hf download ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2 --local-dir ~/models/flash-next/ds4-iq2
+# Vision encoder (optional, for --vision)
+./download_model.sh qwen38-vision
+
+M=~/models/flash-next/Q2_0
+DS4_QWEN_NGRAM_GGUF=$M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+DS4_QWEN_MTP_GGUF=~/models/flash-next/ds4-iq2/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf \
+./ds4-server -m $M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+    --ctx 262144 --prefill-chunk 2048 --mtp \
+    --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
+    --host 127.0.0.1 --port 8010
+```
+
+Then point your agent at `http://127.0.0.1:8010/v1`. See
+[docs/CLIENTS.md](docs/CLIENTS.md) for OpenCode and Claude Code setup.
+
+## Tips for agents
+
+- Pick the reasoning effort once per session. Qwen3.8 writes it at the top of
+  the system prompt, so switching it mid-session prefills the whole
+  conversation again.
+- The server keeps one live conversation. Switching to another one saves the
+  current state to the disk cache (`--kv-disk-dir`), and switching back
+  restores it in about a second.
+
+## Status
+
+Experimental, one developer, one machine. Parts of this fork that help every
+ds4 user are being proposed upstream. Everything else in ds4 (other models,
+CUDA, distributed inference, SSD streaming) is inherited from upstream and
+should keep working, but is not the focus here.
+
+Model weights are under the Qwen community license; read it before any
+commercial use. The code is MIT, like upstream.
+
+---
+
+The upstream README follows.
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>

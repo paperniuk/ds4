@@ -49,7 +49,10 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
 - **n-gram table from a sidecar**: the 26.8 GiB IQ4_NL n-gram table is read
   from the second GGUF shard on disk, one small read per token, and the
   IQ4_NL block size is fixed.
-- **MTP block from another GGUF**, since the ISTA release has none.
+- **MTP block from another GGUF**, since the ISTA release has none. A
+  [1.5 GB file](https://huggingface.co/paperniuk/Qwen3.8-Flash-Next-MTP-block)
+  with only that block is enough; the `mtp-*-Q8_0.gguf` from ggml-org works
+  as well.
 - **Prompt anchor for agents**: Qwen3.8's recurrent layers cannot be rewound,
   so a retried or edited agent turn used to prefill the whole transcript
   again. The server now keeps a copy of the state at the last turn marker. A
@@ -70,8 +73,8 @@ Each change is a separate commit with a test.
 
 - An M1/M2 Mac (Max or Ultra) with 64 GB of RAM. Only the M1 Max has been
   measured so far; reports from other chips are welcome.
-- About 67 GB of disk for the model (both shards) and 45 GB more for the
-  GGUF that provides the MTP block. A fast internal SSD, since the n-gram
+- About 67 GB of disk for the model (both shards) and 1.5 GB for the MTP
+  block. A fast internal SSD, since the n-gram
   table is read from disk on every token.
 - 262K context needs a higher GPU wired memory limit, reset at every reboot:
 
@@ -90,13 +93,13 @@ cd ds4 && make
 # Model: both shards of the Q2_0 release
 hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "Q2_0/*" --local-dir ~/models/flash-next
 # MTP block (optional, for --mtp)
-hf download ivanfioravanti/Qwen3.8-Flash-Next-DS4-IQ2 --local-dir ~/models/flash-next/ds4-iq2
+hf download paperniuk/Qwen3.8-Flash-Next-MTP-block --local-dir ~/models/flash-next/mtp
 # Vision encoder (optional, for --vision)
 ./download_model.sh qwen38-vision
 
 M=~/models/flash-next/Q2_0
 DS4_QWEN_NGRAM_GGUF=$M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
-DS4_QWEN_MTP_GGUF=~/models/flash-next/ds4-iq2/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf \
+DS4_QWEN_MTP_GGUF=~/models/flash-next/mtp/Qwen3.8-Flash-Next-MTP-block.gguf \
 ./ds4-server -m $M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
     --ctx 262144 --prefill-chunk 2048 --mtp \
     --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \

@@ -517,7 +517,7 @@ ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/pn
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
-ds4_quants.o: ds4_quants.c ds4_quants.h
+ds4_quants.o: ds4_quants.c ds4_quants.h ds4_iq_grids.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4_quants.c
 
 ds4_engram.o: ds4_engram.c ds4_engram.h
@@ -652,7 +652,7 @@ ifeq ($(UNAME_S),Darwin)
 tests/test_qwen4_kernels.o: tests/test_qwen4_kernels.c ds4_gpu.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen4_kernels.c
 
-$(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o
+$(QWEN4_KERNEL_TEST): tests/test_qwen4_kernels.o ds4_metal.o ds4_image.o ds4_quants.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_quant_types.o: tests/test_quant_types.c ds4_gpu.h ds4_quants.h

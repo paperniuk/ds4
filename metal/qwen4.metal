@@ -3347,6 +3347,147 @@ kernel void kernel_qwen4_moe_down_q2_0(
     }
 }
 
+/* Routed experts in the codebook quants IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S
+ * (256-weight blocks).  mid: a SIMD group owns QWEN4_GRID_MID_NR gate rows
+ * and the same up rows of one expert; lane l keeps the 16 inputs of chunk
+ * l % 16 of every second block and reuses them for all of its rows.  The
+ * shared expert has a dense type of its own and takes the generic row dot,
+ * one row per grid slot. */
+#define QWEN4_GRID_MID_NR 2
+
+template <typename block_t, void (*deq)(device const block_t *, short, thread float4x4 &)>
+kernel void kernel_qwen4_moe_mid_grid(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint NR = QWEN4_GRID_MID_NR;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const bool shared = tgpig.y >= args.n_slots;
+    const uint slot = shared ? args.n_slots : tgpig.y;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    device float *out = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (shared) {
+        /* the host adds QWEN4_GRID_MID_NR - 1 grid slots: one row each */
+        const uint r = row0 + (tgpig.y - args.n_slots);
+        if (r < args.out_rows) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) out[r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const block_t *gr[NR], *ur[NR];
+    for (uint r = 0; r < NR; r++) {
+        const uint64_t off = ebase + (uint64_t)min(row0 + r, args.out_rows - 1u) * args.row_bytes;
+        gr[r] = (device const block_t *)(gate_base + off);
+        ur[r] = (device const block_t *)(up_base + off);
+    }
+    const short ix = tiisg / 16, il = tiisg % 16;
+    const uint nb = args.in_dim / 256u;
+    float sg[NR] = {0.0f}, su[NR] = {0.0f};
+    for (uint ib = (uint)ix; ib < nb; ib += 2) {
+        device const float4 *y = (device const float4 *)(xt + ib * 256u + (uint)il * 16u);
+        const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+        for (uint r = 0; r < NR; r++) {
+            float4x4 w;
+            deq(gr[r] + ib, il, w);
+            sg[r] += dot(w[0], y0) + dot(w[1], y1) + dot(w[2], y2) + dot(w[3], y3);
+            deq(ur[r] + ib, il, w);
+            su[r] += dot(w[0], y0) + dot(w[1], y1) + dot(w[2], y2) + dot(w[3], y3);
+        }
+    }
+    for (uint r = 0; r < NR; r++) {
+        const float g = simd_sum(sg[r]), u = simd_sum(su[r]);
+        if (tiisg == 0 && row0 + r < args.out_rows) out[row0 + r] = qwen4_silu(g) * u;
+    }
+}
+
+typedef decltype(kernel_qwen4_moe_mid_grid<block_iq3_s, ds4q_dequantize_iq3_s>) qwen4_moe_mid_grid_t;
+template [[host_name("kernel_qwen4_moe_mid_iq2_xs")]]  kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq2_xs, ds4q_dequantize_iq2_xs>;
+template [[host_name("kernel_qwen4_moe_mid_iq2_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq2_s, ds4q_dequantize_iq2_s>;
+template [[host_name("kernel_qwen4_moe_mid_iq3_xxs")]] kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_xxs, ds4q_dequantize_iq3_xxs>;
+template [[host_name("kernel_qwen4_moe_mid_iq3_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_s, ds4q_dequantize_iq3_s>;
+
+/* IQ4_NL down rows, laid out as the Q2_0 ones: eight lanes share a row of
+ * 640 inputs (40 chunks of 16) and the four lane groups of a SIMD group
+ * take QWEN4_IQ4_NL_DOWN_NR rows each. */
+#define QWEN4_IQ4_NL_DOWN_NR 4
+
+kernel void kernel_qwen4_moe_down_iq4_nl(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const char    *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    constexpr uint NR = QWEN4_IQ4_NL_DOWN_NR;
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const bool shared = tgpig.y >= args.n_slots;
+    const uint slot = shared ? args.n_slots : tgpig.y;
+    const uint sg_row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * (4u * NR);
+    if (sg_row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    device const float *m = mid + pair * args.in_dim;
+    device float *out = part + pair * args.out_rows;
+    if (shared && args.shared_type != 20u) {
+        /* the host adds three grid slots: NR rows each */
+        const uint r0 = sg_row0 + (tgpig.y - args.n_slots) * NR;
+        for (uint r = r0; r < r0 + NR && r < args.out_rows; r++) {
+            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m,
+                                          args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) out[r] = v;
+        }
+        return;
+    }
+    const uint row_bytes = shared ? args.shared_row_bytes : args.row_bytes;
+    const uint64_t ebase = shared ? 0 :
+        (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const char *db = (shared ? sh_down : down_base) + ebase;
+    const uint grp = tiisg / 8u, lane = tiisg % 8u;
+    const uint row0 = sg_row0 + grp * NR;
+    device const block_iq4_nl *dr[NR];
+    for (uint r = 0; r < NR; r++) {
+        dr[r] = (device const block_iq4_nl *)(db + (uint64_t)min(row0 + r, args.out_rows - 1u) * row_bytes);
+    }
+    const uint nchunks = args.in_dim / 16u;
+    float acc[NR] = {0.0f};
+    for (uint c = lane; c < nchunks; c += 8u) {
+        device const float4 *y = (device const float4 *)(m + c * 16u);
+        const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
+        for (uint r = 0; r < NR; r++) {
+            float4x4 w;
+            ds4q_dequantize_iq4_nl(dr[r] + c / 2u, (short)(c % 2u), w);
+            acc[r] += dot(w[0], y0) + dot(w[1], y1) + dot(w[2], y2) + dot(w[3], y3);
+        }
+    }
+    for (uint r = 0; r < NR; r++) {
+        float v = acc[r];
+        v += simd_shuffle_xor(v, 4);
+        v += simd_shuffle_xor(v, 2);
+        v += simd_shuffle_xor(v, 1);
+        if (lane == 0 && row0 + r < args.out_rows) out[row0 + r] = v;
+    }
+}
+
 /* MXFP4 routed down rows with four blocks per lane requested before the
  * accumulation chain.  The shipped qwen4_row_dot loop for type 39 compiles
  * to s = t0*y0 + t1*y1 + t2*y16 + t3*y17 (left to right), acc += s*d; that
@@ -3700,9 +3841,35 @@ kernel void kernel_qwen4_moe_build_lists(
     }
 }
 
+/* The types that only have the 16-weight dequantizers of quants.metal:
+ * IQ4_NL and the codebook quants. */
+static inline bool qwen4_mm_deq16_has(uint type) {
+    return type == 20 || type == 17 || type == 18 || type == 21 || type == 22;
+}
+
+/* quarters q0 and q0 + 1 (q0 even) of 32-wide block b */
+static inline void qwen4_mm_deq16(device const char *row, uint b, uint q0, uint type, thread float4x4 &w) {
+    const uint sb = b / 8;
+    const short il = (short)((b % 8) * 2 + q0 / 2);
+    switch (type) {
+    case 17: ds4q_dequantize_iq2_xs((device const block_iq2_xs *)row + sb, il, w); break;
+    case 18: ds4q_dequantize_iq3_xxs((device const block_iq3_xxs *)row + sb, il, w); break;
+    case 21: ds4q_dequantize_iq3_s((device const block_iq3_s *)row + sb, il, w); break;
+    case 22: ds4q_dequantize_iq2_s((device const block_iq2_s *)row + sb, il, w); break;
+    default: ds4q_dequantize_iq4_nl((device const block_iq4_nl *)row + b, (short)(q0 / 2), w); break;
+    }
+}
+
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
 static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
+    if (qwen4_mm_deq16_has(type)) {
+        float4x4 w;
+        qwen4_mm_deq16(row, b, q & ~1u, type, w);
+        const uint c = (q & 1u) * 2u;
+        for (uint i = 0; i < 4; i++) { dst[i] = (D)w[c][i]; dst[4 + i] = (D)w[c + 1][i]; }
+        return;
+    }
     if (type == 2) {
         /* q4_0: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
@@ -3779,6 +3946,12 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
  * 16-byte word; other types take two 8-value steps */
 template <typename D>
 static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uint type, threadgroup D *dst) {
+    if (qwen4_mm_deq16_has(type)) {
+        float4x4 w;
+        qwen4_mm_deq16(row, b, q0, type, w);
+        for (uint i = 0; i < 16; i++) dst[i] = (D)w[i >> 2][i & 3u];
+        return;
+    }
     if (type == 42) {
         /* q2_0: 18-byte blocks of 64 (d, 16 bytes of 2-bit codes, value (q - 1) * d);
          * 32-block b is half of block b/2 */

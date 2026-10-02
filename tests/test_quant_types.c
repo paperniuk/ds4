@@ -1,5 +1,5 @@
 /* GPU checks for the mixed-precision weight types (Q2_0, Q5_0, IQ4_NL, Q3_K,
- * Q5_K, Q6_K, IQ4_XS, BF16): the generic quant matmul at 1..64 tokens and the
+ * Q5_K, Q6_K, IQ4_XS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, BF16): the generic quant matmul at 1..64 tokens and the
  * Qwen row dot (multi GEMV), against a CPU reference built on ds4_quants.c.
  * Build: make test-quant-types */
 
@@ -73,6 +73,10 @@ static const quant_type types[] = {
     { "q5_K",   13, 256, 176, 0,   2  },
     { "q6_K",   14, 256, 210, 208, -1 },
     { "iq4_xs", 23, 256, 136, 0,   -1 },
+    { "iq2_xs", 17, 256, 74,  0,   -1 },
+    { "iq2_s",  22, 256, 82,  0,   -1 },
+    { "iq3_xxs",18, 256, 98,  0,   -1 },
+    { "iq3_s",  21, 256, 110, 0,   -1 },
     { "bf16",   30, 1,   2,   -1,  -1 },
 };
 

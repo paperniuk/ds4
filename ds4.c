@@ -2369,7 +2369,11 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ2_XS   = 17,
+    DS4_TENSOR_IQ3_XXS  = 18,
     DS4_TENSOR_IQ4_NL   = 20,
+    DS4_TENSOR_IQ3_S    = 21,
+    DS4_TENSOR_IQ2_S    = 22,
     DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
@@ -5672,7 +5676,9 @@ static bool weights_qwen4_layer_has_required(const ds4_layer_weights *l, uint32_
 static bool tensor_type_is_mixed_quant(uint32_t type) {
     return type == DS4_TENSOR_Q2_0 || type == DS4_TENSOR_Q5_0 || type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS;
+           type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS ||
+           type == DS4_TENSOR_IQ2_XS || type == DS4_TENSOR_IQ2_S ||
+           type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S;
 }
 
 /* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream
@@ -5699,7 +5705,7 @@ static void tensor_expect_qwen4_expert_layout(
     if (!t) ds4_die("internal error: missing tensor while validating layout");
     if (!tensor_is_routed_expert_type(t->type) &&
         t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0 && t->type != DS4_TENSOR_Q2_0) {
+        t->type != DS4_TENSOR_Q4_0 && !tensor_type_is_mixed_quant(t->type)) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -58129,17 +58135,25 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
+/* The codebook quants of ISTA's IQ3_XXS file: 256-weight blocks, gate/up only. */
+static bool qwen4_expert_type_is_grid(uint32_t type) {
+    return type == DS4_TENSOR_IQ2_XS || type == DS4_TENSOR_IQ2_S ||
+           type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S;
+}
+
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_Q2_0;
+           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS || type == DS4_TENSOR_Q2_0 ||
+           type == DS4_TENSOR_IQ4_NL || qwen4_expert_type_is_grid(type);
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
-                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0) ||
-                 (t->type == DS4_TENSOR_Q2_0 && (t->dim[0] % 64u) == 0));
+                 ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS ||
+                   qwen4_expert_type_is_grid(t->type)) && (t->dim[0] % 256u) == 0) ||
+                 (t->type == DS4_TENSOR_Q2_0 && (t->dim[0] % 64u) == 0) ||
+                 (t->type == DS4_TENSOR_IQ4_NL && (t->dim[0] % 32u) == 0));
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
@@ -58204,9 +58218,10 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
             }
         }
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
-            !qwen4_graph_expert_ok(l->ffn_down_exps)) {
+            !qwen4_graph_expert_ok(l->ffn_down_exps) || l->ffn_up_exps->type != l->ffn_gate_exps->type) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, q2_0, f16, f32)\n", il);
+                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, q2_0, f16, f32; "
+                    "gate and up must match)\n", il);
             return false;
         }
     }

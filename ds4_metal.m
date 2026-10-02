@@ -48,7 +48,11 @@ enum {
     DS4_METAL_TENSOR_Q6_K    = 14,
     DS4_METAL_TENSOR_Q8_K    = 15,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
+    DS4_METAL_TENSOR_IQ2_XS  = 17,
+    DS4_METAL_TENSOR_IQ3_XXS = 18,
     DS4_METAL_TENSOR_IQ4_NL  = 20,
+    DS4_METAL_TENSOR_IQ3_S   = 21,
+    DS4_METAL_TENSOR_IQ2_S   = 22,
     DS4_METAL_TENSOR_IQ4_XS  = 23,
     DS4_METAL_TENSOR_BF16    = 30,
     DS4_METAL_TENSOR_MXFP4   = 39,
@@ -92,6 +96,14 @@ static const ds4_gpu_quant_kind ds4_gpu_quant_kinds[] = {
       "kernel_mul_mv_ext_q6_K_f32_r1_",   "kernel_mul_mm_q6_K_f32", false, 8 },
     { DS4_METAL_TENSOR_IQ4_XS, 256, 136, 2, 2, 128, "kernel_mul_mv_iq4_xs_dense_f32",
       NULL,                               "kernel_mul_mm_iq4_xs_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ2_XS, 256,  74, 2, 2,  32, "kernel_mul_mv_iq2_xs_dense_f32",
+      NULL,                               "kernel_mul_mm_iq2_xs_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ2_S,  256,  82, 2, 2,  32, "kernel_mul_mv_iq2_s_dense_f32",
+      NULL,                               "kernel_mul_mm_iq2_s_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ3_XXS,256,  98, 2, 2,  32, "kernel_mul_mv_iq3_xxs_dense_f32",
+      NULL,                               "kernel_mul_mm_iq3_xxs_f32", false, 8 },
+    { DS4_METAL_TENSOR_IQ3_S,  256, 110, 2, 2,  32, "kernel_mul_mv_iq3_s_dense_f32",
+      NULL,                               "kernel_mul_mm_iq3_s_f32", false, 8 },
     { DS4_METAL_TENSOR_BF16,     1,   2, 2, 4, 256, "kernel_mul_mv_bf16_dense_f32",
       "kernel_mul_mv_ext_bf16_f32_r1_",   "kernel_mul_mm_bf16_f32", true, 3 },
 };
@@ -48346,6 +48358,11 @@ enum {
     QWEN4_K_HC_GATE_MIX_BF16_ROWS,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3,
+    QWEN4_K_MOE_MID_IQ2_XS,
+    QWEN4_K_MOE_MID_IQ2_S,
+    QWEN4_K_MOE_MID_IQ3_XXS,
+    QWEN4_K_MOE_MID_IQ3_S,
+    QWEN4_K_MOE_DOWN_IQ4_NL,
     QWEN4_K_COUNT,
 };
 
@@ -48461,6 +48478,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_bf16_rows",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt2",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt3",
+    "kernel_qwen4_moe_mid_iq2_xs",
+    "kernel_qwen4_moe_mid_iq2_s",
+    "kernel_qwen4_moe_mid_iq3_xxs",
+    "kernel_qwen4_moe_mid_iq3_s",
+    "kernel_qwen4_moe_down_iq4_nl",
 };
 
 typedef struct {
@@ -49771,6 +49793,17 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
                               MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
+    const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
+                            weight_type == DS4_METAL_TENSOR_IQ2_S ? QWEN4_K_MOE_MID_IQ2_S :
+                            weight_type == DS4_METAL_TENSOR_IQ3_XXS ? QWEN4_K_MOE_MID_IQ3_XXS :
+                            weight_type == DS4_METAL_TENSOR_IQ3_S ? QWEN4_K_MOE_MID_IQ3_S : -1;
+    if (grid_kernel >= 0 && (in_dim % 256u) == 0 && getenv("DS4_QWEN4_NO_GRID_MOE") == NULL) {
+        /* codebook experts: two gate and two up rows per SIMD group; the
+         * shared expert spreads over one extra slot (metal/qwen4.metal) */
+        return qwen4_dispatch(grid_kernel, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + 7u) / 8u, n_out + (has_shared ? 1u : 0u), n_tokens),
+                              MTLSizeMake(128, 1, 1), 0);
+    }
     return qwen4_dispatch(kernel, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + rows_per_tg - 1) / rows_per_tg, n_out, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
@@ -49810,6 +49843,12 @@ int ds4_gpu_qwen4_moe_down_tensor(
         /* Q2_0 experts: sixteen short down rows per SIMD group */
         const uint32_t split = has_shared && shared_type != 42u ? 4u : 1u;
         return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q2_0, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + 63u) / 64u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
+    }
+    if (weight_type == DS4_METAL_TENSOR_IQ4_NL && getenv("DS4_QWEN4_NO_GRID_MOE") == NULL) {
+        /* IQ4_NL experts: sixteen short down rows per SIMD group */
+        const uint32_t split = has_shared && shared_type != DS4_METAL_TENSOR_IQ4_NL ? 4u : 1u;
+        return qwen4_dispatch(QWEN4_K_MOE_DOWN_IQ4_NL, &args, sizeof(args), b, 5,
                               MTLSizeMake((out_dim + 63u) / 64u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
     const uint32_t nsg = qwen4_moe_mv_specialize(weight_type) ? qwen4_moe_mv_groups(weight_type) : 4u;
@@ -49939,6 +49978,13 @@ int ds4_gpu_qwen4_moe_build_lists_tensor(
     }
     return qwen4_dispatch(QWEN4_K_MOE_BUILD_LISTS, &args, sizeof(args), b, 3,
                           MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1), 0);
+}
+
+/* Expert types the tiled GEMMs can stage: qwen4_mm_stage16 in qwen4.metal. */
+static bool qwen4_moe_mm_type_ok(uint32_t type) {
+    return type == 8u || type == 39u || type == 12u || type == 10u || type == 16u || type == 2u || type == 42u ||
+           type == DS4_METAL_TENSOR_IQ4_NL || type == DS4_METAL_TENSOR_IQ2_XS || type == DS4_METAL_TENSOR_IQ2_S ||
+           type == DS4_METAL_TENSOR_IQ3_XXS || type == DS4_METAL_TENSOR_IQ3_S;
 }
 
 static uint32_t qwen4_moe_mm_tiles(uint32_t n_tokens, bool mid) {
@@ -50088,8 +50134,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u &&
-         weight_type != 42u) ||
+        !qwen4_moe_mm_type_ok(weight_type) ||
         (in_dim % 64) != 0 || ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
@@ -50172,8 +50217,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u &&
-         weight_type != 42u) ||
+        !qwen4_moe_mm_type_ok(weight_type) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||

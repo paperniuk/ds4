@@ -7,9 +7,12 @@
 
 enum {
     Q_F32 = 0, Q_F16 = 1, Q_Q4_0 = 2, Q_Q5_0 = 6, Q_Q8_0 = 8, Q_Q3_K = 11,
-    Q_Q4_K = 12, Q_Q5_K = 13, Q_Q6_K = 14, Q_IQ4_NL = 20, Q_IQ4_XS = 23,
+    Q_Q4_K = 12, Q_Q5_K = 13, Q_Q6_K = 14, Q_IQ2_XS = 17, Q_IQ3_XXS = 18,
+    Q_IQ4_NL = 20, Q_IQ3_S = 21, Q_IQ2_S = 22, Q_IQ4_XS = 23,
     Q_BF16 = 30, Q_Q2_0 = 42,
 };
+
+#include "ds4_iq_grids.inc"
 
 static const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -203,6 +206,80 @@ static void deq_iq4_xs(const uint8_t *b, float *y) {
     }
 }
 
+/* Eight weights of a codebook quant: grid bytes scaled by dl, bit j of
+ * signs negates weight j. */
+static void grid8(const uint8_t *grid, uint8_t signs, float dl, float *y) {
+    for (int j = 0; j < 8; j++) y[j] = dl * (float)grid[j] * ((signs >> j) & 1 ? -1.0f : 1.0f);
+}
+
+/* The IQ3 grids hold four weights per entry: two entries make eight. */
+static void grid4x2(const uint32_t *g1, const uint32_t *g2, uint8_t signs, float dl, float *y) {
+    uint8_t grid[8];
+    memcpy(grid, g1, 4);
+    memcpy(grid + 4, g2, 4);
+    grid8(grid, signs, dl, y);
+}
+
+/* IQ2_XS: f16 d, u16 qs[32] (9-bit grid index, 7-bit sign index), scales[8]. */
+static void deq_iq2_xs(const uint8_t *b, float *y) {
+    const float d = half_at(b);
+    const uint8_t *qs = b + 2, *scales = b + 66;
+    for (int ib = 0; ib < 8; ib++) {
+        for (int l = 0; l < 4; l++) {
+            const uint16_t q = (uint16_t)(qs[8 * ib + 2 * l] | (qs[8 * ib + 2 * l + 1] << 8));
+            const float dl = d * (0.5f + (float)((scales[ib] >> 4 * (l / 2)) & 0xf)) * 0.25f;
+            grid8((const uint8_t *)(iq2xs_grid + (q & 511)), ksigns_iq2xs[q >> 9], dl, y);
+            y += 8;
+        }
+    }
+}
+
+/* IQ2_S: f16 d, qs[32], signs[32], qh[8], scales[8]. */
+static void deq_iq2_s(const uint8_t *b, float *y) {
+    const float d = half_at(b);
+    const uint8_t *qs = b + 2, *signs = b + 34, *qh = b + 66, *scales = b + 74;
+    for (int ib = 0; ib < 8; ib++) {
+        for (int l = 0; l < 4; l++) {
+            const float dl = d * (0.5f + (float)((scales[ib] >> 4 * (l / 2)) & 0xf)) * 0.25f;
+            const uint32_t idx = qs[4 * ib + l] | ((uint32_t)(qh[ib] << (8 - 2 * l)) & 0x300);
+            grid8((const uint8_t *)(iq2s_grid + idx), signs[4 * ib + l], dl, y);
+            y += 8;
+        }
+    }
+}
+
+/* IQ3_XXS: f16 d, qs[64], then per 32 weights a u32 of 4 x 7 sign bits and
+ * a 4-bit scale. */
+static void deq_iq3_xxs(const uint8_t *b, float *y) {
+    const float d = half_at(b);
+    const uint8_t *qs = b + 2, *gas = b + 66;
+    for (int ib = 0; ib < 8; ib++) {
+        uint32_t aux;
+        memcpy(&aux, gas + 4 * ib, sizeof(aux));
+        const float dl = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        for (int l = 0; l < 4; l++) {
+            grid4x2(iq3xxs_grid + qs[8 * ib + 2 * l], iq3xxs_grid + qs[8 * ib + 2 * l + 1],
+                    ksigns_iq2xs[(aux >> 7 * l) & 127], dl, y);
+            y += 8;
+        }
+    }
+}
+
+/* IQ3_S: f16 d, qs[64], qh[8], signs[32], scales[4]. */
+static void deq_iq3_s(const uint8_t *b, float *y) {
+    const float d = half_at(b);
+    const uint8_t *qs = b + 2, *qh = b + 66, *signs = b + 74, *scales = b + 106;
+    for (int ib = 0; ib < 8; ib++) {
+        const float dl = d * (float)(1 + 2 * ((scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+        for (int l = 0; l < 4; l++) {
+            const uint32_t i1 = qs[8 * ib + 2 * l] | ((uint32_t)(qh[ib] << (8 - 2 * l)) & 256);
+            const uint32_t i2 = qs[8 * ib + 2 * l + 1] | ((uint32_t)(qh[ib] << (7 - 2 * l)) & 256);
+            grid4x2(iq3s_grid + i1, iq3s_grid + i2, signs[4 * ib + l], dl, y);
+            y += 8;
+        }
+    }
+}
+
 typedef struct {
     uint32_t type;
     uint32_t block;
@@ -221,6 +298,10 @@ static const quant_info quant_infos[] = {
     { Q_Q5_K,   256, 176, deq_q5_K },
     { Q_Q6_K,   256, 210, deq_q6_K },
     { Q_IQ4_XS, 256, 136, deq_iq4_xs },
+    { Q_IQ2_XS, 256,  74, deq_iq2_xs },
+    { Q_IQ2_S,  256,  82, deq_iq2_s },
+    { Q_IQ3_XXS,256,  98, deq_iq3_xxs },
+    { Q_IQ3_S,  256, 110, deq_iq3_s },
 };
 
 static const quant_info *quant_find(uint32_t type) {

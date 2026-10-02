@@ -7,6 +7,9 @@
 #   ./flash doctor     check the machine, the files and the memory limit
 #   ./flash opencode   print the OpenCode provider block for this server
 #
+# The other models ds4 runs go through the same launcher: ./flash models
+# lists them, ./flash pull NAME downloads one, --model FILE serves it.
+#
 # It works from a source checkout (it runs make when the binaries are
 # missing) and from the prebuilt package, where the binaries sit next to it.
 set -e
@@ -30,15 +33,20 @@ usage: flash <command> [options]
 
   pull [--no-vision]     download what is missing into $MODELS
                          (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder)
+  pull NAME              download another model into ./gguf (see: flash models)
+  models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
+      --model FILE       serve another GGUF instead; the context defaults to
+                         32768 and nothing is tuned, pass the rest after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [-- ARGS]         interactive chat in the terminal
+  chat [--model FILE] [-- ARGS]
+                         interactive chat in the terminal
   doctor                 check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
 
@@ -86,8 +94,18 @@ fetch() {
     mv "$out.part" "$out"
 }
 
+other_models() {
+    [ -f "$HERE/download_model.sh" ] || die "download_model.sh is missing next to this script"
+    cd "$HERE"   # downloads land in ./gguf
+    exec sh ./download_model.sh "$@"
+}
+
 cmd_pull() {
     local vision=1
+    case ${1:-} in
+        ""|--*) ;;
+        *) other_models "$@" ;;
+    esac
     while [ $# -gt 0 ]; do
         case $1 in
             --no-vision) vision=0 ;;
@@ -146,8 +164,30 @@ check_machine() {
     RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 }
 
+# Absolute path of a model given by the user, so it survives the cd to $HERE.
+model_path() {
+    [ -f "$1" ] || die "no such model file: $1"
+    echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+}
+
+# Any other model ds4 supports. Nothing here is tuned: sizing the context
+# to the machine is up to the caller, as are --mtp and --vision.
+serve_other() {
+    local model=$1 ctx=${2:-32768} dry=$3
+    shift 3
+    set -- -m "$model" --ctx "$ctx" --host "$HOST" --port "$PORT" "$@"
+    if [ "$dry" = 1 ]; then
+        echo "cd $HERE && caffeinate -i ./ds4-server $*"
+        return
+    fi
+    ensure_binaries
+    echo "flash: $(basename "$model"), context $ctx, http://$HOST:$PORT/v1" >&2
+    cd "$HERE"
+    exec caffeinate -i ./ds4-server "$@"
+}
+
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0
+    local ctx="" mtp=1 vision=1 dry=0 model=""
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
@@ -156,12 +196,14 @@ cmd_serve() {
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
             --dry-run) dry=1 ;;
+            --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
             *) die "serve: unknown option $1 (see: flash help)" ;;
         esac
         shift
     done
     check_machine
+    if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
     [ "$dry" = 1 ] || ensure_binaries
@@ -221,8 +263,19 @@ cmd_serve() {
 }
 
 cmd_chat() {
-    if [ "$1" = -- ]; then shift; fi
+    local model=""
+    if [ "${1:-}" = --model ]; then
+        [ $# -ge 2 ] || die "--model needs a file"
+        model=$(model_path "$2") || exit 1
+        shift 2
+    fi
+    if [ "${1:-}" = -- ]; then shift; fi
     check_machine
+    if [ -n "$model" ]; then
+        ensure_binaries
+        cd "$HERE"
+        exec ./ds4 -m "$model" "$@"
+    fi
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
     ensure_binaries
@@ -310,6 +363,7 @@ case ${1:-help} in
     pull) shift; cmd_pull "$@" ;;
     serve) shift; cmd_serve "$@" ;;
     chat) shift; cmd_chat "$@" ;;
+    models) other_models ;;
     doctor) shift; cmd_doctor ;;
     opencode) shift; cmd_opencode ;;
     help|-h|--help) usage ;;

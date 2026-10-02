@@ -168,6 +168,22 @@ unlocks the larger one. MTP and vision are on when their files are present.
 | `./flash chat` | talk to the model in the terminal |
 | `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
 | `./flash opencode` | print the provider block for `~/.config/opencode/opencode.json` |
+| `./flash models` | list the other models ds4 runs |
+| `./flash pull NAME` | download one of them into `./gguf` |
+| `./flash serve --model FILE` | serve any other GGUF; also `./flash chat --model FILE` |
+
+The launcher is tuned for Flash-Next. The other models (DeepSeek V4 and V4.1
+Flash, GLM 5.2 and 5.3, the upstream Qwen3.8 files) run through it untuned:
+
+```sh
+./flash models                                   # names and sizes
+./flash pull glm53-q2
+./flash serve --model gguf/GLM-5.3-Flash-Q2.gguf --ctx 65536 -- --mtp
+```
+
+With `--model` the context defaults to 32768 and is not checked against the
+memory of the machine, and everything after `--` goes to `ds4-server`
+unchanged. See [docs/MODELS.md](docs/MODELS.md) for what fits where.
 
 `FLASH_MODELS` changes the model directory, `PORT` and `HOST` the address.
 See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;

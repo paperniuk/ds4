@@ -4222,6 +4222,196 @@ kernel void kernel_qwen4_moe_mm_mid(
     }
 }
 
+/* Register-matrix prompt tiles for Q2_0 experts.  A simdgroup owns 8 expert
+ * rows and 8*NT tokens and keeps the weights and the accumulators in
+ * registers: a lane holds elements [fm][fn] and [fm][fn + 1] of each 8x8
+ * matrix, so no weight is staged in threadgroup memory.  A is the raw 2-bit
+ * code minus one as an exact half, B the fp32 activations, staged once for
+ * the four simdgroups, and the block scale is applied to the dot product of
+ * each 64-wide K step.  Inner index r of K step j is physical k = 8 r + j,
+ * which makes a lane's weights of a step one 32-bit word.  NA = 2 is the
+ * gate/up tile, writing silu(gate . x) * (up . x); NA = 1 the down tile. */
+template <uint NT, uint NA>
+static inline void qwen4_moe_reg_tile(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *w0,
+        device const char    *w1,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const float   *src,        /* mid: x [T][in_dim]; down: mid [T][n_out][in_dim] */
+        device float         *dst,        /* [T][n_out][out_rows] */
+        threadgroup float    *Bs,         /* [64][8 * NT] */
+        uint3 tgpig, uint sgitg, uint lane) {
+    constexpr uint TT = QWEN4_MM_TOKS * NT;
+    constexpr uint KPT = 64 * TT / 128;
+    const uint tid = sgitg * 32u + lane;
+    const uint2 block = qwen4_moe_mm_block(args, tgpig);
+    const uint rb = block.x, e = tgpig.y;
+    if (e >= args.n_expert) return;
+    const uint count = (uint)counts[e];
+    uint work_count = count, work_start = 0;
+    if (qwen4_moe_tail_base) {
+        const uint remainder = count % qwen4_moe_tail_base;
+        const uint tail_tt = remainder <= 8u ? 8u : remainder <= 16u ? 16u : remainder <= 32u ? 32u : 64u;
+        if (TT < qwen4_moe_tail_base) {
+            if (!remainder || tail_tt != TT) return;
+            work_start = count - remainder;
+            work_count = remainder;
+        } else if (remainder && tail_tt < TT) {
+            work_count = count - remainder;
+        }
+    }
+    /* simdgroup_matrix lane layout: thread_elements() are M[fm][fn], M[fm][fn + 1] */
+    const uint qid = lane >> 2;
+    const uint fm = (qid & 4u) | ((lane >> 1) & 3u);
+    const uint fn = ((qid & 2u) << 1) | ((lane & 1u) << 1);
+    const uint row = rb * QWEN4_MM_ROWS + sgitg * 8u + fm;
+    const bool live = row < args.out_rows;
+    device const int32_t *list = lists + (uint64_t)e * args.list_cap;
+    const uint64_t row_off = (uint64_t)e * args.expert_bytes + (uint64_t)(live ? row : 0u) * args.row_bytes;
+    /* an 18-byte block is 9 ushorts: the scale, then 8 codes in each of the rest */
+    device const ushort *wq[NA];
+    wq[0] = (device const ushort *)(w0 + row_off);
+    if constexpr (NA == 2) wq[1] = (device const ushort *)(w1 + row_off);
+    const uint nk = args.in_dim / 64u;
+    for (uint tile = block.y; tile * TT < work_count; tile += args.tiles_per_launch) {
+        const uint t0 = work_start + tile * TT;
+        const uint n_tile = min((uint)TT, work_count - tile * TT);
+        /* the two tokens this lane accumulates in fragment j */
+        uint64_t out[NT][2];
+        bool ok[NT][2];
+#pragma unroll
+        for (uint j = 0; j < NT; j++) {
+#pragma unroll
+            for (uint el = 0; el < 2; el++) {
+                const uint tok = j * 8u + fn + el;
+                ok[j][el] = live && tok < n_tile;
+                const uint pair = tok < n_tile ? (uint)list[t0 + tok] : 0u;
+                out[j][el] = ((uint64_t)(pair / args.n_slots) * args.n_out + pair % args.n_slots) * args.out_rows + row;
+            }
+        }
+        /* the token whose activations this thread stages */
+        const uint s_tok = tid % TT, s_kq = tid / TT;
+        const int s_pair = s_tok < n_tile ? list[t0 + s_tok] : -1;
+        const uint s_t = s_pair >= 0 ? (uint)s_pair / args.n_slots : 0u;
+        const uint s_slot = s_pair >= 0 ? (uint)s_pair % args.n_slots : 0u;
+        device const float *s_x = src + (NA == 2 ? (uint64_t)s_t : (uint64_t)s_t * args.n_out + s_slot) * args.in_dim;
+        float2 acc[NA][NT];
+        uint w[NA];
+        float d[NA];
+#pragma unroll
+        for (uint i = 0; i < NA; i++) {
+#pragma unroll
+            for (uint j = 0; j < NT; j++) acc[i][j] = float2(0.0f);
+            w[i] = live ? ((uint)wq[i][1 + fn] | ((uint)wq[i][2 + fn] << 16)) : 0u;
+            d[i] = live ? (float)as_type<half>(wq[i][0]) : 0.0f;
+        }
+        for (uint kb = 0; kb < nk; kb++) {
+            device const float *xr = s_x + kb * 64u + s_kq * KPT;
+#pragma unroll
+            for (uint j = 0; j < KPT; j += 4) {
+                const float4 v = s_pair >= 0 ? *(device const float4 *)(xr + j) : float4(0.0f);
+                Bs[(s_kq * KPT + j + 0) * TT + s_tok] = v.x;
+                Bs[(s_kq * KPT + j + 1) * TT + s_tok] = v.y;
+                Bs[(s_kq * KPT + j + 2) * TT + s_tok] = v.z;
+                Bs[(s_kq * KPT + j + 3) * TT + s_tok] = v.w;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint cw[NA];
+            float cd[NA];
+            float2 dot[NA][NT];
+#pragma unroll
+            for (uint i = 0; i < NA; i++) {
+                cw[i] = w[i];
+                cd[i] = d[i];
+                if (live && kb + 1 < nk) {   /* read ahead: the wait hides behind the multiply */
+                    device const ushort *nq = wq[i] + (kb + 1) * 9u;
+                    w[i] = (uint)nq[1 + fn] | ((uint)nq[2 + fn] << 16);
+                    d[i] = (float)as_type<half>(nq[0]);
+                }
+#pragma unroll
+                for (uint j = 0; j < NT; j++) dot[i][j] = float2(0.0f);
+            }
+#pragma unroll
+            for (uint ks = 0; ks < 8; ks++) {
+                simdgroup_half8x8 a[NA];
+#pragma unroll
+                for (uint i = 0; i < NA; i++) {
+                    /* 0x6400 is half 1024 with an ulp of 1: the OR adds the code exactly */
+                    reinterpret_cast<thread half2 &>(a[i].thread_elements()) =
+                        as_type<half2>(((cw[i] >> (2u * ks)) & 0x00030003u) | 0x64006400u) - half2(1025.0h);
+                }
+#pragma unroll
+                for (uint j = 0; j < NT; j++) {
+                    simdgroup_float8x8 b, c, r;
+                    simdgroup_load(b, Bs + ks * TT + j * 8u, 8u * TT, 0, false);
+#pragma unroll
+                    for (uint i = 0; i < NA; i++) {
+                        reinterpret_cast<thread float2 &>(c.thread_elements()) = dot[i][j];
+                        simdgroup_multiply_accumulate(r, a[i], b, c);
+                        dot[i][j] = reinterpret_cast<thread float2 &>(r.thread_elements());
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+            for (uint i = 0; i < NA; i++) {
+#pragma unroll
+                for (uint j = 0; j < NT; j++) acc[i][j] = fma(dot[i][j], float2(cd[i]), acc[i][j]);
+            }
+        }
+#pragma unroll
+        for (uint j = 0; j < NT; j++) {
+#pragma unroll
+            for (uint el = 0; el < 2; el++) {
+                if (!ok[j][el]) continue;
+                if constexpr (NA == 2) dst[out[j][el]] = qwen4_silu(acc[0][j][el]) * acc[NA - 1][j][el];
+                else dst[out[j][el]] = acc[0][j][el];
+            }
+        }
+    }
+}
+
+template <uint NT>
+kernel void kernel_qwen4_moe_mm_mid_reg(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const float   *x,
+        device float         *mid,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float Bs[64 * QWEN4_MM_TOKS * NT];
+    qwen4_moe_reg_tile<NT, 2>(args, gate_base, up_base, lists, counts, x, mid, Bs, tgpig, sgitg, lane);
+}
+
+template <uint NT>
+kernel void kernel_qwen4_moe_mm_down_reg(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *down_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const float   *midv,
+        device float         *part,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float Bs[64 * QWEN4_MM_TOKS * NT];
+    qwen4_moe_reg_tile<NT, 1>(args, down_base, down_base, lists, counts, midv, part, Bs, tgpig, sgitg, lane);
+}
+
+#define QWEN4_MM_MID_REG_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort
+#define QWEN4_MM_DOWN_REG_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort
+template [[host_name("kernel_qwen4_moe_mm_mid_reg_nt1")]] kernel void kernel_qwen4_moe_mm_mid_reg<1>(QWEN4_MM_MID_REG_SIG);
+template [[host_name("kernel_qwen4_moe_mm_mid_reg_nt2")]] kernel void kernel_qwen4_moe_mm_mid_reg<2>(QWEN4_MM_MID_REG_SIG);
+template [[host_name("kernel_qwen4_moe_mm_mid_reg")]] kernel void kernel_qwen4_moe_mm_mid_reg<4>(QWEN4_MM_MID_REG_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_reg_nt1")]] kernel void kernel_qwen4_moe_mm_down_reg<1>(QWEN4_MM_DOWN_REG_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_reg_nt2")]] kernel void kernel_qwen4_moe_mm_down_reg<2>(QWEN4_MM_DOWN_REG_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_reg")]] kernel void kernel_qwen4_moe_mm_down_reg<4>(QWEN4_MM_DOWN_REG_SIG);
+
 template [[host_name("kernel_qwen4_moe_mm_mid_nt1")]]
 kernel void kernel_qwen4_moe_mm_mid<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);
 

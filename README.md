@@ -119,6 +119,16 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   same token for the same seed. That is 27.9 to 26.9 ms per token in plain
   decode and 40.1 to 39.1 ms per two-token MTP cycle. Greedy decoding does
   not use the sampler and does not change.
+- **Faster prefill of the expert layers**: three changes to the prompt
+  tiles, measured on a 16K token prompt. The Q6_K decoder reads four weights
+  at a time instead of branching per weight (276 to 291 tok/s). The gate/up
+  tile reads the next expert weights before the multiply, so the wait for
+  cold memory overlaps with it (291 to 303). And the Q2_0 expert tiles keep
+  the weights and accumulators in registers, the simdgroup matrix layout of
+  the Splash M1 port, with fp32 activations staged once per threadgroup (303
+  to 327). The first two leave the output byte for byte the same; the last
+  one is more accurate than the tile it replaces and `DS4_QWEN4_MOE_REG=0`
+  turns it off.
 
 Each change is a separate commit with a test.
 
@@ -293,6 +303,8 @@ send `"temperature": 0` or a `seed`.
 | Variable | Effect |
 |---|---|
 | `DS4_QWEN4_NGRAM_FIRST=1` | read the n-gram rows before any GPU work, as before |
+| `DS4_QWEN4_MOE_REG=0` | staged expert tiles in prefill instead of the register ones |
+| `DS4_METAL_FORCE_METAL4=1` | Metal 4 tensor kernels on chips older than M5 |
 | `DS4_QWEN4_TIMING=1` | print host and GPU time per forward call every 50 calls |
 | `DS4_QWEN4_SPEC_TIMING=1` | print the draft and verify time of the MTP cycle |
 | `DS4_METAL_ENCODER_TIMELINE=file` | write the GPU time of every dispatch (slows the run) |

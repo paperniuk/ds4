@@ -1,15 +1,16 @@
 #!/bin/bash
-# flash: one command to run Qwen3.8-Flash-Next on an Apple Silicon Mac with ds4.
+# dstar: one command to run Qwen3.8-Flash-Next and the other ds4 models on an
+# Apple Silicon Mac.
 #
-#   ./flash pull       download the model, the MTP block and the vision encoder
-#   ./flash serve      start the OpenAI/Anthropic compatible server
-#   ./flash chat       talk to the model in the terminal
-#   ./flash doctor     check the machine, the files and the memory limit
-#   ./flash opencode   print the OpenCode provider block for this server
-#   ./flash link       make "flash" a command that works from any directory
+#   ./dstar pull       download the model, the MTP block and the vision encoder
+#   ./dstar serve      start the OpenAI/Anthropic compatible server
+#   ./dstar chat       talk to the model in the terminal
+#   ./dstar doctor     check the machine, the files and the memory limit
+#   ./dstar opencode   print the OpenCode provider block for this server
+#   ./dstar link       make "dstar" a command that works from any directory
 #
-# The other models ds4 runs go through the same launcher: ./flash models
-# lists them, ./flash pull NAME downloads one, ./flash serve NAME runs it.
+# The other models ds4 runs go through the same launcher: ./dstar models
+# lists them, ./dstar pull NAME downloads one, ./dstar serve NAME runs it.
 #
 # It works from a source checkout (it runs make when the binaries are
 # missing) and from the prebuilt package, where the binaries sit next to it.
@@ -22,13 +23,13 @@ while [ -L "$SELF" ]; do
     case $LINK in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
 done
 HERE=$(cd "$(dirname "$SELF")" && pwd)
-BIN_DIR=${FLASH_BIN:-$HOME/.local/bin}
-MODELS=${FLASH_MODELS:-$HOME/models/flash-next}
+BIN_DIR=${DSTAR_BIN:-$HOME/.local/bin}
+MODELS=${DSTAR_MODELS:-$HOME/models/flash-next}
 PORT=${PORT:-8010}
 HOST=${HOST:-127.0.0.1}
 
 MODEL_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
-QUANT=${FLASH_QUANT:-q2}
+QUANT=${DSTAR_QUANT:-q2}
 MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
 MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
 VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
@@ -36,13 +37,13 @@ VISION_FILE=mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
 
 usage() {
     cat <<EOF
-usage: flash <command> [options]
+usage: dstar <command> [options]
 
   pull [--no-vision] [--quant iq3|iq3s]
                          download what is missing into $MODELS
                          (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder;
                          iq3 is 47 GB more, iq3s 55 GB more)
-  pull NAME              download another model into ./gguf (see: flash models)
+  pull NAME              download another model into ./gguf (see: dstar models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
@@ -59,7 +60,7 @@ usage: flash <command> [options]
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
-                         from its file name (flash serve deepseek). The context
+                         from its file name (dstar serve deepseek). The context
                          defaults to 32768, a model larger than the RAM streams
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
@@ -68,14 +69,14 @@ usage: flash <command> [options]
                          interactive chat in the terminal
   doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
-  link                   link this script into $BIN_DIR, so that "flash"
-                         works from any directory (FLASH_BIN changes the place)
+  link                   link this script into $BIN_DIR, so that "dstar"
+                         works from any directory (DSTAR_BIN changes the place)
 
-Environment: FLASH_MODELS (model directory), FLASH_QUANT (q2, iq3 or iq3s), PORT, HOST.
+Environment: DSTAR_MODELS (model directory), DSTAR_QUANT (q2, iq3 or iq3s), PORT, HOST.
 EOF
 }
 
-die() { echo "flash: $*" >&2; exit 1; }
+die() { echo "dstar: $*" >&2; exit 1; }
 
 # First existing path of the candidates, or the first candidate.
 first_of() {
@@ -114,7 +115,7 @@ locate_files() {
 ensure_binaries() {
     if [ -x "$HERE/ds4-server" ] && [ -x "$HERE/ds4" ]; then return; fi
     [ -f "$HERE/Makefile" ] || die "ds4-server is missing next to this script"
-    echo "flash: building ds4 (first run only)" >&2
+    echo "dstar: building ds4 (first run only)" >&2
     make -C "$HERE" ds4 ds4-server >&2
 }
 
@@ -254,7 +255,7 @@ serve_other() {
     case " $* " in
         *" --ssd-streaming "*) ;;
         *) if needs_streaming "$model"; then
-               echo "flash: the model is larger than the RAM, streaming it from the SSD" >&2
+               echo "dstar: the model is larger than the RAM, streaming it from the SSD" >&2
                export DS4_METAL_SELECTED_ID_POLL=${DS4_METAL_SELECTED_ID_POLL:-1}
                set -- "$@" --ssd-streaming
            fi ;;
@@ -264,7 +265,7 @@ serve_other() {
         return
     fi
     ensure_binaries
-    echo "flash: $(basename "$model"), context $ctx, http://$HOST:$PORT/v1" >&2
+    echo "dstar: $(basename "$model"), context $ctx, http://$HOST:$PORT/v1" >&2
     cd "$HERE"
     exec caffeinate -i ./ds4-server "$@"
 }
@@ -283,9 +284,9 @@ cmd_serve() {
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
-            -*) die "serve: unknown option $1 (see: flash help)" ;;
+            -*) die "serve: unknown option $1 (see: dstar help)" ;;
             *) model=$(model_path "$1") || exit 1 ;;
-            *) die "serve: unknown option $1 (see: flash help)" ;;
+            *) die "serve: unknown option $1 (see: dstar help)" ;;
         esac
         shift
     done
@@ -295,7 +296,7 @@ cmd_serve() {
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
     [ "$dry" = 1 ] || ensure_binaries
-    [ "$RAM_GB" -ge 60 ] || echo "flash: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
+    [ "$RAM_GB" -ge 60 ] || echo "dstar: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
 
     # Without --ctx take the largest window that leaves the rest of the
     # system 8 GB (the iq3 quant on 64 GB fits 262K, but then it swaps), and
@@ -306,7 +307,7 @@ cmd_serve() {
             [ $(( $(need_mib "$want") + 8192 )) -gt $(( RAM_GB * 1024 )) ] || break
         done
         if [ "$want" != 262144 ]; then
-            echo "flash: using a $(( want / 1000 ))K context, a larger one would leave the rest of the system too little memory." >&2
+            echo "dstar: using a $(( want / 1000 ))K context, a larger one would leave the rest of the system too little memory." >&2
             echo "    --ctx N forces it." >&2
         fi
         ctx=$want
@@ -314,7 +315,7 @@ cmd_serve() {
             if [ "$c" -le "$want" ] && ctx_fits "$c"; then ctx=$c; break; fi
         done
         if [ "$ctx" != "$want" ]; then
-            echo "flash: using a $(( ctx / 1000 ))K context. For $(( want / 1000 ))K run this once per boot, then restart:" >&2
+            echo "dstar: using a $(( ctx / 1000 ))K context. For $(( want / 1000 ))K run this once per boot, then restart:" >&2
             echo "    $(sysctl_hint "$want")" >&2
         fi
     fi
@@ -322,7 +323,7 @@ cmd_serve() {
     [ "$(need_mib "$ctx")" -le "$max_mib" ] ||
         die "a context of $ctx tokens needs about $(need_mib "$ctx") MiB of GPU memory, more than this Mac can give"
     if ! ctx_fits "$ctx"; then
-        echo "flash: a context of $ctx tokens needs a higher GPU memory limit. Run:" >&2
+        echo "dstar: a context of $ctx tokens needs a higher GPU memory limit. Run:" >&2
         echo "    $(sysctl_hint "$ctx")" >&2
         exit 1
     fi
@@ -347,7 +348,7 @@ cmd_serve() {
         export DS4_QWEN_MTP_GGUF=$F_MTP
         set -- --mtp "$@"
     elif [ "$mtp" = 1 ]; then
-        echo "flash: no MTP block in $MODELS, decoding without it (run: $0 pull)" >&2
+        echo "dstar: no MTP block in $MODELS, decoding without it (run: $0 pull)" >&2
     fi
     if [ "$vision" = 1 ] && [ -f "$F_VISION" ]; then set -- --vision "$F_VISION" "$@"; fi
 
@@ -356,7 +357,7 @@ cmd_serve() {
         echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
         return
     fi
-    echo "flash: $QUANT, context $ctx, http://$HOST:$PORT/v1" >&2
+    echo "dstar: $QUANT, context $ctx, http://$HOST:$PORT/v1" >&2
     cd "$HERE"   # the Metal shaders load from ./metal
     exec caffeinate -i ./ds4-server -m "$F_SHARD1" "$@"
 }
@@ -417,10 +418,10 @@ cmd_doctor() {
     done
     [ -d "$HERE/metal" ] && line "metal shaders" "ok" || { line "metal shaders" "missing $HERE/metal"; bad=1; }
     for f in "$F_SHARD1" "$F_SHARD2"; do
-        if [ -f "$f" ]; then line "model" "$(basename "$f")"; else line "model" "missing $(basename "$f") (flash pull)"; bad=1; fi
+        if [ -f "$f" ]; then line "model" "$(basename "$f")"; else line "model" "missing $(basename "$f") (dstar pull)"; bad=1; fi
     done
-    [ -f "$F_MTP" ] && line "MTP block" "ok" || line "MTP block" "missing, decoding will be slower (flash pull)"
-    [ -f "$F_VISION" ] && line "vision encoder" "ok" || line "vision encoder" "missing, images are off (flash pull)"
+    [ -f "$F_MTP" ] && line "MTP block" "ok" || line "MTP block" "missing, decoding will be slower (dstar pull)"
+    [ -f "$F_VISION" ] && line "vision encoder" "ok" || line "vision encoder" "missing, images are off (dstar pull)"
     limit=$(wired_limit)
     line "wired limit" "$([ "$limit" = 0 ] && echo "system default" || echo "$limit MiB")"
     for c in 32768 131072 262144 400000 524288; do
@@ -448,11 +449,11 @@ cmd_doctor() {
 
 cmd_link() {
     mkdir -p "$BIN_DIR"
-    if [ -e "$BIN_DIR/flash" ] && [ ! -L "$BIN_DIR/flash" ]; then
-        die "$BIN_DIR/flash exists and is not a link; remove it first"
+    if [ -e "$BIN_DIR/dstar" ] && [ ! -L "$BIN_DIR/dstar" ]; then
+        die "$BIN_DIR/dstar exists and is not a link; remove it first"
     fi
-    ln -sf "$HERE/flash" "$BIN_DIR/flash"
-    echo "flash -> $HERE/flash"
+    ln -sf "$HERE/dstar" "$BIN_DIR/dstar"
+    echo "dstar -> $HERE/dstar"
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *) echo "$BIN_DIR is not on your PATH. Add this line to ~/.zshrc and open a new terminal:"

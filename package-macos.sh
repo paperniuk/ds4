@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build the prebuilt macOS package for Qwen3.8-Flash-Next: the binaries, the
-# Metal shaders they load at start and the flash launcher, in one tarball.
+# Metal shaders they load at start and the dstar launcher, in one tarball.
 #
 #   ./package-macos.sh [output directory]
 #
@@ -19,7 +19,7 @@ git -C "$ROOT" archive HEAD | tar -x -C "$WORK/src"
 MACOSX_DEPLOYMENT_TARGET=15.0 make -C "$WORK/src" ds4 ds4-server \
     NATIVE_CPU_FLAG=-mcpu=apple-m1 DEBUG_FLAGS= >/dev/null
 
-cp "$WORK/src/ds4" "$WORK/src/ds4-server" "$WORK/src/flash" "$WORK/src/download_model.sh" "$WORK/src/LICENSE" "$WORK/$NAME/"
+cp "$WORK/src/ds4" "$WORK/src/ds4-server" "$WORK/src/dstar" "$WORK/src/download_model.sh" "$WORK/src/LICENSE" "$WORK/$NAME/"
 mkdir "$WORK/$NAME/metal"
 cp "$WORK/src"/metal/*.metal "$WORK/$NAME/metal/"
 strip -x "$WORK/$NAME/ds4" "$WORK/$NAME/ds4-server"

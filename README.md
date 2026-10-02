@@ -12,7 +12,7 @@ What it adds to stock ds4:
 - **The small ISTA-DASLab GSQ-RCO files.** Their weights take 35 to 51 GiB,
   so the model fits a 64 GB Mac with room for the whole context window.
   Stock ds4 does not open these files; its own take 42 and 70 GiB.
-- **One launcher.** `flash serve` picks the context that fits the memory of
+- **One launcher.** `dstar serve` picks the context that fits the memory of
   the machine, turns on MTP and vision, and prints the one `sysctl` line it
   may need.
 - **Agent sessions that do not replay.** A retried or edited turn on a 31K
@@ -27,16 +27,30 @@ what is not specific to M1 is listed in [Which Macs gain](#which-macs-gain).
 
 ## Pick a quant for your Mac
 
-| Memory | `flash serve` | Context | Checked on |
-|---|---|---|---|
-| 64 GB | `--quant q2` (default) | 262K, up to 524K | M1 Max |
-| 64 GB | `--quant iq3` | 131K | M1 Max |
-| 96 GB | `--quant iq3s` | 262K | memory plan only |
-| 128 GB or more | `--quant iq3s` | 262K, up to 524K | memory plan only |
+| Memory | `dstar serve` | Context | GPU memory limit | Checked on |
+|---|---|---|---|---|
+| 64 GB | `--quant q2` (default) | 262K, up to 524K | raise it above 131K | M1 Max |
+| 64 GB | `--quant iq3` | 131K, 262K with `--ctx 262k` | raise it for 262K | M1 Max |
+| 96 GB | `--quant iq3s` | 262K | default | memory plan only |
+| 128 GB or more | `--quant iq3s` | 262K, up to 524K | default | memory plan only |
+
+**The GPU memory limit often has to be raised.** macOS lets the GPU wire
+about three quarters of the memory by default, 48 GiB on a 64 GB Mac, and
+the model with a long context needs more. When a context does not fit,
+`dstar serve` falls back to a smaller one or stops, and prints the exact
+line to run, for example:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=57344    # 61440 for iq3 at 262K or q2 at 524K
+```
+
+The setting is lost at every reboot, so it has to be run again after one.
+With IQ3_XXS at 262K the server holds 56.6 GiB of the 64, which leaves the
+rest of the system about 5 GB: close the browser first.
 
 Q2_0 is the fastest file. IQ3_XXS and IQ3_S answer better by ISTA's own
 measurements (LiveCodeBench 81.1, 86.3 and 86.9) and are slower, see
-[The larger quants](#the-larger-quants). `flash doctor` prints the largest
+[The larger quants](#the-larger-quants). `dstar doctor` prints the largest
 context every quant can hold on the machine it runs on.
 
 Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
@@ -195,7 +209,7 @@ nothing but the M1 Max was measured:
 
 | Change | Default | To try it on another chip |
 |---|---|---|
-| Remainder tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_TAILS=1` (`flash serve` sets it on every Mac) |
+| Remainder tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_TAILS=1` (`dstar serve` sets it on every Mac) |
 | Register tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_REG=1` |
 | Packed group rows in the DeepSeek V4 attention output | M1 | `DS4_METAL_ATTN_OUT_DENSE=1` |
 
@@ -214,8 +228,8 @@ useful report: the first prints the machine and what fits, the second a
 prefill and decode speed.
 
 ```sh
-./flash doctor
-./flash chat -- -p "Write a C function that reverses a linked list." -n 300 --temp 0
+dstar doctor
+dstar chat -- -p "Write a C function that reverses a linked list." -n 300 --temp 0
 ```
 
 ## Requirements
@@ -253,40 +267,40 @@ cd ds4 && make
 Then, from any directory:
 
 ```sh
-flash pull       # 69 GB: the model, the MTP block, the vision encoder
-flash serve      # server on http://127.0.0.1:8010/v1
-flash opencode   # provider block for OpenCode
+dstar pull       # 69 GB: the model, the MTP block, the vision encoder
+dstar serve      # server on http://127.0.0.1:8010/v1
+dstar opencode   # provider block for OpenCode
 ```
 
 The installer links the launcher into `~/.local/bin`. After a source build
-run `./flash link` once to do the same, or keep calling it as `./flash`. If
-`~/.local/bin` is not on your `PATH`, `flash link` prints the line to add.
+run `./dstar link` once to do the same, or keep calling it as `./dstar`. If
+`~/.local/bin` is not on your `PATH`, `dstar link` prints the line to add.
 
-`flash serve` picks the context for you: the full 262K when the memory of
+`dstar serve` picks the context for you: the full 262K when the memory of
 the machine and the GPU memory limit allow it, a smaller one otherwise, and
 it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are on when their files are present.
 
 | Command | What it does |
 |---|---|
-| `./flash pull` | download what is missing into `~/models/flash-next`, resumable |
-| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
-| `./flash serve --dry-run` | print the `ds4-server` command and environment instead of running it |
-| `./flash chat` | talk to the model in the terminal |
-| `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
-| `./flash opencode` | print the provider block for `~/.config/opencode/opencode.json` |
-| `./flash link` | link the launcher into `~/.local/bin`, so `flash` works from any directory |
-| `./flash models` | list the other models ds4 runs |
-| `./flash pull NAME` | download one of them into `./gguf` |
-| `./flash serve NAME` | serve another model by a word from its file name; also `./flash chat NAME` |
+| `dstar pull` | download what is missing into `~/models/flash-next`, resumable |
+| `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
+| `dstar serve --dry-run` | print the `ds4-server` command and environment instead of running it |
+| `dstar chat` | talk to the model in the terminal |
+| `dstar doctor` | check the machine, the files, the memory limit and which contexts fit |
+| `dstar opencode` | print the provider block for `~/.config/opencode/opencode.json` |
+| `dstar link` | link the launcher into `~/.local/bin`, so `dstar` works from any directory |
+| `dstar models` | list the other models ds4 runs |
+| `dstar pull NAME` | download one of them into `./gguf` |
+| `dstar serve NAME` | serve another model by a word from its file name; also `dstar chat NAME` |
 
 The launcher is tuned for Flash-Next. The other models (DeepSeek V4 and V4.1
 Flash, GLM 5.2 and 5.3, the upstream Qwen3.8 files) run through it untuned:
 
 ```sh
-./flash models                  # names and sizes
-./flash pull ds4f-q2
-./flash serve deepseek          # or a path to the GGUF
-./flash chat deepseek
+dstar models                  # names and sizes
+dstar pull ds4f-q2
+dstar serve deepseek          # or a path to the GGUF
+dstar chat deepseek
 ```
 
 The name is looked up in `./gguf` and next to `~/models/flash-next`. The
@@ -296,7 +310,7 @@ DeepSeek V4 Flash Q2 runs at about 10 tokens per second on a 64 GB M1 Max
 that way. Everything after `--` goes to `ds4-server`
 unchanged. See [docs/MODELS.md](docs/MODELS.md) for what fits where.
 
-`FLASH_MODELS` changes the model directory, `FLASH_QUANT` the default quant,
+`DSTAR_MODELS` changes the model directory, `DSTAR_QUANT` the default quant,
 `PORT` and `HOST` the address.
 See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
 use port 8010 and the context the server was started with.
@@ -305,7 +319,7 @@ use port 8010 and the context the server was started with.
 quieter Mac: the engine sleeps after every decoded token and every prefill
 chunk. Speed drops a little more than in proportion, `--power 50` gives 16
 tokens per second where the full speed is 35, and the output does not
-change. In `flash chat` the `/power N` command changes it on the fly.
+change. In `dstar chat` the `/power N` command changes it on the fly.
 
 After a `git pull`, run `make` and restart the server. There is nothing to
 switch on: the speedups listed above are the default path.
@@ -313,11 +327,11 @@ switch on: the speedups listed above are the default path.
 ### The larger quants
 
 ```sh
-./flash pull --quant iq3     # IQ3_XXS, 47 GB more
-./flash serve --quant iq3
+dstar pull --quant iq3     # IQ3_XXS, 47 GB more
+dstar serve --quant iq3
 
-./flash pull --quant iq3s    # IQ3_S, 55 GB more
-./flash serve --quant iq3s
+dstar pull --quant iq3s    # IQ3_S, 55 GB more
+dstar serve --quant iq3s
 ```
 
 The n-gram shard, the MTP block and the vision encoder are the same files
@@ -338,7 +352,7 @@ fork dequantizes them on the CPU bit for bit as llama.cpp does and has Metal
 kernels for them, checked against that reference by `make test-quant-types`
 and `make test-qwen4-kernels`.
 
-**IQ3_XXS on 64 GB.** `flash serve` starts it with a 131K context, which
+**IQ3_XXS on 64 GB.** `dstar serve` starts it with a 131K context, which
 plans 52 GiB of GPU memory. `--ctx 262k` works and plans 56.6 GiB, but leaves
 the rest of the system about 5 GB, so close the browser first. Longer
 contexts do not fit.
@@ -346,22 +360,22 @@ contexts do not fit.
 **IQ3_S is for 96 GB and more.** With MTP and vision it plans about 56 GiB
 at 32K and 60 GiB at 131K. On a 64 GB Mac it therefore runs with a 32K
 context and little room for anything else; it was loaded and measured that
-way here. On 96 GB or more `flash serve` picks the full 262K window, and the
+way here. On 96 GB or more `dstar serve` picks the full 262K window, and the
 default GPU memory limit is already high enough. That choice comes from the
 memory plan, it has not been run on such a machine.
 
-`./flash doctor` lists the largest context every quant can hold on the
-machine. `./flash doctor --quant NAME` and `./flash chat --quant NAME` take
-the same option, and `FLASH_QUANT=iq3` makes one the default.
+`dstar doctor` lists the largest context every quant can hold on the
+machine. `dstar doctor --quant NAME` and `dstar chat --quant NAME` take
+the same option, and `DSTAR_QUANT=iq3` makes one the default.
 
-Above that, upstream's Q4 file (`./flash pull qwen38-q4k`, 165 GiB on disk,
+Above that, upstream's Q4 file (`dstar pull qwen38-q4k`, 165 GiB on disk,
 70 GiB of weights in memory) runs through the launcher as one of the other
 models: no automatic context, and the kernels of this fork for the ISTA
 quants do not take part.
 
 ### By hand
 
-`flash serve` runs this, with the paths filled in:
+`dstar serve` runs this, with the paths filled in:
 
 ```sh
 M=~/models/flash-next/Q2_0
@@ -380,7 +394,7 @@ there at start.
 
 ### Longer contexts
 
-`./flash serve --ctx 400k` or `--ctx 524k` does all of the below. By hand:
+`dstar serve --ctx 400k` or `--ctx 524k` does all of the below. By hand:
 pick the context, raise the wired limit to match, and add YaRN and a
 separate checkpoint directory above 262144:
 

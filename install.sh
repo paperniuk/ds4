@@ -3,11 +3,11 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
 #
-# It unpacks the latest release into ~/ds4-flash-next (FLASH_DIR to change),
-# links the launcher into ~/.local/bin (FLASH_BIN to change) and downloads
-# nothing else; `flash pull` fetches the model.
+# It unpacks the latest release into ~/ds4-flash-next (DSTAR_DIR to change),
+# links the launcher into ~/.local/bin (DSTAR_BIN to change) and downloads
+# nothing else; `dstar pull` fetches the model.
 set -e
-DIR=${FLASH_DIR:-$HOME/ds4-flash-next}
+DIR=${DSTAR_DIR:-$HOME/ds4-flash-next}
 URL=https://github.com/paperniuk/ds4/releases/latest/download/ds4-flash-next-macos-arm64.tar.gz
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
@@ -31,13 +31,13 @@ fi
 mkdir -p "$DIR"
 tar -xzf "$TMP/pkg.tar.gz" -C "$DIR" --strip-components 1
 
-"$DIR/flash" link
+"$DIR/dstar" link
 
 cat <<MSG
 
 Installed in $DIR. Next:
 
-  flash pull      # 69 GB: the model, the MTP block, the vision encoder
-  flash serve     # server on http://127.0.0.1:8010/v1
-  flash opencode  # provider block for OpenCode
+  dstar pull      # 69 GB: the model, the MTP block, the vision encoder
+  dstar serve     # server on http://127.0.0.1:8010/v1
+  dstar opencode  # provider block for OpenCode
 MSG

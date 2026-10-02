@@ -1,19 +1,52 @@
-# ds4 for Apple Silicon, tuned on M1: Qwen3.8-Flash-Next at 262K context
+# ds4 Flash-Next: Qwen3.8-Flash-Next on Apple Silicon
 
-A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) tuned
-primarily for Apple7/Apple8 GPUs, that is M1 and M2 Macs, which do not get
-the Metal 4 tensor API that stock ds4 uses on M5. Most of the work is not
-tied to those chips: it runs on every Apple Silicon Mac, see
-[Which Macs gain](#which-macs-gain).
+A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar), tuned
+mostly for M1/M2, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
+64 GB of memory or more:
+the **full 262K context**, MTP speculative decoding and vision, as a local
+OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
+other agent.
 
-It runs **Qwen3.8-Flash-Next** (the ISTA-DASLab GSQ-RCO Q2_0 GGUF) on a
-**64 GB M1 Max** with the **full 262K context**, MTP speculative decoding and
-vision, as a local OpenAI/Anthropic compatible server for OpenCode, Claude
-Code, Pi or any other agent.
+What it adds to stock ds4:
 
-## Numbers
+- **The small ISTA-DASLab GSQ-RCO files.** Their weights take 35 to 51 GiB,
+  so the model fits a 64 GB Mac with room for the whole context window.
+  Stock ds4 does not open these files; its own take 42 and 70 GiB.
+- **One launcher.** `flash serve` picks the context that fits the memory of
+  the machine, turns on MTP and vision, and prints the one `sysctl` line it
+  may need.
+- **Agent sessions that do not replay.** A retried or edited turn on a 31K
+  prompt takes 0.3 s instead of 109 s, and a new session with the same
+  system prompt and tools starts from a checkpoint on disk.
+- **Metal kernels for these quants**, written and measured on an M1 Max,
+  where stock ds4 decoded at 21 to 23 tokens per second and this fork
+  decodes at 35.
 
-M1 Max, 32-core GPU, 64 GB. Greedy decoding, `--prefill-chunk 2048`.
+Nearly all of it is the same code on every Apple Silicon chip. What is and
+what is not specific to M1 is listed in [Which Macs gain](#which-macs-gain).
+
+## Pick a quant for your Mac
+
+| Memory | `flash serve` | Context | Checked on |
+|---|---|---|---|
+| 64 GB | `--quant q2` (default) | 262K, up to 524K | M1 Max |
+| 64 GB | `--quant iq3` | 131K | M1 Max |
+| 96 GB | `--quant iq3s` | 262K | memory plan only |
+| 128 GB or more | `--quant iq3s` | 262K, up to 524K | memory plan only |
+
+Q2_0 is the fastest file. IQ3_XXS and IQ3_S answer better by ISTA's own
+measurements (LiveCodeBench 81.1, 86.3 and 86.9) and are slower, see
+[The larger quants](#the-larger-quants). `flash doctor` prints the largest
+context every quant can hold on the machine it runs on.
+
+Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
+the weights must fit in memory: by the memory plan Q2_0 with a 32K context
+needs 42 GiB.
+
+## Speed on an M1 Max
+
+M1 Max, 32-core GPU, 64 GB, the Q2_0 file. Greedy decoding,
+`--prefill-chunk 2048`.
 
 | Context | Decode | Decode with MTP | Prefill |
 |---|---|---|---|
@@ -22,12 +55,12 @@ M1 Max, 32-core GPU, 64 GB. Greedy decoding, `--prefill-chunk 2048`.
 | 262K | 29.7 tok/s | 36.1 tok/s | ~269 tok/s |
 
 MTP gains depend on the text: about +30% on code, about +10% on prose.
+IQ3_XXS runs at about three quarters of this speed and IQ3_S a little below
+that.
 
-The same release has a larger IQ3_XXS file, which ISTA measures as clearly
-better (LiveCodeBench 86.3 against 81.1 for Q2_0). It runs here too, at about
-three quarters of the speed: 29 tok/s plain and 35 tok/s with MTP at 4K. The
-largest one, IQ3_S, is meant for Macs with 96 GB or more. See
-[The larger quants](#the-larger-quants).
+These are the only measured numbers so far. Newer chips have faster GPUs and
+run the same kernels, but nobody has timed them; if you do, the two commands
+at the end of [Which Macs gain](#which-macs-gain) make a useful report.
 
 ## Beyond 262K
 
@@ -217,13 +250,17 @@ git clone https://github.com/paperniuk/ds4.git
 cd ds4 && make
 ```
 
-Then, in either directory:
+Then, from any directory:
 
 ```sh
-./flash pull       # 69 GB: the model, the MTP block, the vision encoder
-./flash serve      # server on http://127.0.0.1:8010/v1
-./flash opencode   # provider block for OpenCode
+flash pull       # 69 GB: the model, the MTP block, the vision encoder
+flash serve      # server on http://127.0.0.1:8010/v1
+flash opencode   # provider block for OpenCode
 ```
+
+The installer links the launcher into `~/.local/bin`. After a source build
+run `./flash link` once to do the same, or keep calling it as `./flash`. If
+`~/.local/bin` is not on your `PATH`, `flash link` prints the line to add.
 
 `flash serve` picks the context for you: the full 262K when the memory of
 the machine and the GPU memory limit allow it, a smaller one otherwise, and
@@ -237,6 +274,7 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 | `./flash chat` | talk to the model in the terminal |
 | `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
 | `./flash opencode` | print the provider block for `~/.config/opencode/opencode.json` |
+| `./flash link` | link the launcher into `~/.local/bin`, so `flash` works from any directory |
 | `./flash models` | list the other models ds4 runs |
 | `./flash pull NAME` | download one of them into `./gguf` |
 | `./flash serve NAME` | serve another model by a word from its file name; also `./flash chat NAME` |

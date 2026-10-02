@@ -3992,6 +3992,21 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
     qwen4_mm_stage8(row, b, q0 + 1, type, dst + 8);
 }
 
+/* Q2_0 prefetch for the prompt tiles: the scale and the four code bytes of
+ * 16 weights, read one K step ahead so the load waits behind the multiply. */
+struct qwen4_q2pre { float d; uint q; };
+static inline qwen4_q2pre qwen4_q2_load16(device const char *row, uint b, uint q0) {
+    device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 2) * 18);
+    device const uchar *qs = blk + 2 + ((b & 1u) * 32u + q0 * 8u) / 4u;
+    qwen4_q2pre r;
+    r.d = (float)(*(device const half *)blk);
+    r.q = (uint)qs[0] | ((uint)qs[1] << 8) | ((uint)qs[2] << 16) | ((uint)qs[3] << 24);
+    return r;
+}
+static inline void qwen4_q2_stage16(qwen4_q2pre r, threadgroup half *dst) {
+    for (uint i = 0; i < 16; i++) dst[i] = (half)(r.d * ((float)((r.q >> (2u * i)) & 3u) - 1.0f));
+}
+
 /* Raw words of one 32-block (K step) of an expert row, for the tensor tiles'
  * register prefetch: Q4_K keeps the 16-byte header (d, dmin, scales) and the
  * 16 nibble bytes of the quarter pair; Q2_K keeps d|dmin, the group's scale
@@ -4134,12 +4149,20 @@ kernel void kernel_qwen4_moe_mm_mid(
         const uint my_tok = tid % TT;
         const int my_pair = my_tok < n_tile ? list[t0 + my_tok] : -1;
         const uint my_t = my_pair >= 0 ? (uint)my_pair / args.n_slots : 0;
+        const uint ar = tid / 4, aq = tid % 4;
+        const uint atype = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
+        const bool pre = atype == 42 && row0 + ar < args.out_rows;
+        device const char *pgrow = gbase + (uint64_t)(row0 + ar) * args.row_bytes;
+        device const char *purow = ubase + (uint64_t)(row0 + ar) * args.row_bytes;
+        qwen4_q2pre pg, pu;
+        if (pre) { pg = qwen4_q2_load16(pgrow, aq >> 1, (aq & 1) * 2); pu = qwen4_q2_load16(purow, aq >> 1, (aq & 1) * 2); }
         for (uint kb = 0; kb < nk; kb++) {
             /* A: 32 rows x 64 k; thread = (row, 16-wide slice) */
             {
                 const uint r = tid / 4, q = tid % 4;   /* q: 16-value half of one of the two 32-blocks */
                 threadgroup half *dg = Ag + r * QWEN4_MM_KS + q * 16;
                 threadgroup half *du = Au + r * QWEN4_MM_KS + q * 16;
+                if (pre) { qwen4_q2_stage16(pg, dg); qwen4_q2_stage16(pu, du); } else
                 if (row0 + r < args.out_rows) {
                     device const char *grow = gbase + (uint64_t)(row0 + r) * args.row_bytes;
                     device const char *urow = ubase + (uint64_t)(row0 + r) * args.row_bytes;
@@ -4165,6 +4188,10 @@ kernel void kernel_qwen4_moe_mm_mid(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (pre && kb + 1 < nk) {
+                pg = qwen4_q2_load16(pgrow, (kb + 1) * 2 + (aq >> 1), (aq & 1) * 2);
+                pu = qwen4_q2_load16(purow, (kb + 1) * 2 + (aq >> 1), (aq & 1) * 2);
+            }
             for (uint sub = 0; sub < QWEN4_MM_KS / 8; sub++) {
                 simdgroup_half8x8 ag, au, b;
                 simdgroup_load(ag, Ag + (sgitg * 8) * QWEN4_MM_KS + sub * 8, QWEN4_MM_KS, 0, false);

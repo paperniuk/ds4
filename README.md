@@ -5,7 +5,8 @@ mostly for M1/M2, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
 64 GB of memory or more:
 the **full 262K context**, MTP speculative decoding and vision, as a local
 OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
-other agent.
+other agent. The same launcher also runs **DeepSeek V4 Flash** and the other
+ds4 models, see [Other models](#other-models).
 
 What it adds to stock ds4:
 
@@ -21,6 +22,9 @@ What it adds to stock ds4:
 - **Metal kernels for these quants**, written and measured on an M1 Max,
   where stock ds4 decoded at 21 to 23 tokens per second and this fork
   decodes at 35.
+- **DeepSeek V4 Flash on a 64 GB Mac.** The 81 GiB Q2 file is larger than
+  the memory, so `dstar serve deepseek` streams it from the SSD: about 10
+  tokens per second on an M1 Max, against 9.4 in stock ds4.
 
 Nearly all of it is the same code on every Apple Silicon chip. What is and
 what is not specific to M1 is listed in [Which Macs gain](#which-macs-gain).
@@ -282,7 +286,7 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 
 | Command | What it does |
 |---|---|
-| `dstar pull` | download what is missing into `~/models/flash-next`, resumable |
+| `dstar pull` | download what is missing into `~/models/flash-next`, resumable; `--quant q2/iq3/iq3s` picks the quant, `--no-vision` skips the encoder |
 | `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
 | `dstar serve --dry-run` | print the `ds4-server` command and environment instead of running it |
 | `dstar chat` | talk to the model in the terminal |
@@ -292,6 +296,8 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 | `dstar models` | list the other models ds4 runs |
 | `dstar pull NAME` | download one of them into `./gguf` |
 | `dstar serve NAME` | serve another model by a word from its file name; also `dstar chat NAME` |
+
+### Other models
 
 The launcher is tuned for Flash-Next. The other models (DeepSeek V4 and V4.1
 Flash, GLM 5.2 and 5.3, the upstream Qwen3.8 files) run through it untuned:
@@ -327,15 +333,18 @@ switch on: the speedups listed above are the default path.
 ### The larger quants
 
 ```sh
-dstar pull --quant iq3     # IQ3_XXS, 47 GB more
+dstar pull --quant iq3     # IQ3_XXS: 76 GB, or 47 GB next to another quant
 dstar serve --quant iq3
 
-dstar pull --quant iq3s    # IQ3_S, 55 GB more
+dstar pull --quant iq3s    # IQ3_S: 83 GB, or 55 GB next to another quant
 dstar serve --quant iq3s
 ```
 
-The n-gram shard, the MTP block and the vision encoder are the same files
-for every quant, so a second quant downloads only its own weights.
+`dstar pull --quant` downloads that quant only, there is no need to fetch
+Q2_0 first. The n-gram shard, the MTP block and the vision encoder are the
+same files for every quant, so a second quant downloads only its own
+weights. Without `--quant`, `dstar serve` takes the quant that is on disk,
+Q2_0 when there are several.
 
 | `--quant` | ISTA file | Weights | ISTA task average | LiveCodeBench | Plain | With MTP | Default context on 64 GB |
 |---|---|---|---|---|---|---|---|

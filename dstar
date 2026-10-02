@@ -29,7 +29,7 @@ PORT=${PORT:-8010}
 HOST=${HOST:-127.0.0.1}
 
 MODEL_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
-QUANT=${DSTAR_QUANT:-q2}
+QUANT=${DSTAR_QUANT:-}
 MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
 MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
 VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
@@ -39,10 +39,12 @@ usage() {
     cat <<EOF
 usage: dstar <command> [options]
 
-  pull [--no-vision] [--quant iq3|iq3s]
-                         download what is missing into $MODELS
-                         (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder;
-                         iq3 is 47 GB more, iq3s 55 GB more)
+  pull [--no-vision] [--quant q2|iq3|iq3s]
+                         download what is missing into $MODELS:
+                         one quant (q2 by default, 67 GB; iq3 76 GB; iq3s
+                         83 GB), the 1.5 GB MTP block, the 0.6 GB vision
+                         encoder. A second quant reuses the 27 GB n-gram
+                         table of the first
   pull NAME              download another model into ./gguf (see: dstar models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
@@ -112,6 +114,18 @@ locate_files() {
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
 }
 
+# Without --quant or DSTAR_QUANT: the fastest quant that is on disk, q2 when
+# nothing is, so a Mac that pulled only iq3s serves it with a plain "serve".
+pick_quant() {
+    local q
+    [ -z "$QUANT" ] || return 0
+    for q in q2 iq3 iq3s; do
+        QUANT=$q; locate_files
+        [ -f "$F_SHARD1" ] && return 0
+    done
+    QUANT=q2
+}
+
 ensure_binaries() {
     if [ -x "$HERE/ds4-server" ] && [ -x "$HERE/ds4" ]; then return; fi
     [ -f "$HERE/Makefile" ] || die "ds4-server is missing next to this script"
@@ -155,6 +169,7 @@ cmd_pull() {
         esac
         shift
     done
+    pick_quant
     locate_files
     mkdir -p "$MODELS"
     local need_gb=0 free_gb
@@ -166,7 +181,7 @@ cmd_pull() {
     fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD2" "$F_SHARD2"
     fetch "$MTP_REPO" "$MTP_FILE" "$F_MTP"
     if [ "$vision" = 1 ]; then fetch "$VISION_REPO" "$VISION_FILE" "$F_VISION"; fi
-    echo "Done. Start the server with: $0 serve"
+    echo "Done. Start the server with: dstar serve"
 }
 
 parse_ctx() {
@@ -293,6 +308,7 @@ cmd_serve() {
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
+    pick_quant
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
     [ "$dry" = 1 ] || ensure_binaries
@@ -392,6 +408,7 @@ cmd_chat() {
         cd "$HERE"
         exec ./ds4 -m "$model" "$@"
     fi
+    pick_quant
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
     ensure_binaries
@@ -408,6 +425,7 @@ cmd_doctor() {
     local bad=0 limit
     if [ "${1:-}" = --quant ]; then QUANT=${2:-}; fi
     check_machine
+    pick_quant
     locate_files
     line() { printf '%-22s %s\n' "$1" "$2"; }
     line "quant" "$QUANT"

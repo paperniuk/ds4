@@ -40,4 +40,6 @@ Installed in $DIR. Next:
   dstar pull      # 69 GB: the model, the MTP block, the vision encoder
   dstar serve     # server on http://127.0.0.1:8010/v1
   dstar opencode  # provider block for OpenCode
+
+DeepSeek V4 Flash and the other ds4 models: dstar models
 MSG

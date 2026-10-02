@@ -18068,6 +18068,11 @@ static void graph_power_sleep(double work_sec, uint32_t power_percent) {
     sleep_sec(sleep);
 }
 
+/* --power N on Qwen3.8: every forward pass is followed by a sleep that keeps
+ * the GPU busy N% of the time.  A decode token is one pass, and so is a
+ * prefill chunk: a smaller --prefill-chunk gives shorter pauses. */
+static uint32_t g_qwen4_power_percent = 100;
+
 static void graph_power_note_prefill_layer(ds4_gpu_graph *g,
                                            uint32_t il,
                                            double elapsed_sec) {
@@ -59228,6 +59233,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    const double power_t0 = g_qwen4_power_percent < 100u ? now_sec() : 0.0;
     static int timing = -1;
     if (timing < 0) {
         const char *tv = getenv("DS4_QWEN4_TIMING");
@@ -59388,6 +59394,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         g->snap2_valid = ok;
         g->snap_after_second = false;
     }
+    if (g_qwen4_power_percent < 100u) graph_power_sleep(now_sec() - power_t0, g_qwen4_power_percent);
     return ok;
 }
 
@@ -71218,15 +71225,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (!backend_ok || opt->tp.role != DS4_TP_NONE || opt->cuda_tensor_parallel ||
             (gpu_cfg && gpu_cfg->n_gpus > 1) ||
             opt->distributed.role != DS4_DISTRIBUTED_NONE || load_slice ||
-            e->ssd_streaming || opt->dspark || e->power_percent != 100 ||
+            e->ssd_streaming || opt->dspark ||
             (opt->mtp_path && opt->mtp_path[0])) {
             fprintf(stderr, "ds4: Qwen3.8 requires Metal or single-GPU CUDA (or --cpu --first-token-test); "
-                            "tensor parallelism, pipeline execution, SSD streaming, DSpark, "
-                            "external MTP models and power throttling are not supported\n");
+                            "tensor parallelism, pipeline execution, SSD streaming, DSpark "
+                            "and external MTP models are not supported\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
+#ifndef DS4_NO_GPU
+        g_qwen4_power_percent = (uint32_t)e->power_percent;
+#endif
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
@@ -73993,6 +74003,7 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (ds4_model_is_qwen4()) g_qwen4_power_percent = (uint32_t)power_percent;
 #endif
     return 0;
 }

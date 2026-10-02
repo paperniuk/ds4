@@ -168,7 +168,7 @@ unlocks the larger one. MTP and vision are on when their files are present.
 | Command | What it does |
 |---|---|
 | `./flash pull` | download what is missing into `~/models/flash-next`, resumable |
-| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--port N`, `--lan`, `--no-mtp`, `--no-vision` |
+| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
 | `./flash serve --dry-run` | print the `ds4-server` command and environment instead of running it |
 | `./flash chat` | talk to the model in the terminal |
 | `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
@@ -198,6 +198,12 @@ unchanged. See [docs/MODELS.md](docs/MODELS.md) for what fits where.
 `PORT` and `HOST` the address.
 See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
 use port 8010 and the context the server was started with.
+
+`--power N` keeps the GPU busy N percent of the time, for a cooler and
+quieter Mac: the engine sleeps after every decoded token and every prefill
+chunk. Speed drops a little more than in proportion, `--power 50` gives 16
+tokens per second where the full speed is 35, and the output does not
+change. In `flash chat` the `/power N` command changes it on the fly.
 
 After a `git pull`, run `make` and restart the server. There is nothing to
 switch on: the speedups listed above are the default path.
@@ -528,8 +534,8 @@ Changing the level in a conversation rebuilds its cached prefix.
 The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
 `--temp 0` selects greedy output.
 
-For DeepSeek V4, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. V4.1 and GLM currently require `--power 100`.
+For DeepSeek V4 and Qwen3.8, `--power N` trades throughput for lower sustained
+GPU load. The default is 100. V4.1 and GLM currently require `--power 100`.
 
 DeepSeek V4 Flash and GLM 5.3 Flash also support directional steering. Load a
 vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for

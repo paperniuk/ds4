@@ -45,13 +45,15 @@ usage: flash <command> [options]
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
+      --power N          keep the GPU busy N% of the time, 1..100: a cooler
+                         and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
                          from its file name (flash serve deepseek). The context
                          defaults to 32768, a model larger than the RAM streams
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [--quant iq3] [NAME or FILE] [-- ARGS]
+  chat [--quant iq3] [--power N] [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
   doctor [--quant iq3]   check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
@@ -159,6 +161,14 @@ parse_ctx() {
 # GPU memory plan with MTP and vision, in MiB: about 39.1 GiB (47.9 for the
 # iq3 quant) plus 33 KiB per context token, and 2 GiB of headroom under the
 # wired limit.
+parse_power() {
+    case $1 in
+        ''|*[!0-9]*) die "--power needs a number from 1 to 100" ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 100 ] || die "--power needs a number from 1 to 100"
+    echo "$1"
+}
+
 need_mib() { awk -v c="$1" -v b="$BASE_GIB" 'BEGIN { printf "%d", (b + c * 3.315e-5 + 2) * 1024 }'; }
 
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
@@ -235,7 +245,7 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0 model=""
+    local ctx="" mtp=1 vision=1 dry=0 model="" power=""
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
@@ -243,6 +253,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
+            --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
@@ -253,6 +264,7 @@ cmd_serve() {
         esac
         shift
     done
+    if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
     locate_files
@@ -319,18 +331,22 @@ cmd_serve() {
 }
 
 cmd_chat() {
-    local model=""
-    if [ "${1:-}" = --quant ]; then
-        [ $# -ge 2 ] || die "--quant needs q2 or iq3"
-        QUANT=$2
+    local model="" power=""
+    while :; do
+        case ${1:-} in
+            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2 ;;
+            --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1 ;;
+            *) break ;;
+        esac
         shift 2
-    fi
+    done
     case ${1:-} in
         --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift 2 ;;
         ""|-*) ;;
         *) model=$(model_path "$1") || exit 1; shift ;;
     esac
     if [ "${1:-}" = -- ]; then shift; fi
+    if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     if [ -n "$model" ]; then
         ensure_binaries

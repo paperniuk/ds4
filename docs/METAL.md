@@ -67,5 +67,5 @@ For more than two machines, use [pipeline parallelism](DISTRIBUTED.md#pipeline-p
 - [Batched serving](SERVER.md#multiple-sessions)
 - [Benchmarking](PERFORMANCE.md)
 
-For DeepSeek V4 Flash and PRO, `--power 70` trades throughput for lower
-sustained GPU load. V4.1 and GLM currently require `--power 100`.
+For DeepSeek V4 Flash and PRO and for Qwen3.8, `--power 70` trades throughput
+for lower sustained GPU load. V4.1 and GLM currently require `--power 100`.

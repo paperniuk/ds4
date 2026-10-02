@@ -1,11 +1,12 @@
 #!/bin/bash
-# flash: one command to run Qwen3.8-Flash-Next on an M1/M2 Mac with ds4.
+# flash: one command to run Qwen3.8-Flash-Next on an Apple Silicon Mac with ds4.
 #
 #   ./flash pull       download the model, the MTP block and the vision encoder
 #   ./flash serve      start the OpenAI/Anthropic compatible server
 #   ./flash chat       talk to the model in the terminal
 #   ./flash doctor     check the machine, the files and the memory limit
 #   ./flash opencode   print the OpenCode provider block for this server
+#   ./flash link       make "flash" a command that works from any directory
 #
 # The other models ds4 runs go through the same launcher: ./flash models
 # lists them, ./flash pull NAME downloads one, ./flash serve NAME runs it.
@@ -14,7 +15,14 @@
 # missing) and from the prebuilt package, where the binaries sit next to it.
 set -e
 
-HERE=$(cd "$(dirname "$0")" && pwd)
+# Follow symlinks, so the script can be linked into a directory on the PATH.
+SELF=$0
+while [ -L "$SELF" ]; do
+    LINK=$(readlink "$SELF")
+    case $LINK in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
+done
+HERE=$(cd "$(dirname "$SELF")" && pwd)
+BIN_DIR=${FLASH_BIN:-$HOME/.local/bin}
 MODELS=${FLASH_MODELS:-$HOME/models/flash-next}
 PORT=${PORT:-8010}
 HOST=${HOST:-127.0.0.1}
@@ -60,6 +68,8 @@ usage: flash <command> [options]
                          interactive chat in the terminal
   doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
+  link                   link this script into $BIN_DIR, so that "flash"
+                         works from any directory (FLASH_BIN changes the place)
 
 Environment: FLASH_MODELS (model directory), FLASH_QUANT (q2, iq3 or iq3s), PORT, HOST.
 EOF
@@ -436,6 +446,20 @@ cmd_doctor() {
     return $bad
 }
 
+cmd_link() {
+    mkdir -p "$BIN_DIR"
+    if [ -e "$BIN_DIR/flash" ] && [ ! -L "$BIN_DIR/flash" ]; then
+        die "$BIN_DIR/flash exists and is not a link; remove it first"
+    fi
+    ln -sf "$HERE/flash" "$BIN_DIR/flash"
+    echo "flash -> $HERE/flash"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) echo "$BIN_DIR is not on your PATH. Add this line to ~/.zshrc and open a new terminal:"
+           echo "    export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac
+}
+
 cmd_opencode() {
     cat <<EOF
 Merge this into ~/.config/opencode/opencode.json under "provider":
@@ -483,6 +507,7 @@ case ${1:-help} in
     models) other_models ;;
     doctor) shift; cmd_doctor "$@" ;;
     opencode) shift; cmd_opencode ;;
+    link) cmd_link ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 1 ;;
 esac

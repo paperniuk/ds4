@@ -21,6 +21,11 @@ M1 Max, 32-core GPU, 64 GB. Greedy decoding, `--prefill-chunk 2048`.
 
 MTP gains depend on the text: about +30% on code, about +10% on prose.
 
+The same release has a larger IQ3_XXS file, which ISTA measures as clearly
+better (LiveCodeBench 86.3 against 81.1 for Q2_0). It runs here too, at about
+three quarters of the speed: 29 tok/s plain and 35 tok/s with MTP at 4K. See
+[The IQ3_XXS quant](#the-iq3_xxs-quant).
+
 ## Beyond 262K
 
 The model was trained on a 262,144 token window, but the same build runs
@@ -189,12 +194,34 @@ DeepSeek V4 Flash Q2 runs at about 10 tokens per second on a 64 GB M1 Max
 that way. Everything after `--` goes to `ds4-server`
 unchanged. See [docs/MODELS.md](docs/MODELS.md) for what fits where.
 
-`FLASH_MODELS` changes the model directory, `PORT` and `HOST` the address.
+`FLASH_MODELS` changes the model directory, `FLASH_QUANT` the default quant,
+`PORT` and `HOST` the address.
 See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
 use port 8010 and the context the server was started with.
 
 After a `git pull`, run `make` and restart the server. There is nothing to
 switch on: the speedups listed above are the default path.
+
+### The IQ3_XXS quant
+
+```sh
+./flash pull --quant iq3     # 47 GB more; the n-gram shard is shared with Q2_0
+./flash serve --quant iq3
+```
+
+ISTA's IQ3_XXS file keeps the experts in IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S
+and many dense projections in IQ3_S, codebook quants that stock ds4 does not
+load. This fork dequantizes them on the CPU bit for bit as llama.cpp does and
+has Metal kernels for them, checked against that reference by
+`make test-quant-types` and `make test-qwen4-kernels`.
+
+Its weights take 43.8 GiB against 35 for Q2_0. On a 64 GB Mac `flash serve`
+therefore starts it with a 131K context, which plans 52 GiB of GPU memory.
+`--ctx 262k` works and plans 56.6 GiB, but leaves the rest of the system
+about 5 GB, so close the browser first. Longer contexts do not fit.
+
+`./flash doctor --quant iq3` and `./flash chat --quant iq3` take the same
+option, and `FLASH_QUANT=iq3` makes it the default.
 
 ### By hand
 

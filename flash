@@ -20,8 +20,7 @@ PORT=${PORT:-8010}
 HOST=${HOST:-127.0.0.1}
 
 MODEL_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
-SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
-SHARD2=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+QUANT=${FLASH_QUANT:-q2}
 MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
 MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
 VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
@@ -31,12 +30,17 @@ usage() {
     cat <<EOF
 usage: flash <command> [options]
 
-  pull [--no-vision]     download what is missing into $MODELS
-                         (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder)
+  pull [--no-vision] [--quant iq3]
+                         download what is missing into $MODELS
+                         (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder;
+                         the iq3 quant is 47 GB more)
   pull NAME              download another model into ./gguf (see: flash models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
+      --quant q2|iq3     q2 (default) is the fast 2-bit file; iq3 is ISTA's
+                         IQ3_XXS: better answers, a quarter slower, 9 GB more
+                         memory, so 262k is its ceiling on 64 GB
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
@@ -47,12 +51,12 @@ usage: flash <command> [options]
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [NAME or FILE] [-- ARGS]
+  chat [--quant iq3] [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
-  doctor                 check the machine, the files and the memory limit
+  doctor [--quant iq3]   check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
 
-Environment: FLASH_MODELS (model directory), PORT, HOST.
+Environment: FLASH_MODELS (model directory), FLASH_QUANT (q2 or iq3), PORT, HOST.
 EOF
 }
 
@@ -66,9 +70,20 @@ first_of() {
     echo "$1"
 }
 
+# The two quants of the ISTA release. Their second shard, the n-gram table,
+# is the same file, so one copy serves both.
 locate_files() {
-    F_SHARD1=$MODELS/Q2_0/$SHARD1
-    F_SHARD2=$MODELS/Q2_0/$SHARD2
+    local tag other
+    case $QUANT in
+        q2) tag=Q2_0; other=IQ3_XXS; BASE_GIB=39.1; SHARD1_GB=38 ;;
+        iq3) tag=IQ3_XXS; other=Q2_0; BASE_GIB=47.9; SHARD1_GB=47 ;;
+        *) die "unknown quant $QUANT (q2 or iq3)" ;;
+    esac
+    QDIR=$MODELS/$tag
+    SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-$tag-00001-of-00002.gguf
+    SHARD2=Qwen3.8-Flash-Next-GSQ-RCO-$tag-00002-of-00002.gguf
+    F_SHARD1=$QDIR/$SHARD1
+    F_SHARD2=$(first_of "$QDIR/$SHARD2" "$MODELS/$other/Qwen3.8-Flash-Next-GSQ-RCO-$other-00002-of-00002.gguf")
     F_MTP=$(first_of "$MODELS/$MTP_FILE" "$MODELS/mtp/$MTP_FILE")
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
 }
@@ -111,19 +126,20 @@ cmd_pull() {
     while [ $# -gt 0 ]; do
         case $1 in
             --no-vision) vision=0 ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2; shift ;;
             *) die "pull: unknown option $1" ;;
         esac
         shift
     done
     locate_files
     mkdir -p "$MODELS"
-    if [ ! -f "$F_SHARD1" ] || [ ! -f "$F_SHARD2" ]; then
-        local free_gb
-        free_gb=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
-        [ "$free_gb" -ge 72 ] || die "the model needs about 70 GB, $MODELS has $free_gb GB free"
-    fi
-    fetch "$MODEL_REPO" "Q2_0/$SHARD1" "$F_SHARD1"
-    fetch "$MODEL_REPO" "Q2_0/$SHARD2" "$F_SHARD2"
+    local need_gb=0 free_gb
+    [ -f "$F_SHARD1" ] || need_gb=$(( SHARD1_GB + 2 ))
+    [ -f "$F_SHARD2" ] || need_gb=$(( need_gb + 29 ))
+    free_gb=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
+    [ "$free_gb" -ge "$need_gb" ] || die "the download needs about $need_gb GB, $MODELS has $free_gb GB free"
+    fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD1" "$F_SHARD1"
+    fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD2" "$F_SHARD2"
     fetch "$MTP_REPO" "$MTP_FILE" "$F_MTP"
     if [ "$vision" = 1 ]; then fetch "$VISION_REPO" "$VISION_FILE" "$F_VISION"; fi
     echo "Done. Start the server with: $0 serve"
@@ -140,9 +156,10 @@ parse_ctx() {
     esac
 }
 
-# GPU memory plan with MTP and vision, in MiB: about 39.1 GiB plus 33 KiB per
-# context token, and 2 GiB of headroom under the wired limit.
-need_mib() { awk -v c="$1" 'BEGIN { printf "%d", (39.1 + c * 3.315e-5 + 2) * 1024 }'; }
+# GPU memory plan with MTP and vision, in MiB: about 39.1 GiB (47.9 for the
+# iq3 quant) plus 33 KiB per context token, and 2 GiB of headroom under the
+# wired limit.
+need_mib() { awk -v c="$1" -v b="$BASE_GIB" 'BEGIN { printf "%d", (b + c * 3.315e-5 + 2) * 1024 }'; }
 
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
 
@@ -226,6 +243,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
@@ -238,7 +256,7 @@ cmd_serve() {
     check_machine
     if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
     locate_files
-    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
+    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
     [ "$dry" = 1 ] || ensure_binaries
     [ "$RAM_GB" -ge 60 ] || echo "flash: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
 
@@ -246,7 +264,12 @@ cmd_serve() {
     # and fall back to 131K otherwise, saying how to get the larger one.
     if [ -z "$ctx" ]; then
         ctx=262144
-        if ! ctx_fits "$ctx"; then
+        if [ $(( $(need_mib "$ctx") + 8192 )) -gt $(( RAM_GB * 1024 )) ]; then
+            # the iq3 quant on 64 GB: 262K fits, but leaves the system 5 GB and it swaps
+            ctx=131072
+            echo "flash: using a 131K context, 262K would leave the rest of the system too little memory." >&2
+            echo "    --ctx 262k forces it." >&2
+        elif ! ctx_fits "$ctx"; then
             ctx=131072
             echo "flash: using a 131K context. For the full 262K run this once per boot, then restart:" >&2
             echo "    $(sysctl_hint 262144)" >&2
@@ -290,13 +313,18 @@ cmd_serve() {
         echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
         return
     fi
-    echo "flash: context $ctx, http://$HOST:$PORT/v1" >&2
+    echo "flash: $QUANT, context $ctx, http://$HOST:$PORT/v1" >&2
     cd "$HERE"   # the Metal shaders load from ./metal
     exec caffeinate -i ./ds4-server -m "$F_SHARD1" "$@"
 }
 
 cmd_chat() {
     local model=""
+    if [ "${1:-}" = --quant ]; then
+        [ $# -ge 2 ] || die "--quant needs q2 or iq3"
+        QUANT=$2
+        shift 2
+    fi
     case ${1:-} in
         --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift 2 ;;
         ""|-*) ;;
@@ -317,7 +345,7 @@ cmd_chat() {
         exec ./ds4 -m "$model" "$@"
     fi
     locate_files
-    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
+    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
     ensure_binaries
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     if [ -f "$F_MTP" ]; then
@@ -330,9 +358,11 @@ cmd_chat() {
 
 cmd_doctor() {
     local bad=0 limit
+    if [ "${1:-}" = --quant ]; then QUANT=${2:-}; fi
     check_machine
     locate_files
     line() { printf '%-22s %s\n' "$1" "$2"; }
+    line "quant" "$QUANT"
     line "machine" "$(sysctl -n machdep.cpu.brand_string), $RAM_GB GB"
     [ "$RAM_GB" -ge 60 ] || { line "" "less than 64 GB: the model may not fit"; bad=1; }
     for b in ds4 ds4-server; do
@@ -404,7 +434,7 @@ case ${1:-help} in
     serve) shift; cmd_serve "$@" ;;
     chat) shift; cmd_chat "$@" ;;
     models) other_models ;;
-    doctor) shift; cmd_doctor ;;
+    doctor) shift; cmd_doctor "$@" ;;
     opencode) shift; cmd_opencode ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 1 ;;

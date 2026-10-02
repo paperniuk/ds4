@@ -44327,6 +44327,16 @@ void ds4_chat_role_markers(ds4_engine *e, int *prefix, int *user, int *assistant
     *assistant = chat_role_name_token(vocab, "assistant");
 }
 
+/* isfinite() is an out-of-line libm call when the build assumes finite math,
+ * and the samplers ask it for every logit.  The bit test is the same
+ * predicate and inlines into the vocabulary scans.  It reads the stored
+ * bits, never a float value, so finite math cannot fold it away. */
+static inline bool f32_is_finite(const float *v) {
+    uint32_t u;
+    memcpy(&u, v, sizeof(u));
+    return (u & 0x7f800000u) != 0x7f800000u;
+}
+
 static inline void argmax_f32_unrolled8_range(
         const float *logits,
         uint32_t     begin,
@@ -44724,7 +44734,7 @@ static bool sample_fast_top_p(
 
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!f32_is_finite(&logits[i])) continue;
         const float p = expf((v - max_logit) / temperature);
         sum += p;
         sample_candidate cand = {.id = (int)i, .logit = v, .prob = p};
@@ -44799,16 +44809,21 @@ static int sample_full_vocab(
     float max_logit = DS4_NEG_INF;
     int best = 0;
     uint32_t finite = 0;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        finite++;
-        if (v > max_logit) {
-            max_logit = v;
-            best = (int)i;
+    for (uint32_t i = 0; i < n_vocab; i++) finite += f32_is_finite(&logits[i]);
+    if (finite == 0) return sample_argmax(logits, n_vocab);
+    if (finite == n_vocab) {
+        best = sample_argmax_unrolled8(logits, n_vocab);
+        max_logit = logits[best];
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!f32_is_finite(&logits[i])) continue;
+            if (v > max_logit) {
+                max_logit = v;
+                best = (int)i;
+            }
         }
     }
-    if (finite == 0) return sample_argmax(logits, n_vocab);
 
     int fast_token = best;
     if (top_p < 1.0f &&
@@ -44849,10 +44864,51 @@ static int sample_full_vocab(
             }
         }
 
+        /* Min-p keeps a handful of tokens.  With every logit finite, skip
+         * the blocks whose maximum is clearly below the rejection boundary
+         * and keep the survivors in a short list: the same probabilities are
+         * summed and walked in the same order as the full scan below, which
+         * remains the path for masked logits or a crowded nucleus. */
+        enum { SAMPLE_MIN_P_CAP = 1024, SAMPLE_MIN_P_BLOCK = 32 };
+        if (have_reject_scaled && finite == n_vocab) {
+            const float edge = max_logit + reject_scaled * temperature;
+            const float skip_below = edge - 1e-3f * (1.0f + fabsf(edge) + fabsf(max_logit));
+            int ids[SAMPLE_MIN_P_CAP];
+            float kept[SAMPLE_MIN_P_CAP];
+            uint32_t n = 0;
+            bool crowded = !isfinite(skip_below);
+            for (uint32_t b0 = 0; b0 < n_vocab && !crowded; b0 += SAMPLE_MIN_P_BLOCK) {
+                const uint32_t b1 = n_vocab - b0 < SAMPLE_MIN_P_BLOCK ? n_vocab : b0 + SAMPLE_MIN_P_BLOCK;
+                float block_max = logits[b0];
+                for (uint32_t i = b0 + 1u; i < b1; i++) block_max = logits[i] > block_max ? logits[i] : block_max;
+                if (block_max < skip_below) continue;
+                for (uint32_t i = b0; i < b1; i++) {
+                    const float scaled = (logits[i] - max_logit) / temperature;
+                    if (scaled <= reject_scaled) continue;
+                    const float p = expf(scaled);
+                    if (p < min_rel) continue;
+                    if (n == SAMPLE_MIN_P_CAP) { crowded = true; break; }
+                    ids[n] = (int)i;
+                    kept[n++] = p;
+                    sum += p;
+                }
+            }
+            if (!crowded) {
+                if (sum <= 0.0f || !isfinite(sum)) return best;
+                float r = sample_rng_f32(rng) * sum;
+                for (uint32_t k = 0; k < n; k++) {
+                    r -= kept[k];
+                    if (r <= 0.0f) return ids[k];
+                }
+                return best;
+            }
+            sum = 0.0f;
+        }
+
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!f32_is_finite(&logits[i])) continue;
             const float scaled = (v - max_logit) / temperature;
             if (have_reject_scaled && scaled <= reject_scaled) continue;
             const float p = expf(scaled);
@@ -44883,7 +44939,7 @@ static int sample_full_vocab(
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
             prob_scratch[i] = -1.0f;
-            if (!isfinite(v)) continue;
+            if (!f32_is_finite(&logits[i])) continue;
             const float p = expf((v - max_logit) / temperature);
             prob_scratch[i] = p;
             sum += p;
@@ -44910,7 +44966,7 @@ static int sample_full_vocab(
         cand = xmalloc((size_t)finite * sizeof(cand[0]));
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!f32_is_finite(&logits[i])) continue;
             const float p = expf((v - max_logit) / temperature);
             cand[n++] = (sample_candidate){.id = (int)i, .logit = v, .prob = p};
             sum += p;
@@ -44981,7 +45037,7 @@ static int sample_top_p_min_p(
     int n = 0;
     for (uint32_t i = 0; i < n_vocab; i++) {
         float v = logits[i];
-        if (!isfinite(v)) continue;
+        if (!f32_is_finite(&logits[i])) continue;
         if (n == top_k && v <= vals[n - 1]) continue;
         int j = n < top_k ? n++ : n - 1;
         while (j > 0 && vals[j - 1] < v) {

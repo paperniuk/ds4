@@ -59088,9 +59088,9 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     return ok;
 }
 
-/* host side: embedding rows tiled into R and the PLE n-gram gather */
-static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
-                                     const int *tokens, uint32_t T) {
+/* host side: embedding rows tiled into R */
+static bool qwen4_graph_stage_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                                   const int *tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
     float *row = g->host_row;
     const ds4_vision_span *spans = g->vis_spans;
@@ -59107,9 +59107,15 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         if (t == 0 && g->snap_after_first) g->snap_mrope_delta = g->mrope_delta;
         if (t == 1u && g->snap_after_second) g->snap2_mrope_delta = g->mrope_delta;
     }
-    if (!ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) ||
-        !ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u))
-        return false;
+    return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)T * hc_dim * sizeof(float)) &&
+           ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
+}
+
+/* host side: the PLE n-gram gather.  The rows come from disk and only the
+ * PLE layer reads them. */
+static bool qwen4_graph_stage_ngrams(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens, uint32_t T) {
+    const uint32_t E = DS4_N_EMBD;
+    float *row = g->host_row;
     uint32_t ids[256 * DS4_MAX_PLE_HEADS];
     for (uint32_t t = 0; t < T; t++) {
         qwen4_ple_step(tokens[t], g->ple_prev, ids + (t % 256u) * DS4_N_PLE_HEADS);
@@ -59167,8 +59173,16 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
             flush_layer = (uint32_t)layer;
         }
     }
+    /* The n-gram read waits on the disk.  Start the GPU on the layers before
+     * the PLE layer first and read while they run; DS4_QWEN4_NGRAM_FIRST=1
+     * restores the read before any GPU work. */
+    static int ngram_first = -1;
+    if (ngram_first < 0) ngram_first = getenv("DS4_QWEN4_NGRAM_FIRST") != NULL;
+    const bool ngram_late = !ngram_first && timing != 2 && DS4_N_PLE_LAYER > 0 && DS4_N_PLE_LAYER < n_trunk;
     const double t0 = timing ? now_sec() : 0.0;
-    if (!qwen4_graph_stage_inputs(g, m, w, tokens, T)) return false;
+    double t_ngram = 0.0;
+    if (!qwen4_graph_stage_rows(g, m, w, tokens, T)) return false;
+    if (!ngram_late && !qwen4_graph_stage_ngrams(g, m, tokens, T)) return false;
     const double t1 = timing ? now_sec() : 0.0;
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
@@ -59188,6 +59202,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     } while (0)
     for (uint32_t il = 0; il < n_trunk && ok; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        if (ngram_late && il == DS4_N_PLE_LAYER) {
+            const double tn = timing ? now_sec() : 0.0;
+            ok = ds4_gpu_flush_commands() != 0 && qwen4_graph_stage_ngrams(g, m, tokens, T);
+            if (timing) t_ngram = now_sec() - tn;
+            if (!ok) break;
+        }
         if (ds4_qwen4_layer_is_ple(il)) {
             ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
                  qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
@@ -59277,12 +59297,14 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, rows * DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (timing) {
-        static double acc[4];
+        static double acc[5];
         static int n_calls;
-        acc[0] += t1 - t0; acc[1] += t2 - t1; acc[2] += t3 - t2; acc[3] += now_sec() - t3;
+        acc[0] += t1 - t0; acc[1] += t2 - t1 - t_ngram; acc[2] += t3 - t2; acc[3] += now_sec() - t3;
+        acc[4] += t_ngram;
         if (++n_calls % 50 == 0) {
-            fprintf(stderr, "ds4: Qwen3.8 forward(T=%u) avg ms: stage %.3f encode %.3f gpu %.3f read %.3f\n", T,
-                    1e3 * acc[0] / 50, 1e3 * acc[1] / 50, 1e3 * acc[2] / 50, 1e3 * acc[3] / 50);
+            fprintf(stderr, "ds4: Qwen3.8 forward(T=%u) avg ms: stage %.3f encode %.3f gpu %.3f read %.3f"
+                    " late n-gram %.3f\n", T, 1e3 * acc[0] / 50, 1e3 * acc[1] / 50, 1e3 * acc[2] / 50,
+                    1e3 * acc[3] / 50, 1e3 * acc[4] / 50);
             memset(acc, 0, sizeof(acc));
         }
     }
@@ -79257,7 +79279,7 @@ static bool qwen4_batch_rows_build_ragged(qwen4_batch_row *rows, const qwen4_bat
 
 /* Embeddings, rope positions and n-gram ids for every row; a session with a
  * draft row records the verify snapshot's host state after its first token,
- * as qwen4_graph_stage_inputs does. */
+ * as qwen4_graph_stage_ngrams does. */
 static bool qwen4_batch_stage_embeddings_ragged(const qwen4_batch_member *mem, int count, uint32_t N,
                                                 const ds4_model *m, const ds4_weights *w,
                                                 ds4_qwen4_gpu_graph *g, uint32_t *ids) {

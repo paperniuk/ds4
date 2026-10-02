@@ -2555,23 +2555,18 @@ void dequantize_q6_K(device const block_q6_K *xb, short il, thread type4x4 &reg)
     const uint sc_base = (uint)n128 * 8u + (uint)quarter * 2u + (uint)(il128 & 1);
     const float d = (float)xb->d * (float)((int)xb->scales[sc_base]);
 
-    for (int i = 0; i < 16; ++i) {
-        const uint l = (uint)l0 + (uint)i;
-        uint v;
-        if (quarter == 0) {
-            v = ((uint)xb->ql[ql_base + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 0u) & 3u) << 4u);
-        } else if (quarter == 1) {
-            v = ((uint)xb->ql[ql_base + 32u + l] & 0x0Fu) |
-                ((((uint)xb->qh[qh_base + l] >> 2u) & 3u) << 4u);
-        } else if (quarter == 2) {
-            v = ((uint)xb->ql[ql_base + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 4u) & 3u) << 4u);
-        } else {
-            v = ((uint)xb->ql[ql_base + 32u + l] >> 4u) |
-                ((((uint)xb->qh[qh_base + l] >> 6u) & 3u) << 4u);
-        }
-        reg[i / 4][i % 4] = d * (float)((int)v - 32);
+    /* The quarter picks the ql half and nibble and the qh bit pair; read
+     * four weights at a time so the 64x32 prompt tile is not branch-bound. */
+    device const uchar *ql = xb->ql + ql_base + (uint)(quarter & 1) * 32u + (uint)l0;
+    device const uchar *qh = xb->qh + qh_base + (uint)l0;
+    const uint lshift = (uint)(quarter >> 1) * 4u;
+    const uint hshift = (uint)quarter * 2u;
+    for (int j = 0; j < 4; ++j) {
+        const uint4 lo = uint4(*(device const packed_uchar4 *)(ql + 4 * j));
+        const uint4 hi = uint4(*(device const packed_uchar4 *)(qh + 4 * j));
+        const uint4 v = ((lo >> lshift) & 0x0Fu) | (((hi >> hshift) & 3u) << 4u);
+        const float4 f = d * float4(int4(v) - 32);
+        reg[j][0] = f.x; reg[j][1] = f.y; reg[j][2] = f.z; reg[j][3] = f.w;
     }
 }
 

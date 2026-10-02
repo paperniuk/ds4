@@ -1,8 +1,10 @@
-# ds4 for M1/M2 Macs: Qwen3.8-Flash-Next at 262K context
+# ds4 for Apple Silicon, tuned on M1: Qwen3.8-Flash-Next at 262K context
 
-A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) tuned for
-Apple7/Apple8 GPUs, that is M1 and M2 Macs, which do not get the Metal 4
-tensor API that stock ds4 uses on M5.
+A fork of [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) tuned
+primarily for Apple7/Apple8 GPUs, that is M1 and M2 Macs, which do not get
+the Metal 4 tensor API that stock ds4 uses on M5. Most of the work is not
+tied to those chips: it runs on every Apple Silicon Mac, see
+[Which Macs gain](#which-macs-gain).
 
 It runs **Qwen3.8-Flash-Next** (the ISTA-DASLab GSQ-RCO Q2_0 GGUF) on a
 **64 GB M1 Max** with the **full 262K context**, MTP speculative decoding and
@@ -23,8 +25,9 @@ MTP gains depend on the text: about +30% on code, about +10% on prose.
 
 The same release has a larger IQ3_XXS file, which ISTA measures as clearly
 better (LiveCodeBench 86.3 against 81.1 for Q2_0). It runs here too, at about
-three quarters of the speed: 29 tok/s plain and 35 tok/s with MTP at 4K. See
-[The IQ3_XXS quant](#the-iq3_xxs-quant).
+three quarters of the speed: 29 tok/s plain and 35 tok/s with MTP at 4K. The
+largest one, IQ3_S, is meant for Macs with 96 GB or more. See
+[The larger quants](#the-larger-quants).
 
 ## Beyond 262K
 
@@ -132,9 +135,60 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
 
 Each change is a separate commit with a test.
 
+## Which Macs gain
+
+The fork was written and measured on one M1 Max. The code falls into three
+groups, and only the last one looks at the chip.
+
+**Any Apple Silicon Mac, nothing to switch on.** These are not chosen by
+chip name, so an M3, M4 or M5 runs them too:
+
+- Loading the ISTA-DASLab GGUFs at all: the Q2_0, IQ3_XXS and IQ3_S files, the
+  n-gram table from the second shard, the MTP block from another file.
+  Stock ds4 does not open these files.
+- The decode kernels for the mixed precision weights, and the long context
+  work in the indexer and the attention. The vector block scorer was M5
+  only upstream and is now the path on every chip.
+- Everything on the host side: the prompt anchor, the cold cache anchor,
+  the n-gram read behind the first layer, the sampler, images in agent
+  sessions, contexts beyond 262K with YaRN, `--power` for Qwen3.8.
+- The Q6_K decoder and the read ahead in the expert prompt tile.
+- For DeepSeek V4 with `--ssd-streaming`: the early commit of the routed
+  experts and the single simdgroup rows of the narrow Q8_0 projection.
+
+**On by default on M1 only, one variable elsewhere.** These were kept behind
+a chip name because a tile that wins on one GPU can lose on another, and
+nothing but the M1 Max was measured:
+
+| Change | Default | To try it on another chip |
+|---|---|---|
+| Remainder tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_TAILS=1` (`flash serve` sets it on every Mac) |
+| Register tiles for Q2_0 experts in prefill | M1 | `DS4_QWEN4_MOE_REG=1` |
+| Packed group rows in the DeepSeek V4 attention output | M1 | `DS4_METAL_ATTN_OUT_DENSE=1` |
+
+An M2 reports itself as M2, so it starts with the last two off. It has the
+same GPU family as the M1 and they are expected to help there; set the
+variables and compare.
+
+**Where the gain is smaller or unknown.** The numbers on this page are M1 Max
+numbers. On M5 stock ds4 already uses Metal 4 tensor kernels for part of the
+work, and upstream has its own tuning for M3, so the distance to stock ds4
+there is not known. On a Mac with more memory the context table does not
+apply as written: 262K needs no wired limit change on 96 GB or more.
+
+If you run it on anything else, the two commands below are enough for a
+useful report: the first prints the machine and what fits, the second a
+prefill and decode speed.
+
+```sh
+./flash doctor
+./flash chat -- -p "Write a C function that reverses a linked list." -n 300 --temp 0
+```
+
 ## Requirements
 
-- An M1/M2 Mac (Max or Ultra) with 64 GB of RAM. Only the M1 Max has been
+- An Apple Silicon Mac with 64 GB of RAM or more. The fork targets M1 and M2
+  (Max or Ultra); M3 and later run the same code. Only the M1 Max has been
   measured so far; reports from other chips are welcome.
 - About 67 GB of disk for the model (both shards) and 1.5 GB for the MTP
   block. A fast internal SSD, since the n-gram
@@ -171,14 +225,14 @@ Then, in either directory:
 ./flash opencode   # provider block for OpenCode
 ```
 
-`flash serve` picks the context for you: the full 262K when the GPU memory
-limit allows it, 131K otherwise, and it prints the `sudo sysctl` line that
-unlocks the larger one. MTP and vision are on when their files are present.
+`flash serve` picks the context for you: the full 262K when the memory of
+the machine and the GPU memory limit allow it, a smaller one otherwise, and
+it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are on when their files are present.
 
 | Command | What it does |
 |---|---|
 | `./flash pull` | download what is missing into `~/models/flash-next`, resumable |
-| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
+| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
 | `./flash serve --dry-run` | print the `ds4-server` command and environment instead of running it |
 | `./flash chat` | talk to the model in the terminal |
 | `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
@@ -218,26 +272,54 @@ change. In `flash chat` the `/power N` command changes it on the fly.
 After a `git pull`, run `make` and restart the server. There is nothing to
 switch on: the speedups listed above are the default path.
 
-### The IQ3_XXS quant
+### The larger quants
 
 ```sh
-./flash pull --quant iq3     # 47 GB more; the n-gram shard is shared with Q2_0
+./flash pull --quant iq3     # IQ3_XXS, 47 GB more
 ./flash serve --quant iq3
+
+./flash pull --quant iq3s    # IQ3_S, 55 GB more
+./flash serve --quant iq3s
 ```
 
-ISTA's IQ3_XXS file keeps the experts in IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S
-and many dense projections in IQ3_S, codebook quants that stock ds4 does not
-load. This fork dequantizes them on the CPU bit for bit as llama.cpp does and
-has Metal kernels for them, checked against that reference by
-`make test-quant-types` and `make test-qwen4-kernels`.
+The n-gram shard, the MTP block and the vision encoder are the same files
+for every quant, so a second quant downloads only its own weights.
 
-Its weights take 43.8 GiB against 35 for Q2_0. On a 64 GB Mac `flash serve`
-therefore starts it with a 131K context, which plans 52 GiB of GPU memory.
-`--ctx 262k` works and plans 56.6 GiB, but leaves the rest of the system
-about 5 GB, so close the browser first. Longer contexts do not fit.
+| `--quant` | ISTA file | Weights | ISTA task average | LiveCodeBench | Plain | With MTP | Default context on 64 GB |
+|---|---|---|---|---|---|---|---|
+| `q2` | Q2_0 | 35.0 GiB | 89.07 | 81.14 | 35 tok/s | 39 to 47 | 262K |
+| `iq3` | IQ3_XXS | 43.8 GiB | 92.57 | 86.29 | 29 tok/s | 35 | 131K |
+| `iq3s` | IQ3_S | 51.0 GiB | 93.26 | 86.86 | 26 tok/s | 32 to 34 | 32K |
 
-`./flash doctor --quant iq3` and `./flash chat --quant iq3` take the same
-option, and `FLASH_QUANT=iq3` makes it the default.
+The scores are ISTA's own, from their model card. The speeds are M1 Max
+numbers at a short context, on one code prompt for IQ3_S.
+
+These files keep the experts in IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS and
+many dense projections in IQ3_S, quants that stock ds4 does not load. This
+fork dequantizes them on the CPU bit for bit as llama.cpp does and has Metal
+kernels for them, checked against that reference by `make test-quant-types`
+and `make test-qwen4-kernels`.
+
+**IQ3_XXS on 64 GB.** `flash serve` starts it with a 131K context, which
+plans 52 GiB of GPU memory. `--ctx 262k` works and plans 56.6 GiB, but leaves
+the rest of the system about 5 GB, so close the browser first. Longer
+contexts do not fit.
+
+**IQ3_S is for 96 GB and more.** With MTP and vision it plans about 56 GiB
+at 32K and 60 GiB at 131K. On a 64 GB Mac it therefore runs with a 32K
+context and little room for anything else; it was loaded and measured that
+way here. On 96 GB or more `flash serve` picks the full 262K window, and the
+default GPU memory limit is already high enough. That choice comes from the
+memory plan, it has not been run on such a machine.
+
+`./flash doctor` lists the largest context every quant can hold on the
+machine. `./flash doctor --quant NAME` and `./flash chat --quant NAME` take
+the same option, and `FLASH_QUANT=iq3` makes one the default.
+
+Above that, upstream's Q4 file (`./flash pull qwen38-q4k`, 165 GiB on disk,
+70 GiB of weights in memory) runs through the launcher as one of the other
+models: no automatic context, and the kernels of this fork for the ISTA
+quants do not take part.
 
 ### By hand
 

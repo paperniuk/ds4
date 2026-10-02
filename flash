@@ -1,0 +1,317 @@
+#!/bin/bash
+# flash: one command to run Qwen3.8-Flash-Next on an M1/M2 Mac with ds4.
+#
+#   ./flash pull       download the model, the MTP block and the vision encoder
+#   ./flash serve      start the OpenAI/Anthropic compatible server
+#   ./flash chat       talk to the model in the terminal
+#   ./flash doctor     check the machine, the files and the memory limit
+#   ./flash opencode   print the OpenCode provider block for this server
+#
+# It works from a source checkout (it runs make when the binaries are
+# missing) and from the prebuilt package, where the binaries sit next to it.
+set -e
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+MODELS=${FLASH_MODELS:-$HOME/models/flash-next}
+PORT=${PORT:-8010}
+HOST=${HOST:-127.0.0.1}
+
+MODEL_REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
+SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+SHARD2=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
+MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
+VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
+VISION_FILE=mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+
+usage() {
+    cat <<EOF
+usage: flash <command> [options]
+
+  pull [--no-vision]     download what is missing into $MODELS
+                         (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder)
+  serve [options]        start the server on http://$HOST:$PORT/v1
+      --ctx N            context: 131k, 262k (default), 400k, 524k or a number
+      --port N           port (default $PORT)
+      --lan              listen on every interface (there is no authentication)
+      --no-mtp           plain decoding without the speculative MTP block
+      --no-vision        do not load the vision encoder
+      --dry-run          print the server command instead of running it
+      -- ARGS            pass the remaining arguments to ds4-server
+  chat [-- ARGS]         interactive chat in the terminal
+  doctor                 check the machine, the files and the memory limit
+  opencode               print the OpenCode provider block
+
+Environment: FLASH_MODELS (model directory), PORT, HOST.
+EOF
+}
+
+die() { echo "flash: $*" >&2; exit 1; }
+
+# First existing path of the candidates, or the first candidate.
+first_of() {
+    for p in "$@"; do
+        if [ -f "$p" ]; then echo "$p"; return; fi
+    done
+    echo "$1"
+}
+
+locate_files() {
+    F_SHARD1=$MODELS/Q2_0/$SHARD1
+    F_SHARD2=$MODELS/Q2_0/$SHARD2
+    F_MTP=$(first_of "$MODELS/$MTP_FILE" "$MODELS/mtp/$MTP_FILE")
+    F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
+}
+
+ensure_binaries() {
+    if [ -x "$HERE/ds4-server" ] && [ -x "$HERE/ds4" ]; then return; fi
+    [ -f "$HERE/Makefile" ] || die "ds4-server is missing next to this script"
+    echo "flash: building ds4 (first run only)" >&2
+    make -C "$HERE" ds4 ds4-server >&2
+}
+
+# Resumable download of one Hugging Face file. A .part file marks an
+# unfinished download, so an interrupted pull continues where it stopped.
+fetch() {
+    local repo=$1 path=$2 out=$3
+    if [ -f "$out" ]; then echo "have  $out"; return; fi
+    mkdir -p "$(dirname "$out")"
+    echo "fetch $repo/$path"
+    if [ -n "$HF_TOKEN" ]; then
+        curl -fL --progress-bar -C - -H "Authorization: Bearer $HF_TOKEN" -o "$out.part" \
+            "https://huggingface.co/$repo/resolve/main/$path"
+    else
+        curl -fL --progress-bar -C - -o "$out.part" "https://huggingface.co/$repo/resolve/main/$path"
+    fi
+    mv "$out.part" "$out"
+}
+
+cmd_pull() {
+    local vision=1
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --no-vision) vision=0 ;;
+            *) die "pull: unknown option $1" ;;
+        esac
+        shift
+    done
+    locate_files
+    mkdir -p "$MODELS"
+    if [ ! -f "$F_SHARD1" ] || [ ! -f "$F_SHARD2" ]; then
+        local free_gb
+        free_gb=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
+        [ "$free_gb" -ge 72 ] || die "the model needs about 70 GB, $MODELS has $free_gb GB free"
+    fi
+    fetch "$MODEL_REPO" "Q2_0/$SHARD1" "$F_SHARD1"
+    fetch "$MODEL_REPO" "Q2_0/$SHARD2" "$F_SHARD2"
+    fetch "$MTP_REPO" "$MTP_FILE" "$F_MTP"
+    if [ "$vision" = 1 ]; then fetch "$VISION_REPO" "$VISION_FILE" "$F_VISION"; fi
+    echo "Done. Start the server with: $0 serve"
+}
+
+parse_ctx() {
+    case $1 in
+        131k|131K) echo 131072 ;;
+        262k|262K) echo 262144 ;;
+        400k|400K) echo 400000 ;;
+        524k|524K) echo 524288 ;;
+        *[!0-9]*|"") die "--ctx takes 131k, 262k, 400k, 524k or a number of tokens" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# GPU memory plan with MTP and vision, in MiB: about 39.1 GiB plus 33 KiB per
+# context token, and 2 GiB of headroom under the wired limit.
+need_mib() { awk -v c="$1" 'BEGIN { printf "%d", (39.1 + c * 3.315e-5 + 2) * 1024 }'; }
+
+wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
+
+# Does the context fit under the wired limit? A limit of 0 is the system
+# default, which holds 131072 on a 64 GB machine and nothing larger.
+ctx_fits() {
+    local ctx=$1 limit
+    limit=$(wired_limit)
+    if [ "$limit" = 0 ]; then [ "$ctx" -le 131072 ]; return; fi
+    [ "$limit" -ge "$(need_mib "$ctx")" ]
+}
+
+sysctl_hint() {
+    local need
+    need=$(need_mib "$1")
+    echo "sudo sysctl iogpu.wired_limit_mb=$(( (need + 2047) / 2048 * 2048 ))"
+}
+
+check_machine() {
+    [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || die "this needs an Apple Silicon Mac"
+    RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+}
+
+cmd_serve() {
+    local ctx="" mtp=1 vision=1 dry=0
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
+            --port) [ $# -ge 2 ] || die "--port needs a value"; PORT=$2; shift ;;
+            --lan) HOST=0.0.0.0 ;;
+            --no-mtp) mtp=0 ;;
+            --no-vision) vision=0 ;;
+            --dry-run) dry=1 ;;
+            --) shift; break ;;
+            *) die "serve: unknown option $1 (see: flash help)" ;;
+        esac
+        shift
+    done
+    check_machine
+    locate_files
+    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
+    [ "$dry" = 1 ] || ensure_binaries
+    [ "$RAM_GB" -ge 60 ] || echo "flash: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
+
+    # Without --ctx take the full 262K window when the wired limit allows it
+    # and fall back to 131K otherwise, saying how to get the larger one.
+    if [ -z "$ctx" ]; then
+        ctx=262144
+        if ! ctx_fits "$ctx"; then
+            ctx=131072
+            echo "flash: using a 131K context. For the full 262K run this once per boot, then restart:" >&2
+            echo "    $(sysctl_hint 262144)" >&2
+        fi
+    fi
+    local max_mib=$(( RAM_GB * 1024 - 4096 ))
+    [ "$(need_mib "$ctx")" -le "$max_mib" ] ||
+        die "a context of $ctx tokens needs about $(need_mib "$ctx") MiB of GPU memory, more than this Mac can give"
+    if ! ctx_fits "$ctx"; then
+        echo "flash: a context of $ctx tokens needs a higher GPU memory limit. Run:" >&2
+        echo "    $(sysctl_hint "$ctx")" >&2
+        exit 1
+    fi
+
+    # Past the native 262144 window the positions need YaRN scaling. A
+    # checkpoint only loads under the factor it was written with, so those
+    # contexts keep their own cache directory and write snapshots less often.
+    local kv_dir=$HOME/.ds4/server-kv kv_mb=12288 kv_every=10000
+    if [ "$ctx" -gt 262144 ]; then
+        export DS4_QWEN4_YARN_FACTOR=${YARN:-2}
+        kv_dir=$HOME/.ds4/server-kv-yarn$DS4_QWEN4_YARN_FACTOR
+        kv_mb=40960
+        kv_every=32768
+    fi
+
+    export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
+    export DS4_QWEN4_MOE_TAILS=1
+    set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
+        --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
+        --kv-cache-continued-interval-tokens "$kv_every" "$@"
+    if [ "$mtp" = 1 ] && [ -f "$F_MTP" ]; then
+        export DS4_QWEN_MTP_GGUF=$F_MTP
+        set -- --mtp "$@"
+    elif [ "$mtp" = 1 ]; then
+        echo "flash: no MTP block in $MODELS, decoding without it (run: $0 pull)" >&2
+    fi
+    if [ "$vision" = 1 ] && [ -f "$F_VISION" ]; then set -- --vision "$F_VISION" "$@"; fi
+
+    if [ "$dry" = 1 ]; then
+        env | grep '^DS4_QWEN' | sort
+        echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
+        return
+    fi
+    echo "flash: context $ctx, http://$HOST:$PORT/v1" >&2
+    cd "$HERE"   # the Metal shaders load from ./metal
+    exec caffeinate -i ./ds4-server -m "$F_SHARD1" "$@"
+}
+
+cmd_chat() {
+    if [ "$1" = -- ]; then shift; fi
+    check_machine
+    locate_files
+    [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the model is not in $MODELS/Q2_0; run: $0 pull"
+    ensure_binaries
+    export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
+    if [ -f "$F_MTP" ]; then
+        export DS4_QWEN_MTP_GGUF=$F_MTP
+        set -- --mtp "$@"
+    fi
+    cd "$HERE"
+    exec ./ds4 -m "$F_SHARD1" --ctx 32768 "$@"
+}
+
+cmd_doctor() {
+    local bad=0 limit
+    check_machine
+    locate_files
+    line() { printf '%-22s %s\n' "$1" "$2"; }
+    line "machine" "$(sysctl -n machdep.cpu.brand_string), $RAM_GB GB"
+    [ "$RAM_GB" -ge 60 ] || { line "" "less than 64 GB: the model may not fit"; bad=1; }
+    for b in ds4 ds4-server; do
+        if [ -x "$HERE/$b" ]; then line "$b" "ok"; else line "$b" "missing (serve builds it from source)"; fi
+    done
+    [ -d "$HERE/metal" ] && line "metal shaders" "ok" || { line "metal shaders" "missing $HERE/metal"; bad=1; }
+    for f in "$F_SHARD1" "$F_SHARD2"; do
+        if [ -f "$f" ]; then line "model" "$(basename "$f")"; else line "model" "missing $(basename "$f") (flash pull)"; bad=1; fi
+    done
+    [ -f "$F_MTP" ] && line "MTP block" "ok" || line "MTP block" "missing, decoding will be slower (flash pull)"
+    [ -f "$F_VISION" ] && line "vision encoder" "ok" || line "vision encoder" "missing, images are off (flash pull)"
+    limit=$(wired_limit)
+    line "wired limit" "$([ "$limit" = 0 ] && echo "system default" || echo "$limit MiB")"
+    for c in 131072 262144 400000 524288; do
+        if ctx_fits "$c"; then line "context $c" "fits"
+        elif [ "$(need_mib "$c")" -le $(( RAM_GB * 1024 - 4096 )) ]; then line "context $c" "needs: $(sysctl_hint "$c")"
+        else line "context $c" "does not fit in $RAM_GB GB"; fi
+    done
+    if curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+        line "server" "running on port $PORT"
+    else
+        line "server" "not running on port $PORT"
+    fi
+    return $bad
+}
+
+cmd_opencode() {
+    cat <<EOF
+Merge this into ~/.config/opencode/opencode.json under "provider":
+
+  "ds4": {
+    "name": "DwarfStar (local)",
+    "npm": "@ai-sdk/openai-compatible",
+    "options": {
+      "baseURL": "http://127.0.0.1:$PORT/v1",
+      "apiKey": "local",
+      "timeout": false,
+      "chunkTimeout": 900000
+    },
+    "models": {
+      "qwen3.8-flash-next": {
+        "name": "Qwen3.8 Flash Next Q2 (DwarfStar)",
+        "limit": { "context": 262144, "output": 32768 },
+        "reasoning": true,
+        "tool_call": true,
+        "temperature": true,
+        "attachment": true,
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "options": { "reasoningEffort": "xhigh" },
+        "variants": {
+          "xhigh": { "reasoningEffort": "xhigh" },
+          "medium": { "reasoningEffort": "medium" },
+          "low": { "reasoningEffort": "low" },
+          "none": { "reasoningEffort": "none" },
+          "high": { "disabled": true },
+          "minimal": { "disabled": true }
+        }
+      }
+    }
+  }
+
+Set "context" to the value the server was started with. Then pick the model
+ds4/qwen3.8-flash-next in OpenCode.
+EOF
+}
+
+case ${1:-help} in
+    pull) shift; cmd_pull "$@" ;;
+    serve) shift; cmd_serve "$@" ;;
+    chat) shift; cmd_chat "$@" ;;
+    doctor) shift; cmd_doctor ;;
+    opencode) shift; cmd_opencode ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac

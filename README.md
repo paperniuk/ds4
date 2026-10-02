@@ -134,35 +134,71 @@ Without it, use `--ctx 131072` or less.
 
 ## Quick start
 
+Prebuilt binaries, macOS 15 or newer, nothing to compile:
+
 ```sh
-git clone -b m1-flash-next https://github.com/paperniuk/ds4.git
-cd ds4 && make
-
-# Model: both shards of the Q2_0 release
-hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --include "Q2_0/*" --local-dir ~/models/flash-next
-# MTP block (optional, for --mtp)
-hf download paperniuk/Qwen3.8-Flash-Next-MTP-block --local-dir ~/models/flash-next/mtp
-# Vision encoder (optional, for --vision)
-./download_model.sh qwen38-vision
-
-M=~/models/flash-next/Q2_0
-DS4_QWEN_NGRAM_GGUF=$M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
-DS4_QWEN_MTP_GGUF=~/models/flash-next/mtp/Qwen3.8-Flash-Next-MTP-block.gguf \
-./ds4-server -m $M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-    --ctx 262144 --prefill-chunk 2048 --mtp \
-    --vision gguf/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
-    --host 127.0.0.1 --port 8010
+curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
+cd ~/ds4-flash-next
 ```
 
-Then point your agent at `http://127.0.0.1:8010/v1`. See
-[docs/CLIENTS.md](docs/CLIENTS.md) for OpenCode and Claude Code setup.
+Or from source:
+
+```sh
+git clone https://github.com/paperniuk/ds4.git
+cd ds4 && make
+```
+
+Then, in either directory:
+
+```sh
+./flash pull       # 69 GB: the model, the MTP block, the vision encoder
+./flash serve      # server on http://127.0.0.1:8010/v1
+./flash opencode   # provider block for OpenCode
+```
+
+`flash serve` picks the context for you: the full 262K when the GPU memory
+limit allows it, 131K otherwise, and it prints the `sudo sysctl` line that
+unlocks the larger one. MTP and vision are on when their files are present.
+
+| Command | What it does |
+|---|---|
+| `./flash pull` | download what is missing into `~/models/flash-next`, resumable |
+| `./flash serve` | start the server; `--ctx 131k/262k/400k/524k`, `--port N`, `--lan`, `--no-mtp`, `--no-vision` |
+| `./flash serve --dry-run` | print the `ds4-server` command and environment instead of running it |
+| `./flash chat` | talk to the model in the terminal |
+| `./flash doctor` | check the machine, the files, the memory limit and which contexts fit |
+| `./flash opencode` | print the provider block for `~/.config/opencode/opencode.json` |
+
+`FLASH_MODELS` changes the model directory, `PORT` and `HOST` the address.
+See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
+use port 8010 and the context the server was started with.
 
 After a `git pull`, run `make` and restart the server. There is nothing to
 switch on: the speedups listed above are the default path.
 
+### By hand
+
+`flash serve` runs this, with the paths filled in:
+
+```sh
+M=~/models/flash-next/Q2_0
+DS4_QWEN4_MOE_TAILS=1 \
+DS4_QWEN_NGRAM_GGUF=$M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+DS4_QWEN_MTP_GGUF=~/models/flash-next/Qwen3.8-Flash-Next-MTP-block.gguf \
+./ds4-server -m $M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+    --ctx 262144 --prefill-chunk 2048 --mtp \
+    --vision ~/models/flash-next/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf \
+    --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 12288 \
+    --host 127.0.0.1 --port 8010
+```
+
+Run it from the directory that holds `metal/`: the shaders are compiled from
+there at start.
+
 ### Longer contexts
 
-Pick the context, raise the wired limit to match, and add YaRN and a
+`./flash serve --ctx 400k` or `--ctx 524k` does all of the below. By hand:
+pick the context, raise the wired limit to match, and add YaRN and a
 separate checkpoint directory above 262144:
 
 | `--ctx` | `iogpu.wired_limit_mb` | Extra settings |

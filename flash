@@ -30,17 +30,20 @@ usage() {
     cat <<EOF
 usage: flash <command> [options]
 
-  pull [--no-vision] [--quant iq3]
+  pull [--no-vision] [--quant iq3|iq3s]
                          download what is missing into $MODELS
                          (67 GB model, 1.5 GB MTP block, 0.6 GB vision encoder;
-                         the iq3 quant is 47 GB more)
+                         iq3 is 47 GB more, iq3s 55 GB more)
   pull NAME              download another model into ./gguf (see: flash models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
-      --quant q2|iq3     q2 (default) is the fast 2-bit file; iq3 is ISTA's
+      --quant q2|iq3|iq3s
+                         q2 (default) is the fast 2-bit file; iq3 is ISTA's
                          IQ3_XXS: better answers, a quarter slower, 9 GB more
-                         memory, so 262k is its ceiling on 64 GB
+                         memory, so 262k is its ceiling on 64 GB; iq3s is
+                         IQ3_S, ISTA's best file, 16 GB more than q2, for
+                         Macs with 96 GB or more
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
@@ -53,12 +56,12 @@ usage: flash <command> [options]
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [--quant iq3] [--power N] [NAME or FILE] [-- ARGS]
+  chat [--quant NAME] [--power N] [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
-  doctor [--quant iq3]   check the machine, the files and the memory limit
+  doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
 
-Environment: FLASH_MODELS (model directory), FLASH_QUANT (q2 or iq3), PORT, HOST.
+Environment: FLASH_MODELS (model directory), FLASH_QUANT (q2, iq3 or iq3s), PORT, HOST.
 EOF
 }
 
@@ -72,20 +75,28 @@ first_of() {
     echo "$1"
 }
 
-# The two quants of the ISTA release. Their second shard, the n-gram table,
-# is the same file, so one copy serves both.
+# The quants of the ISTA release. Their second shard, the n-gram table, is
+# the same file in every one of them, so one copy serves all.
+QUANT_TAGS="Q2_0 IQ3_XXS IQ3_S"
 locate_files() {
-    local tag other
+    local tag t
     case $QUANT in
-        q2) tag=Q2_0; other=IQ3_XXS; BASE_GIB=39.1; SHARD1_GB=38 ;;
-        iq3) tag=IQ3_XXS; other=Q2_0; BASE_GIB=47.9; SHARD1_GB=47 ;;
-        *) die "unknown quant $QUANT (q2 or iq3)" ;;
+        q2) tag=Q2_0; BASE_GIB=39.1; SHARD1_GB=38 ;;
+        iq3) tag=IQ3_XXS; BASE_GIB=47.9; SHARD1_GB=47 ;;
+        iq3s) tag=IQ3_S; BASE_GIB=55.2; SHARD1_GB=55 ;;
+        *) die "unknown quant $QUANT (q2, iq3 or iq3s)" ;;
     esac
     QDIR=$MODELS/$tag
     SHARD1=Qwen3.8-Flash-Next-GSQ-RCO-$tag-00001-of-00002.gguf
     SHARD2=Qwen3.8-Flash-Next-GSQ-RCO-$tag-00002-of-00002.gguf
     F_SHARD1=$QDIR/$SHARD1
-    F_SHARD2=$(first_of "$QDIR/$SHARD2" "$MODELS/$other/Qwen3.8-Flash-Next-GSQ-RCO-$other-00002-of-00002.gguf")
+    F_SHARD2=$QDIR/$SHARD2
+    for t in $QUANT_TAGS; do
+        [ -f "$F_SHARD2" ] && break
+        if [ -f "$MODELS/$t/Qwen3.8-Flash-Next-GSQ-RCO-$t-00002-of-00002.gguf" ]; then
+            F_SHARD2=$MODELS/$t/Qwen3.8-Flash-Next-GSQ-RCO-$t-00002-of-00002.gguf
+        fi
+    done
     F_MTP=$(first_of "$MODELS/$MTP_FILE" "$MODELS/mtp/$MTP_FILE")
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
 }
@@ -128,7 +139,7 @@ cmd_pull() {
     while [ $# -gt 0 ]; do
         case $1 in
             --no-vision) vision=0 ;;
-            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2; shift ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             *) die "pull: unknown option $1" ;;
         esac
         shift
@@ -159,8 +170,8 @@ parse_ctx() {
 }
 
 # GPU memory plan with MTP and vision, in MiB: about 39.1 GiB (47.9 for the
-# iq3 quant) plus 33 KiB per context token, and 2 GiB of headroom under the
-# wired limit.
+# iq3 quant, 55.2 for iq3s) plus 33 KiB per context token, and 2 GiB of
+# headroom under the wired limit.
 parse_power() {
     case $1 in
         ''|*[!0-9]*) die "--power needs a number from 1 to 100" ;;
@@ -174,11 +185,15 @@ need_mib() { awk -v c="$1" -v b="$BASE_GIB" 'BEGIN { printf "%d", (b + c * 3.315
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
 
 # Does the context fit under the wired limit? A limit of 0 is the system
-# default, which holds 131072 on a 64 GB machine and nothing larger.
+# default: three quarters of the RAM, which on a 64 GB machine holds 131072
+# and nothing larger.
 ctx_fits() {
     local ctx=$1 limit
     limit=$(wired_limit)
-    if [ "$limit" = 0 ]; then [ "$ctx" -le 131072 ]; return; fi
+    if [ "$limit" = 0 ]; then
+        [ "$ctx" -le 131072 ] || [ "$(need_mib "$ctx")" -le $(( RAM_GB * 768 )) ]
+        return
+    fi
     [ "$limit" -ge "$(need_mib "$ctx")" ]
 }
 
@@ -254,7 +269,7 @@ cmd_serve() {
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
-            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2; shift ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
@@ -272,19 +287,25 @@ cmd_serve() {
     [ "$dry" = 1 ] || ensure_binaries
     [ "$RAM_GB" -ge 60 ] || echo "flash: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
 
-    # Without --ctx take the full 262K window when the wired limit allows it
-    # and fall back to 131K otherwise, saying how to get the larger one.
+    # Without --ctx take the largest window that leaves the rest of the
+    # system 8 GB (the iq3 quant on 64 GB fits 262K, but then it swaps), and
+    # step down again when the wired limit is lower, saying how to raise it.
     if [ -z "$ctx" ]; then
-        ctx=262144
-        if [ $(( $(need_mib "$ctx") + 8192 )) -gt $(( RAM_GB * 1024 )) ]; then
-            # the iq3 quant on 64 GB: 262K fits, but leaves the system 5 GB and it swaps
-            ctx=131072
-            echo "flash: using a 131K context, 262K would leave the rest of the system too little memory." >&2
-            echo "    --ctx 262k forces it." >&2
-        elif ! ctx_fits "$ctx"; then
-            ctx=131072
-            echo "flash: using a 131K context. For the full 262K run this once per boot, then restart:" >&2
-            echo "    $(sysctl_hint 262144)" >&2
+        local want c
+        for want in 262144 131072 65536 32768; do
+            [ $(( $(need_mib "$want") + 8192 )) -gt $(( RAM_GB * 1024 )) ] || break
+        done
+        if [ "$want" != 262144 ]; then
+            echo "flash: using a $(( want / 1000 ))K context, a larger one would leave the rest of the system too little memory." >&2
+            echo "    --ctx N forces it." >&2
+        fi
+        ctx=$want
+        for c in 262144 131072 65536 32768; do
+            if [ "$c" -le "$want" ] && ctx_fits "$c"; then ctx=$c; break; fi
+        done
+        if [ "$ctx" != "$want" ]; then
+            echo "flash: using a $(( ctx / 1000 ))K context. For $(( want / 1000 ))K run this once per boot, then restart:" >&2
+            echo "    $(sysctl_hint "$want")" >&2
         fi
     fi
     local max_mib=$(( RAM_GB * 1024 - 4096 ))
@@ -334,7 +355,7 @@ cmd_chat() {
     local model="" power=""
     while :; do
         case ${1:-} in
-            --quant) [ $# -ge 2 ] || die "--quant needs q2 or iq3"; QUANT=$2 ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1 ;;
             *) break ;;
         esac
@@ -392,10 +413,20 @@ cmd_doctor() {
     [ -f "$F_VISION" ] && line "vision encoder" "ok" || line "vision encoder" "missing, images are off (flash pull)"
     limit=$(wired_limit)
     line "wired limit" "$([ "$limit" = 0 ] && echo "system default" || echo "$limit MiB")"
-    for c in 131072 262144 400000 524288; do
+    for c in 32768 131072 262144 400000 524288; do
         if ctx_fits "$c"; then line "context $c" "fits"
         elif [ "$(need_mib "$c")" -le $(( RAM_GB * 1024 - 4096 )) ]; then line "context $c" "needs: $(sysctl_hint "$c")"
         else line "context $c" "does not fit in $RAM_GB GB"; fi
+    done
+    # The largest window each quant can hold on this machine with 8 GB left
+    # for the rest of the system.
+    local q best
+    for q in q2 iq3 iq3s; do
+        QUANT=$q; locate_files; best=""
+        for c in 32768 131072 262144 400000 524288; do
+            [ $(( $(need_mib "$c") + 8192 )) -gt $(( RAM_GB * 1024 )) ] || best=$c
+        done
+        line "quant $q" "$([ -n "$best" ] && echo "up to $best tokens" || echo "too large for $RAM_GB GB with room to spare")$([ -f "$F_SHARD1" ] && echo ", downloaded")"
     done
     if curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
         line "server" "running on port $PORT"

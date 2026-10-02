@@ -30,39 +30,41 @@ What it adds to stock ds4:
 Nearly all of it is the same code on every Apple Silicon chip. What is and
 what is not specific to M1 is listed in [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain).
 
-## Pick a quant for your Mac
+## Qwen3.8-Flash-Next: which quant for your Mac
 
-| Memory | `dstar serve` | Context | GPU memory limit | Checked on |
+Qwen3.8-Flash-Next is the main model here and what `dstar pull` downloads.
+ISTA-DASLab publishes it in three sizes (quants); a larger one answers
+better and is slower. `--quant` picks one, in `dstar pull` and in
+`dstar serve`:
+
+| Your Mac | Quant | `--quant` | Weights | Context it runs with |
 |---|---|---|---|---|
-| 64 GB | `--quant q2` (default) | 262K, up to 524K | raise it above 131K | M1 Max |
-| 64 GB | `--quant iq3` | 131K, 262K with `--ctx 262k` | raise it for 262K | M1 Max |
-| 96 GB | `--quant iq3s` | 262K | default | memory plan only |
-| 128 GB or more | `--quant iq3s` | 262K, up to 524K | default | memory plan only |
+| 64 GB | Q2_0, the fastest | `q2` (default) | 35 GiB | 262K; up to 524K |
+| 64 GB | IQ3_XXS, better answers | `iq3` | 44 GiB | 131K; 262K with `--ctx 262k` |
+| 96 GB or more | IQ3_S, the best file | `iq3s` | 51 GiB | 262K; up to 524K from 128 GB |
 
-**The GPU memory limit often has to be raised.** macOS lets the GPU wire
-about three quarters of the memory by default, 48 GiB on a 64 GB Mac, and
-the model with a long context needs more. When a context does not fit,
-`dstar serve` falls back to a smaller one or stops, and prints the exact
-line to run, for example:
+The 64 GB rows are measured on an M1 Max. The IQ3_S row comes from the
+memory plan: on 64 GB that file runs, but only with a 32K context.
+ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9; speeds are in
+[The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants).
+`dstar doctor` prints the largest context each quant can hold on your Mac.
+
+**On 64 GB the GPU memory limit has to be raised for the long contexts**
+(above 131K with Q2_0, 262K with IQ3_XXS). macOS lets the GPU use about
+three quarters of the memory by default, 48 GiB of 64. When a context does
+not fit, `dstar serve` takes a smaller one and prints the line to run:
 
 ```sh
 sudo sysctl iogpu.wired_limit_mb=57344    # 61440 for iq3 at 262K or q2 at 524K
 ```
 
-The setting is lost at every reboot, so it has to be run again after one.
-With IQ3_XXS at 262K the server holds 56.6 GiB of the 64, which leaves the
-rest of the system about 5 GB: close the browser first.
-
-Q2_0 is the fastest file. IQ3_XXS and IQ3_S answer better by ISTA's own
-measurements (LiveCodeBench 81.1, 86.3 and 86.9) and are slower, see
-[The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants). `dstar doctor` prints the largest
-context every quant can hold on the machine it runs on.
+The setting is lost at every reboot. With IQ3_XXS at 262K the server holds
+56.6 GiB of the 64, so close the browser first.
 
 Below 64 GB nothing has been tried. Qwen3.8 has no SSD streaming in ds4, so
-the weights must fit in memory: by the memory plan Q2_0 with a 32K context
-needs 42 GiB.
+the weights must fit in memory: Q2_0 with a 32K context needs 42 GiB.
 
-## Speed on an M1 Max
+## Flash-Next speed on an M1 Max
 
 M1 Max, 32-core GPU, 64 GB, the Q2_0 file. Greedy decoding,
 `--prefill-chunk 2048`.
@@ -81,21 +83,39 @@ These are the only measured numbers so far. Newer chips have faster GPUs and
 run the same kernels, but nobody has timed them; if you do, the two commands
 at the end of [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain) make a useful report.
 
+## DeepSeek V4 Flash on a 64 GB Mac
+
+The other model measured here, `dstar pull ds4f-q2` and `dstar serve deepseek`.
+The Q2 file is 81 GiB, so on 64 GB ds4 keeps the dense weights and a cache
+of routed experts in memory and reads the rest from the SSD as tokens need
+them. Measured on an M1 Max, 32K context, greedy decoding:
+
+| | Before the changes | This fork |
+|---|---|---|
+| Decode, 400 token answer | 9.4 tok/s | 10.35 tok/s |
+| Prefill, 5K prompt | 94 tok/s | 101 tok/s |
+
+Decode reaches 14.4 tokens per second while every expert it needs is in the
+cache, and falls as the answer wanders: each of the 15 or so experts read
+from the SSD per token costs about 2 ms. The memory plan is 48.9 GiB, of
+which 36.4 GiB is the cache, 5526 of the 11008 experts.
+
+Two things to know. DSpark speculative decoding is slower here (6.3 to 7.4
+tokens per second), because every drafted token pulls more experts from the
+disk, so the launcher leaves it off. And a busy performance core slows the
+GPU by up to 45%: run it on a quiet machine. With 32 GB it is not usable,
+3.6 tokens per second in a simulation.
+
 ## Requirements
 
 - An Apple Silicon Mac with 64 GB of RAM or more. The fork targets M1 and M2
   (Max or Ultra); M3 and later run the same code. Only the M1 Max has been
   measured so far; reports from other chips are welcome.
-- About 67 GB of disk for the model (both shards) and 1.5 GB for the MTP
-  block. A fast internal SSD, since the n-gram
+- For Flash-Next, about 67 GB of disk for the model (both shards) and 1.5 GB
+  for the MTP block. A fast internal SSD, since the n-gram
   table is read from disk on every token.
-- 262K context needs a higher GPU wired memory limit, reset at every reboot:
-
-```sh
-sudo sysctl iogpu.wired_limit_mb=57344
-```
-
-Without it, use `--ctx 131072` or less.
+- For Flash-Next contexts above 131K on 64 GB, a higher GPU memory limit,
+  see [above](#qwen38-flash-next-which-quant-for-your-mac).
 
 ## Quick start
 
@@ -165,28 +185,6 @@ context defaults to 32768 (`--ctx N` changes it) and is not checked against
 the memory. A model larger than the RAM is started with `--ssd-streaming`.
 Everything after `--` goes to `ds4-server` unchanged. See
 [docs/MODELS.md](docs/MODELS.md) for what fits where.
-
-### DeepSeek V4 Flash on a 64 GB Mac
-
-The Q2 file is 81 GiB, so on 64 GB ds4 keeps the dense weights and a cache
-of routed experts in memory and reads the rest from the SSD as tokens need
-them. Measured on an M1 Max, 32K context, greedy decoding:
-
-| | Before the changes | This fork |
-|---|---|---|
-| Decode, 400 token answer | 9.4 tok/s | 10.35 tok/s |
-| Prefill, 5K prompt | 94 tok/s | 101 tok/s |
-
-Decode reaches 14.4 tokens per second while every expert it needs is in the
-cache, and falls as the answer wanders: each of the 15 or so experts read
-from the SSD per token costs about 2 ms. The memory plan is 48.9 GiB, of
-which 36.4 GiB is the cache, 5526 of the 11008 experts.
-
-Two things to know. DSpark speculative decoding is slower here (6.3 to 7.4
-tokens per second), because every drafted token pulls more experts from the
-disk, so the launcher leaves it off. And a busy performance core slows the
-GPU by up to 45%: run it on a quiet machine. With 32 GB it is not usable,
-3.6 tokens per second in a simulation.
 
 `DSTAR_MODELS` changes the Flash-Next directory, `DSTAR_QUANT` the default
 quant, `PORT` and `HOST` the address.

@@ -7090,3 +7090,24 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
 
     dst[ic * args.head_dim + id] = acc/sum;
 }
+
+/* Copy n_rows rows of row_len floats between two row strides, four floats
+ * per thread: packs or scatters one column block of a wider matrix. */
+struct ds4_metal_args_copy_rows_strided {
+    uint32_t n_rows;
+    uint32_t row_len;
+    uint32_t src_stride;
+    uint32_t dst_stride;
+};
+
+kernel void kernel_dsv4_copy_rows_strided(
+        constant ds4_metal_args_copy_rows_strided & args,
+        device const float *src,
+        device float       *dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint per_row = args.row_len / 4u;
+    const uint row = gid / per_row, col = (gid % per_row) * 4u;
+    if (row >= args.n_rows) return;
+    *(device float4 *)(dst + (uint64_t)row * args.dst_stride + col) =
+        *(device const float4 *)(src + (uint64_t)row * args.src_stride + col);
+}

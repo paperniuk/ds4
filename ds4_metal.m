@@ -765,6 +765,8 @@ static id<MTLBuffer> g_moe_q4_gate_slots_buffer;
 static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
+static id<MTLBuffer> g_attn_out_dense_buffer;
+static NSUInteger g_attn_out_dense_bytes;
 static int g_model_fd = -1;
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
@@ -2836,6 +2838,13 @@ static int ds4_gpu_mpp_available(void) {
  * lost during M5 work are removed or kept out of the dispatch path so future
  * changes do not accidentally turn old experiments into new modes.
  */
+/* Grouped attention output projection through the dense prompt matmul.
+ * Measured on M1 Max; DS4_METAL_ATTN_OUT_DENSE=0 or 1 overrides. */
+static bool ds4_gpu_attn_out_low_dense(void) {
+    const int override = ds4_gpu_env_bool("DS4_METAL_ATTN_OUT_DENSE");
+    return override >= 0 ? override != 0 : ds4_gpu_device_name_contains("M1");
+}
+
 static int ds4_gpu_use_mpp_attn_out_low_matmul(void) {
     return ds4_gpu_mpp_available();
 }
@@ -26200,6 +26209,64 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                                                             0) != 0;
                         }
                     }
+                }
+            } else if (n_tokens >= 32u && (rank % 4u) == 0 && (group_dim % 4u) == 0 && ds4_gpu_attn_out_low_dense() &&
+                       ds4_gpu_ensure_scratch_buffer(&g_attn_out_dense_buffer, &g_attn_out_dense_bytes,
+                                                     (NSUInteger)((uint64_t)n_tokens * (group_dim + rank) * sizeof(float)),
+                                                     "ds4_attention_output_dense")) {
+                /* Every group is a plain rank x group_dim projection of its
+                 * slice of the heads.  The id-mapped matmul reads those
+                 * slices in place, 32 token rows a power of two apart, and
+                 * runs three times slower than the same product on packed
+                 * rows.  So pack one group at a time, run the dense prompt
+                 * matmul on it and scatter the result into its columns. */
+                const bool bc_inp = (group_dim % 32u) != 0;
+                const bool bc_out = (rank % 64u) != 0 || (n_tokens % 32u) != 0;
+                const ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(group_dim, rank, n_tokens, row_a_bytes);
+                id<MTLComputePipelineState> mm_pipeline =
+                    ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32", bc_inp, bc_out);
+                id<MTLComputePipelineState> copy_pipeline = ds4_gpu_get_pipeline("kernel_dsv4_copy_rows_strided");
+                const NSUInteger x_bytes = (NSUInteger)n_tokens * (NSUInteger)group_dim * sizeof(float);
+                ok = mm_pipeline != nil && copy_pipeline != nil;
+                for (uint32_t group = 0; ok && group < n_groups; group++) {
+                    struct { uint32_t n_rows, row_len, src_stride, dst_stride; } pack =
+                        { n_tokens, (uint32_t)group_dim, (uint32_t)(n_groups * group_dim), (uint32_t)group_dim };
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:copy_pipeline];
+                    [enc setBytes:&pack length:sizeof(pack) atIndex:0];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(heads)
+                            offset:ds4_gpu_tensor_offset(heads) + (NSUInteger)group * (NSUInteger)group_dim * sizeof(float)
+                           atIndex:1];
+                    [enc setBuffer:g_attn_out_dense_buffer offset:0 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens * (NSUInteger)group_dim / 4u + 255u) / 256u, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+
+                    enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:mm_pipeline];
+                    [enc setBytes:&args length:sizeof(args) atIndex:0];
+                    [enc setBuffer:out_a_buf
+                            offset:(NSUInteger)out_a_inner + (NSUInteger)group * (NSUInteger)rank * (NSUInteger)row_a_bytes
+                           atIndex:1];
+                    [enc setBuffer:g_attn_out_dense_buffer offset:0 atIndex:2];
+                    [enc setBuffer:g_attn_out_dense_buffer offset:x_bytes atIndex:3];
+                    [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens + 31u) / 32u, ((NSUInteger)rank + 63u) / 64u, 1)
+                         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+
+                    struct { uint32_t n_rows, row_len, src_stride, dst_stride; } scatter =
+                        { n_tokens, (uint32_t)rank, (uint32_t)rank, (uint32_t)(n_groups * rank) };
+                    enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:copy_pipeline];
+                    [enc setBytes:&scatter length:sizeof(scatter) atIndex:0];
+                    [enc setBuffer:g_attn_out_dense_buffer offset:x_bytes atIndex:1];
+                    [enc setBuffer:ds4_gpu_tensor_buffer(low)
+                            offset:ds4_gpu_tensor_offset(low) + (NSUInteger)group * (NSUInteger)rank * sizeof(float)
+                           atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens * (NSUInteger)rank / 4u + 255u) / 256u, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
                 }
             } else if (n_tokens >= 32u && ds4_gpu_mul_mm_id_map0_name(n_groups) != NULL) {
                 ds4_gpu_mul_mm_id_map_args map_args =

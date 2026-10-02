@@ -21,6 +21,35 @@ M1 Max, 32-core GPU, 64 GB. Greedy decoding, `--prefill-chunk 2048`.
 
 MTP gains depend on the text: about +30% on code, about +10% on prose.
 
+## Beyond 262K
+
+The model was trained on a 262,144 token window, but the same build runs
+longer ones. 524K is the ceiling on 64 GB; one million tokens would need
+about 72 GiB.
+
+| Context | GPU memory plan | Decode | Prefill | Needles found |
+|---|---|---|---|---|
+| 262K | 45.8 GiB | 31.5 tok/s | 271 tok/s | 20 of 20 |
+| 400K | 50.4 GiB | 29.2 tok/s | 258 tok/s | 20 of 20 |
+| 524K | 54.5 GiB | 27.5 tok/s | 248 tok/s | 18 of 20 |
+
+Decode and prefill are the speed at that depth of one pass over a 524K token
+document (`ds4-bench --teacher-forced-decode`, no MTP). The needles are 20
+one-line facts spread over the document, each asked for by name after a
+single prefill, with YaRN factor 2 (see `speed-bench/long_context_probe.c`).
+MTP and vision add about 2 GiB.
+
+Prediction quality does not drop past the trained window: the tokens of the
+second half of that document score an average NLL of 0.265 at depths 262K to
+524K and 0.276 when the same text is fed from position zero.
+
+Set `DS4_QWEN4_YARN_FACTOR=2` for a context above 262144 and raise the wired
+limit to 61440 for 524K. YaRN changes nothing below 262K and is slightly
+better above it (20 against 19 needles at 400K, 18 against 17 at 524K).
+KV checkpoints record the factor; keep a separate `--kv-disk-dir` for each.
+With prompts this long, pass `--kv-cache-continued-interval-tokens 32768`:
+the default writes a multi-gigabyte snapshot every 10K tokens of prefill.
+
 Same machine, plain decode, before this fork:
 
 | Engine | Short context | Long context | 262K |
@@ -64,6 +93,13 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   for the leftover tokens of each expert. Small prefills, which is what an
   agent sends after every tool call, gain the most: 182 to 223 tok/s at 300
   tokens, 231 to 268 at 600, with identical output.
+- **Smaller draft head for MTP**: `DS4_QWEN4_MTP_DRAFT_VOCAB` points at a
+  list of token ids and the drafter scores only those rows of the output
+  matrix. `gguf-tools/qwen4_mtp_draft_vocab.py` writes a Latin, code and
+  Cyrillic list of 116K ids out of 248K. The draft step drops from 3.3 to
+  2.7 ms with the same acceptance and the same output. A draft is only 8% of
+  an MTP cycle, so this is worth about 1% in tokens per second, which is
+  inside the run to run noise. It is off by default.
 - **Vision in agent sessions**: up to 64 images per request, older ones are
   replaced by a short note instead of failing the request.
 

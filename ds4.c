@@ -58140,10 +58140,12 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
-/* The codebook quants of ISTA's IQ3_XXS file: 256-weight blocks, gate/up only. */
+/* The codebook quants of ISTA's IQ3_XXS file and the IQ4_XS of its IQ3_S
+ * file: 256-weight blocks, gate/up only. */
 static bool qwen4_expert_type_is_grid(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XS || type == DS4_TENSOR_IQ2_S ||
-           type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S;
+           type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_IQ4_XS;
 }
 
 static bool qwen4_expert_type_has_mm(uint32_t type) {
@@ -58225,7 +58227,7 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
         if (!qwen4_graph_expert_ok(l->ffn_gate_exps) || !qwen4_graph_expert_ok(l->ffn_up_exps) ||
             !qwen4_graph_expert_ok(l->ffn_down_exps) || l->ffn_up_exps->type != l->ffn_gate_exps->type) {
             fprintf(stderr, "ds4: Qwen3.8 GPU graph: unsupported routed expert type in layer %u "
-                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, q2_0, f16, f32; "
+                    "(q8_0, mxfp4, q4_K, q2_K, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_xs, iq4_nl, q2_0, f16, f32; "
                     "gate and up must match)\n", il);
             return false;
         }

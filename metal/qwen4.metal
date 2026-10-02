@@ -3347,8 +3347,8 @@ kernel void kernel_qwen4_moe_down_q2_0(
     }
 }
 
-/* Routed experts in the codebook quants IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S
- * (256-weight blocks).  mid: a SIMD group owns QWEN4_GRID_MID_NR gate rows
+/* Routed experts in the codebook quants IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S,
+ * and in IQ4_XS (256-weight blocks).  mid: a SIMD group owns QWEN4_GRID_MID_NR gate rows
  * and the same up rows of one expert; lane l keeps the 16 inputs of chunk
  * l % 16 of every second block and reuses them for all of its rows.  The
  * shared expert has a dense type of its own and takes the generic row dot,
@@ -3421,6 +3421,7 @@ template [[host_name("kernel_qwen4_moe_mid_iq2_xs")]]  kernel qwen4_moe_mid_grid
 template [[host_name("kernel_qwen4_moe_mid_iq2_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq2_s, ds4q_dequantize_iq2_s>;
 template [[host_name("kernel_qwen4_moe_mid_iq3_xxs")]] kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_xxs, ds4q_dequantize_iq3_xxs>;
 template [[host_name("kernel_qwen4_moe_mid_iq3_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_s, ds4q_dequantize_iq3_s>;
+template [[host_name("kernel_qwen4_moe_mid_iq4_xs")]]  kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq4_xs, ds4q_dequantize_iq4_xs>;
 
 /* IQ4_NL down rows, laid out as the Q2_0 ones: eight lanes share a row of
  * 640 inputs (40 chunks of 16) and the four lane groups of a SIMD group
@@ -3842,9 +3843,9 @@ kernel void kernel_qwen4_moe_build_lists(
 }
 
 /* The types that only have the 16-weight dequantizers of quants.metal:
- * IQ4_NL and the codebook quants. */
+ * IQ4_NL, IQ4_XS and the codebook quants. */
 static inline bool qwen4_mm_deq16_has(uint type) {
-    return type == 20 || type == 17 || type == 18 || type == 21 || type == 22;
+    return type == 20 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23;
 }
 
 /* quarters q0 and q0 + 1 (q0 even) of 32-wide block b */
@@ -3856,6 +3857,7 @@ static inline void qwen4_mm_deq16(device const char *row, uint b, uint q0, uint 
     case 18: ds4q_dequantize_iq3_xxs((device const block_iq3_xxs *)row + sb, il, w); break;
     case 21: ds4q_dequantize_iq3_s((device const block_iq3_s *)row + sb, il, w); break;
     case 22: ds4q_dequantize_iq2_s((device const block_iq2_s *)row + sb, il, w); break;
+    case 23: ds4q_dequantize_iq4_xs((device const block_iq4_xs *)row + sb, il, w); break;
     default: ds4q_dequantize_iq4_nl((device const block_iq4_nl *)row + b, (short)(q0 / 2), w); break;
     }
 }

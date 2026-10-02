@@ -1563,13 +1563,13 @@ static void test_attention_rows(arena_t *a) {
 /* IQ4_NL and the codebook quants: random block bytes with a sane scale, the
  * shadow comes from the CPU dequantizer. */
 static bool wtype_is_dequant(uint32_t wtype) {
-    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u;
+    return wtype == 20u || wtype == 17u || wtype == 18u || wtype == 21u || wtype == 22u || wtype == 23u;
 }
 
 static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow, float scale) {
     uint64_t row_bytes = 0;
     require_ok(ds4_quant_row_bytes(wtype, cols, &row_bytes), "quant row bytes");
-    const uint64_t block_bytes = wtype == 20u ? 18u : wtype == 17u ? 74u : wtype == 22u ? 82u : wtype == 18u ? 98u : 110u;
+    const uint64_t block_bytes = wtype == 20u ? 18u : wtype == 17u ? 74u : wtype == 22u ? 82u : wtype == 18u ? 98u : wtype == 23u ? 136u : 110u;
     const uint64_t off = arena_alloc(a, rows * row_bytes);
     uint8_t *w = a->base + off;
     float *deq = malloc(cols * sizeof(float));
@@ -1588,8 +1588,9 @@ static uint64_t arena_dequant(arena_t *a, uint32_t wtype, uint64_t rows, uint64_
 }
 
 static uint64_t arena_tier(arena_t *a, uint32_t wtype, uint64_t rows, uint64_t cols, double **shadow) {
-    /* the codes reach 127 (IQ4_NL) or 43 times the block scale */
-    if (wtype_is_dequant(wtype)) return arena_dequant(a, wtype, rows, cols, shadow, wtype == 20u ? 0.0005f : 0.0002f);
+    /* the codes reach 127 (IQ4_NL), 127 * 31 (IQ4_XS) or 43 times the block scale */
+    if (wtype_is_dequant(wtype))
+        return arena_dequant(a, wtype, rows, cols, shadow, wtype == 20u ? 0.0005f : wtype == 23u ? 0.00002f : 0.0002f);
     if (wtype == 39u) return arena_mxfp4(a, rows, cols, shadow);
     if (wtype == 42u) return arena_q2_0(a, rows, cols, shadow, 0.05f);
     return wtype == 12u ? arena_q4_K(a, rows, cols, shadow, 0.05f) :
@@ -1707,7 +1708,7 @@ static void test_moe_types(arena_t *a, uint32_t NE, uint32_t slots, uint32_t E, 
     uint64_t gate_off, up_off, down_off, sg_off, su_off, sd_off;
     const bool q8 = wtype != 0u;
     const char *tier_name = wtype == 17u ? "iq2_xs" : wtype == 22u ? "iq2_s" : wtype == 18u ? "iq3_xxs" :
-                            wtype == 21u ? "iq3_s" : wtype == 42u ? "q2_0" : wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : wtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
+                            wtype == 21u ? "iq3_s" : wtype == 23u ? "iq4_xs" : wtype == 42u ? "q2_0" : wtype == 12u ? "q4_K" : wtype == 10u ? "q2_K" : wtype == 16u ? "iq2_xxs" : wtype == 39u ? "mxfp4" : q8 ? "q8_0" : "f32";
     if (q8) {
         gate_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &gate_w);
         up_off = arena_tier(a, wtype, (uint64_t)NE * F, E, &up_w);
@@ -3832,9 +3833,9 @@ int main(void) {
     test_moe_types(&arena, 16, 10, 2560, 640, 1, 42u, 42u);
     test_moe_types(&arena, 16, 10, 2560, 640, 2, 42u, 42u);
     test_moe_types(&arena, 16, 10, 2560, 640, 100, 42u, 42u);
-    /* ISTA IQ3_XXS: codebook gate/up with IQ4_NL or Q2_0 down */
-    static const uint32_t grid_types[4] = { 17u, 22u, 18u, 21u };
-    for (int i = 0; i < 4; i++) {
+    /* ISTA IQ3_XXS and IQ3_S: codebook or IQ4_XS gate/up with IQ4_NL or Q2_0 down */
+    static const uint32_t grid_types[5] = { 17u, 22u, 18u, 21u, 23u };
+    for (int i = 0; i < 5; i++) {
         test_moe_types(&arena, 16, 10, 2560, 640, 1, grid_types[i], 20u);
         test_moe_types(&arena, 16, 10, 2560, 640, 2, grid_types[i], 42u);
         test_moe_types(&arena, 16, 10, 2560, 640, 100, grid_types[i], 20u);

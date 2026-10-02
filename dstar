@@ -74,7 +74,8 @@ usage: dstar <command> [options]
   link                   link this script into $BIN_DIR, so that "dstar"
                          works from any directory (DSTAR_BIN changes the place)
 
-Environment: DSTAR_MODELS (model directory), DSTAR_QUANT (q2, iq3 or iq3s), PORT, HOST.
+Environment: DSTAR_MODELS (Flash-Next directory), DSTAR_QUANT (q2, iq3 or iq3s),
+DSTAR_MODEL (the model serve and chat run when none is named), PORT, HOST.
 EOF
 }
 
@@ -237,17 +238,39 @@ check_machine() {
 # Absolute path of a model given by the user, so it survives the cd to $HERE.
 # Anything that is not a file is a name to look for: "deepseek" finds the one
 # main model GGUF with that word in its name under ./gguf or next to $MODELS.
+other_models_on_disk() {
+    find "$HERE/gguf" "$(dirname "$MODELS")" -maxdepth 3 -iname "*$1*.gguf" 2>/dev/null |
+        grep -Eiv 'support|mmproj|mtp-block|encoder|vision\.gguf|GSQ-RCO|-0*([2-9]|1[0-9])-of-' | sort -u
+}
+
 model_path() {
     local found n
     if [ -f "$1" ] && [ "${1%.gguf}" != "$1" ]; then
         echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
         return
     fi
-    found=$(find "$HERE/gguf" "$(dirname "$MODELS")" -maxdepth 3 -iname "*$1*.gguf" 2>/dev/null |
-        grep -Eiv 'support|mmproj|mtp-block|encoder|vision\.gguf|-0*([2-9]|1[0-9])-of-' | sort -u)
+    found=$(other_models_on_disk "$1")
     n=$(printf '%s' "$found" | grep -c . || true)
     [ "$n" != 0 ] || die "no model file or name matches: $1"
     [ "$n" = 1 ] || die "several models match $1, give the file: $(printf '\n%s' "$found")"
+    echo "$found"
+}
+
+# The model to run when none is named: DSTAR_MODEL, else Flash-Next when it
+# is on disk or a quant was asked for, else the one other model on disk.
+# Prints nothing for Flash-Next.
+default_model() {
+    local found n
+    if [ -n "${DSTAR_MODEL:-}" ]; then model_path "$DSTAR_MODEL"; return; fi
+    [ -z "$QUANT" ] || return 0
+    pick_quant
+    locate_files
+    QUANT=""
+    if [ -f "$F_SHARD1" ]; then return 0; fi
+    found=$(other_models_on_disk "")
+    n=$(printf '%s' "$found" | grep -c . || true)
+    [ "$n" != 0 ] || die "no model on disk: dstar pull fetches Qwen3.8-Flash-Next, dstar models lists the others"
+    [ "$n" = 1 ] || die "several models on disk, name one (dstar serve NAME) or set DSTAR_MODEL: $(printf '\n%s' "$found")"
     echo "$found"
 }
 
@@ -307,6 +330,7 @@ cmd_serve() {
     done
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
+    [ -n "$model" ] || model=$(default_model) || exit 1
     if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
     pick_quant
     locate_files
@@ -396,6 +420,7 @@ cmd_chat() {
     if [ "${1:-}" = -- ]; then shift; fi
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
+    [ -n "$model" ] || model=$(default_model) || exit 1
     if [ -n "$model" ]; then
         ensure_binaries
         case " $* " in
@@ -456,6 +481,9 @@ cmd_doctor() {
             [ $(( $(need_mib "$c") + 8192 )) -gt $(( RAM_GB * 1024 )) ] || best=$c
         done
         line "quant $q" "$([ -n "$best" ] && echo "up to $best tokens" || echo "too large for $RAM_GB GB with room to spare")$([ -f "$F_SHARD1" ] && echo ", downloaded")"
+    done
+    other_models_on_disk "" | while read -r f; do
+        line "other model" "$(basename "$f"), $(( $(stat -L -f %z "$f") / 1073741824 )) GiB$(needs_streaming "$f" && echo ", streamed from the SSD")"
     done
     if curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
         line "server" "running on port $PORT"

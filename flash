@@ -8,7 +8,7 @@
 #   ./flash opencode   print the OpenCode provider block for this server
 #
 # The other models ds4 runs go through the same launcher: ./flash models
-# lists them, ./flash pull NAME downloads one, --model FILE serves it.
+# lists them, ./flash pull NAME downloads one, ./flash serve NAME runs it.
 #
 # It works from a source checkout (it runs make when the binaries are
 # missing) and from the prebuilt package, where the binaries sit next to it.
@@ -41,11 +41,13 @@ usage: flash <command> [options]
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
-      --model FILE       serve another GGUF instead; the context defaults to
-                         32768 and nothing is tuned, pass the rest after --
+      NAME or FILE       serve another model instead: a GGUF path or a word
+                         from its file name (flash serve deepseek). The context
+                         defaults to 32768, a model larger than the RAM streams
+                         from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [--model FILE] [-- ARGS]
+  chat [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
   doctor                 check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
@@ -165,9 +167,30 @@ check_machine() {
 }
 
 # Absolute path of a model given by the user, so it survives the cd to $HERE.
+# Anything that is not a file is a name to look for: "deepseek" finds the one
+# main model GGUF with that word in its name under ./gguf or next to $MODELS.
 model_path() {
-    [ -f "$1" ] || die "no such model file: $1"
-    echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    local found n
+    if [ -f "$1" ] && [ "${1%.gguf}" != "$1" ]; then
+        echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+        return
+    fi
+    found=$(find "$HERE/gguf" "$(dirname "$MODELS")" -maxdepth 3 -iname "*$1*.gguf" 2>/dev/null |
+        grep -Eiv 'support|mmproj|mtp-block|encoder|vision\.gguf|-0*([2-9]|1[0-9])-of-' | sort -u)
+    n=$(printf '%s' "$found" | grep -c . || true)
+    [ "$n" != 0 ] || die "no model file or name matches: $1"
+    [ "$n" = 1 ] || die "several models match $1, give the file: $(printf '\n%s' "$found")"
+    echo "$found"
+}
+
+# A model larger than the RAM has to stream its experts from the SSD. Qwen
+# files are the exception: most of their size is the n-gram table, which
+# always stays on disk.
+needs_streaming() {
+    local gb
+    case $(basename "$1") in *[Qq]wen*) return 1 ;; esac
+    gb=$(( $(stat -L -f %z "$1") / 1073741824 ))
+    [ "$gb" -ge "$RAM_GB" ]
 }
 
 # Any other model ds4 supports. Nothing here is tuned: sizing the context
@@ -176,6 +199,14 @@ serve_other() {
     local model=$1 ctx=${2:-32768} dry=$3
     shift 3
     set -- -m "$model" --ctx "$ctx" --host "$HOST" --port "$PORT" "$@"
+    case " $* " in
+        *" --ssd-streaming "*) ;;
+        *) if needs_streaming "$model"; then
+               echo "flash: the model is larger than the RAM, streaming it from the SSD" >&2
+               export DS4_METAL_SELECTED_ID_POLL=${DS4_METAL_SELECTED_ID_POLL:-1}
+               set -- "$@" --ssd-streaming
+           fi ;;
+    esac
     if [ "$dry" = 1 ]; then
         echo "cd $HERE && caffeinate -i ./ds4-server $*"
         return
@@ -198,6 +229,8 @@ cmd_serve() {
             --dry-run) dry=1 ;;
             --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift ;;
             --) shift; break ;;
+            -*) die "serve: unknown option $1 (see: flash help)" ;;
+            *) model=$(model_path "$1") || exit 1 ;;
             *) die "serve: unknown option $1 (see: flash help)" ;;
         esac
         shift
@@ -264,15 +297,22 @@ cmd_serve() {
 
 cmd_chat() {
     local model=""
-    if [ "${1:-}" = --model ]; then
-        [ $# -ge 2 ] || die "--model needs a file"
-        model=$(model_path "$2") || exit 1
-        shift 2
-    fi
+    case ${1:-} in
+        --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift 2 ;;
+        ""|-*) ;;
+        *) model=$(model_path "$1") || exit 1; shift ;;
+    esac
     if [ "${1:-}" = -- ]; then shift; fi
     check_machine
     if [ -n "$model" ]; then
         ensure_binaries
+        case " $* " in
+            *" --ssd-streaming "*) ;;
+            *) if needs_streaming "$model"; then
+                   export DS4_METAL_SELECTED_ID_POLL=${DS4_METAL_SELECTED_ID_POLL:-1}
+                   set -- --ssd-streaming "$@"
+               fi ;;
+        esac
         cd "$HERE"
         exec ./ds4 -m "$model" "$@"
     fi

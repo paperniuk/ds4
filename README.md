@@ -170,19 +170,23 @@ unlocks the larger one. MTP and vision are on when their files are present.
 | `./flash opencode` | print the provider block for `~/.config/opencode/opencode.json` |
 | `./flash models` | list the other models ds4 runs |
 | `./flash pull NAME` | download one of them into `./gguf` |
-| `./flash serve --model FILE` | serve any other GGUF; also `./flash chat --model FILE` |
+| `./flash serve NAME` | serve another model by a word from its file name; also `./flash chat NAME` |
 
 The launcher is tuned for Flash-Next. The other models (DeepSeek V4 and V4.1
 Flash, GLM 5.2 and 5.3, the upstream Qwen3.8 files) run through it untuned:
 
 ```sh
-./flash models                                   # names and sizes
-./flash pull glm53-q2
-./flash serve --model gguf/GLM-5.3-Flash-Q2.gguf --ctx 65536 -- --mtp
+./flash models                  # names and sizes
+./flash pull ds4f-q2
+./flash serve deepseek          # or a path to the GGUF
+./flash chat deepseek
 ```
 
-With `--model` the context defaults to 32768 and is not checked against the
-memory of the machine, and everything after `--` goes to `ds4-server`
+The name is looked up in `./gguf` and next to `~/models/flash-next`. The
+context defaults to 32768 and is not checked against the memory of the
+machine. A model larger than the RAM is started with `--ssd-streaming`:
+DeepSeek V4 Flash Q2 runs at about 10 tokens per second on a 64 GB M1 Max
+that way. Everything after `--` goes to `ds4-server`
 unchanged. See [docs/MODELS.md](docs/MODELS.md) for what fits where.
 
 `FLASH_MODELS` changes the model directory, `PORT` and `HOST` the address.

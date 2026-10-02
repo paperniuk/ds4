@@ -2970,7 +2970,9 @@ static void ds4_gpu_detect_metal4_features(void) {
         }
 
         if (g_metal4_family_supported) {
+            /* DS4_METAL_FORCE_METAL4=1 tries the tensor path on older chips. */
             const int default_enable =
+                ds4_gpu_env_bool("DS4_METAL_FORCE_METAL4") > 0 ||
                 ds4_gpu_device_name_contains("M5") ||
                 ds4_gpu_device_name_contains("M6") ||
                 ds4_gpu_device_name_contains("A19") ||

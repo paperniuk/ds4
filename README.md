@@ -102,6 +102,18 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   inside the run to run noise. It is off by default.
 - **Vision in agent sessions**: up to 64 images per request, older ones are
   replaced by a short note instead of failing the request.
+- **n-gram read behind the first layer**: the sixteen table rows of a token
+  are uncached disk reads, 0.45 ms during which the GPU had nothing to do.
+  Only layer 1 needs them, so layer 0 is submitted first and the read runs
+  while it executes. MTP on code went from 46.8 to 47.7 tok/s, MTP on Russian
+  text from 43.5 to 44.2, plain decode from 36.5 to 36.6, with byte-identical
+  output.
+- **Faster sampler**: with the server defaults (temperature above 0, top-p 1,
+  min-p 0.05) picking a token took 1.34 ms of host time on the 248K
+  vocabulary, again with the GPU idle. It now takes 0.13 ms and returns the
+  same token for the same seed. That is 27.9 to 26.9 ms per token in plain
+  decode and 40.1 to 39.1 ms per two-token MTP cycle. Greedy decoding does
+  not use the sampler and does not change.
 
 Each change is a separate commit with a test.
 
@@ -144,6 +156,61 @@ DS4_QWEN_MTP_GGUF=~/models/flash-next/mtp/Qwen3.8-Flash-Next-MTP-block.gguf \
 
 Then point your agent at `http://127.0.0.1:8010/v1`. See
 [docs/CLIENTS.md](docs/CLIENTS.md) for OpenCode and Claude Code setup.
+
+After a `git pull`, run `make` and restart the server. There is nothing to
+switch on: the speedups listed above are the default path.
+
+### Longer contexts
+
+Pick the context, raise the wired limit to match, and add YaRN and a
+separate checkpoint directory above 262144:
+
+| `--ctx` | `iogpu.wired_limit_mb` | Extra settings |
+|---|---|---|
+| 131072 or less | default | none |
+| 262144 | 57344 | none |
+| 400000 | 57344 | YaRN 2, own KV directory |
+| 524288 | 61440 | YaRN 2, own KV directory |
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=61440
+
+M=~/models/flash-next/Q2_0
+DS4_QWEN4_YARN_FACTOR=2 \
+DS4_QWEN_NGRAM_GGUF=$M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+DS4_QWEN_MTP_GGUF=~/models/flash-next/mtp/Qwen3.8-Flash-Next-MTP-block.gguf \
+./ds4-server -m $M/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+    --ctx 524288 --prefill-chunk 2048 --mtp \
+    --kv-disk-dir ~/.ds4/server-kv-yarn2 --kv-disk-space-mb 40960 \
+    --kv-cache-continued-interval-tokens 32768 \
+    --host 127.0.0.1 --port 8010
+```
+
+Close other heavy applications first: at 524K the server holds about 56 GiB
+of the 64. Measured at `--ctx 400000`: a cold 346K token document takes
+about 22 minutes to read, a follow-up question in the same chat starts
+answering in about a second, and a new chat on the same document in about a
+minute and a half from the checkpoint.
+
+### Sampling
+
+Clients that send no sampling settings get temperature 1, top-p 1 and min-p
+0.05, which is the fast sampler path. A request with top-p below 1 takes
+about 0.9 ms of host time per token instead of 0.13. For reproducible output
+send `"temperature": 0` or a `seed`.
+
+### Switches for measuring
+
+| Variable | Effect |
+|---|---|
+| `DS4_QWEN4_NGRAM_FIRST=1` | read the n-gram rows before any GPU work, as before |
+| `DS4_QWEN4_TIMING=1` | print host and GPU time per forward call every 50 calls |
+| `DS4_QWEN4_SPEC_TIMING=1` | print the draft and verify time of the MTP cycle |
+| `DS4_METAL_ENCODER_TIMELINE=file` | write the GPU time of every dispatch (slows the run) |
+| `DS4_QWEN4_MTP_DRAFT_VOCAB=file` | draft with a reduced vocabulary head |
+
+Compare variants in alternating runs: on a Mac in use, tokens per second of
+a single run moves by 1 to 2 percent.
 
 ## Tips for agents
 

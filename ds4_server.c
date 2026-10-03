@@ -14078,12 +14078,13 @@ decode_again:
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        /* No continued checkpoints while generating: a store stops the stream
+         * for seconds (5 GiB written at 160K tokens of Qwen3.8), and with MTP
+         * the position often steps over the boundary, so it fired at random.
+         * Prefill still writes them, and an eviction persists the live state. */
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
-        }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;

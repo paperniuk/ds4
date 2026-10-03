@@ -37,7 +37,7 @@ cat <<MSG
 
 Installed in $DIR. Next:
 
-  dstar pull      # 67 GB: Qwen3.8-Flash-Next, the MTP block, the vision encoder
+  dstar pull      # 69 GB: Qwen3.8-Flash-Next, the MTP block, the vision encoder
   dstar serve     # server on http://127.0.0.1:8010/v1
   dstar opencode  # provider block for OpenCode
 

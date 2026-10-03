@@ -139,7 +139,7 @@ it prints the line to add. Then:
 
 ```sh
 dstar doctor     # what your Mac fits: memory, files, the context per quant
-dstar pull       # 67 GB: the model, the MTP block, the vision encoder
+dstar pull       # 69 GB: the model, the MTP block, the vision encoder
 dstar serve      # server on http://127.0.0.1:8010/v1
 dstar opencode   # provider block for OpenCode
 ```

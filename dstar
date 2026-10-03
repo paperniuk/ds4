@@ -115,8 +115,9 @@ locate_files() {
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
 }
 
-# Without --quant or DSTAR_QUANT: the fastest quant that is on disk, q2 when
-# nothing is, so a Mac that pulled only iq3s serves it with a plain "serve".
+# Without --quant or DSTAR_QUANT: the fastest quant that is on disk, so a
+# Mac that pulled only iq3s serves it with a plain "serve". When nothing is,
+# the one that suits the memory: q2 below 96 GB, iq3s, the best file, above.
 pick_quant() {
     local q
     [ -z "$QUANT" ] || return 0
@@ -125,6 +126,7 @@ pick_quant() {
         [ -f "$F_SHARD1" ] && return 0
     done
     QUANT=q2
+    [ $(( $(sysctl -n hw.memsize) / 1073741824 )) -lt 96 ] || QUANT=iq3s
 }
 
 ensure_binaries() {
@@ -482,6 +484,10 @@ cmd_doctor() {
         done
         line "quant $q" "$([ -n "$best" ] && echo "up to $best tokens" || echo "too large for $RAM_GB GB with room to spare")$([ -f "$F_SHARD1" ] && echo ", downloaded")"
     done
+    if [ "$RAM_GB" -ge 128 ]; then
+        line "larger file" "ds4's own Q4 answers better and fits $RAM_GB GB:"
+        line "" "dstar pull qwen38-q4k, then dstar serve Q4 -- --mtp"
+    fi
     other_models_on_disk "" | while read -r f; do
         line "other model" "$(basename "$f"), $(( $(stat -L -f %z "$f") / 1073741824 )) GiB$(needs_streaming "$f" && echo ", streamed from the SSD")"
     done

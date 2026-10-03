@@ -66,18 +66,21 @@ the weights must fit in memory: Q2_0 with a 32K context needs 42 GiB.
 
 ## Flash-Next speed on an M1 Max
 
-M1 Max, 32-core GPU, 64 GB, the Q2_0 file. Greedy decoding,
-`--prefill-chunk 2048`.
+M1 Max, 32-core GPU, 64 GB, the Q2_0 file. A prompt of C code with a
+300 token greedy answer, `--prefill-chunk 2048`:
 
 | Context | Decode | Decode with MTP | Prefill |
 |---|---|---|---|
-| 4K | 35.5 tok/s | 39 to 47 tok/s | ~290 tok/s |
-| 128K | 33.8 tok/s | 39 tok/s | ~270 tok/s |
-| 262K | 29.7 tok/s | 36.1 tok/s | ~269 tok/s |
+| 4K | 35.5 to 37.7 tok/s | 44 to 45 tok/s | ~355 tok/s |
+| 128K | 36.0 tok/s | 43.4 tok/s | ~345 tok/s |
+| 256K | 32.9 tok/s | 37.4 tok/s | ~290 to 320 tok/s |
 
-MTP gains depend on the text: about +30% on code, about +10% on prose.
-IQ3_XXS runs at about three quarters of this speed and IQ3_S a little below
-that.
+Prose is a little slower to prefill, about 280 to 320 tokens per second.
+MTP gains depend on the text: about +20 to 30% on code, about +10% on
+prose. In one chat grown to 398K tokens, MTP decode went from 44 to 35
+tokens per second and prefill from 328 to 292.
+IQ3_XXS runs at about 0.8 of this speed (35 to 31 tokens per second with
+MTP up to 259K) and IQ3_S a little below that.
 
 These are the only measured numbers so far. Newer chips have faster GPUs and
 run the same kernels, but nobody has timed them; if you do, the two commands

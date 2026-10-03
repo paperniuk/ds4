@@ -19,7 +19,9 @@ Decode and prefill are the speed at that depth of one pass over a 524K token
 document (`ds4-bench --teacher-forced-decode`, no MTP). The needles are 20
 one-line facts spread over the document, each asked for by name after a
 single prefill, with YaRN factor 2 (see `speed-bench/long_context_probe.c`).
-MTP and vision add about 2 GiB.
+MTP and vision add about 2 GiB. The prefill column predates the faster
+expert tiles of 2 October: a chat grown to 398K tokens with the current
+build prefills at 313 tokens per second at 256K and 292 at 398K.
 
 Prediction quality does not drop past the trained window: the tokens of the
 second half of that document score an average NLL of 0.265 at depths 262K to

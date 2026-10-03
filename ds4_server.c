@@ -836,6 +836,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
+    bool prompt_echoes_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
      * field is ignored on those code paths. */
@@ -3094,6 +3095,15 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* A client that sends earlier reasoning back will send this turn's back too. */
+static bool chat_history_echoes_reasoning(const chat_msgs *msgs) {
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant") && m->reasoning && m->reasoning[0]) return true;
+    }
+    return false;
+}
+
 static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
@@ -4313,6 +4323,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_echoes_reasoning = chat_history_echoes_reasoning(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -4540,6 +4551,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_echoes_reasoning = chat_history_echoes_reasoning(&msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
@@ -5569,6 +5581,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_echoes_reasoning = chat_history_echoes_reasoning(&msgs);
     responses_prepare_live_continuation(s, r, &msgs);
     r->prompt_text = render_chat_prompt_text_for_syntax(
         r->model_syntax, &msgs, active_tool_schemas,
@@ -13058,6 +13071,13 @@ static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *s
                                                      inside_thinking, content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
+    /* The visible key renders this turn with an empty think block.  A client
+     * that echoes reasoning (OpenCode) replays it inside the block, so its next
+     * request never matches that key on disk: key the eviction store by the
+     * sampled text instead, which is what such a client renders. */
+    pthread_mutex_lock(&s->tool_mu);
+    slot->thinking_live.token_text_disk_key = j->req.prompt_echoes_reasoning;
+    pthread_mutex_unlock(&s->tool_mu);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(slot->session),

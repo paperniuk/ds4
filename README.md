@@ -119,34 +119,44 @@ GPU by up to 45%: run it on a quiet machine. With 32 GB it is not usable,
   table is read from disk on every token.
 - For Flash-Next contexts above 131K on 64 GB, a higher GPU memory limit,
   see [above](#qwen38-flash-next-which-quant-for-your-mac).
+- 32 and 48 GB Macs are planned but not supported yet. Until then my
+  [Splash M1 port](https://github.com/paperniuk/splash) with Qwen3.8-27B
+  (21 GB) is the better choice there.
 
 ## Quick start
 
-Prebuilt binaries, macOS 15 or newer, nothing to compile:
+The prebuilt release ([dstar 1.0](https://github.com/paperniuk/ds4/releases/latest)),
+macOS 15 or newer, nothing to compile:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
-cd ~/dstar
 ```
 
-Or from source:
+It checks the download against its SHA-256, unpacks it into `~/dstar`
+(`DSTAR_DIR` to change) and links the launcher into `~/.local/bin`, so
+`dstar` works from any directory. If `~/.local/bin` is not on your `PATH`,
+it prints the line to add. Then:
 
 ```sh
-git clone https://github.com/paperniuk/ds4.git
-cd ds4 && make
-```
-
-Then, from any directory:
-
-```sh
-dstar pull       # 69 GB: the model, the MTP block, the vision encoder
+dstar doctor     # what your Mac fits: memory, files, the context per quant
+dstar pull       # 67 GB: the model, the MTP block, the vision encoder
 dstar serve      # server on http://127.0.0.1:8010/v1
 dstar opencode   # provider block for OpenCode
 ```
 
-The installer links the launcher into `~/.local/bin`. After a source build
-run `./dstar link` once to do the same, or keep calling it as `./dstar`. If
-`~/.local/bin` is not on your `PATH`, `dstar link` prints the line to add.
+Running the installer again updates to the latest release; the models stay
+where they are.
+
+Or build from source and run the launcher from the repository folder:
+
+```sh
+git clone https://github.com/paperniuk/ds4.git
+cd ds4 && make
+./dstar doctor   # the same commands, as ./dstar
+```
+
+`./dstar link` puts that copy on your `PATH` instead, if you prefer it to
+the release.
 
 `dstar serve` picks the context for you: the full 262K when the memory of
 the machine and the GPU memory limit allow it, a smaller one otherwise, and

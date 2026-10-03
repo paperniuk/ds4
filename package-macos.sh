@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the prebuilt macOS package for Qwen3.8-Flash-Next: the binaries, the
-# Metal shaders they load at start and the dstar launcher, in one tarball.
+# Build the prebuilt macOS package: the binaries, the Metal shaders they load
+# at start and the dstar launcher, in one tarball.
 #
 #   ./package-macos.sh [output directory]
 #
@@ -10,7 +10,7 @@
 set -e
 ROOT=$(cd "$(dirname "$0")" && pwd)
 OUT=${1:-$ROOT/dist}
-NAME=ds4-flash-next
+NAME=dstar
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 

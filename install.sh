@@ -1,14 +1,14 @@
 #!/bin/bash
-# Install the prebuilt Qwen3.8-Flash-Next package for Apple Silicon Macs:
+# Install the prebuilt dstar package (ds4 and its launcher) for Apple Silicon Macs:
 #
 #   curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
 #
-# It unpacks the latest release into ~/ds4-flash-next (DSTAR_DIR to change),
+# It unpacks the latest release into ~/dstar (DSTAR_DIR to change),
 # links the launcher into ~/.local/bin (DSTAR_BIN to change) and downloads
 # nothing else; `dstar pull` fetches the model.
 set -e
-DIR=${DSTAR_DIR:-$HOME/ds4-flash-next}
-URL=https://github.com/paperniuk/ds4/releases/latest/download/ds4-flash-next-macos-arm64.tar.gz
+DIR=${DSTAR_DIR:-$HOME/dstar}
+URL=https://github.com/paperniuk/ds4/releases/latest/download/dstar-macos-arm64.tar.gz
 
 if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
     echo "install: this package is for Apple Silicon Macs" >&2
@@ -37,7 +37,7 @@ cat <<MSG
 
 Installed in $DIR. Next:
 
-  dstar pull      # 69 GB: the model, the MTP block, the vision encoder
+  dstar pull      # 67 GB: Qwen3.8-Flash-Next, the MTP block, the vision encoder
   dstar serve     # server on http://127.0.0.1:8010/v1
   dstar opencode  # provider block for OpenCode
 

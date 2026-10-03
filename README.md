@@ -126,7 +126,7 @@ Prebuilt binaries, macOS 15 or newer, nothing to compile:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/paperniuk/ds4/m1-flash-next/install.sh | bash
-cd ~/ds4-flash-next
+cd ~/dstar
 ```
 
 Or from source:

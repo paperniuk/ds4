@@ -11788,17 +11788,30 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
 
     /* The live transcript went past what the client replays (a retried or
      * cancelled turn, or a different spelling of the last reply), but the
-     * prompt still agrees with it up to the anchor of an earlier prompt. */
-    if (ptext && req->image_count == 0 && slot->anchor_text &&
-        slot->anchor_pos > 0 && slot->anchor_pos <= live_pos &&
-        ds4_session_anchor_pos(slot->session) == slot->anchor_pos &&
-        slot->anchor_text_len < plen &&
-        byte_prefix_match(ptext, plen, slot->anchor_text, slot->anchor_text_len))
-    {
-        pr.kind = REUSE_PROMPT_ANCHOR;
-        pr.reuse_tokens = slot->anchor_pos;
-        pr.suffix_off = slot->anchor_text_len;
-        return pr;
+     * prompt still agrees with it up to the anchor of an earlier prompt.
+     *
+     * Image-conditioned sessions used to be excluded from this tier, which
+     * made every turn of a vision agent loop fall back to a cold prefill: the
+     * anchor's rendered text contains vision placeholder tokens, so it can
+     * never be a byte prefix of a request that renders the same image as a
+     * marker.  The exact token prefix is the right key there, and it is
+     * stronger: it proves the retained rows and the retained image spans are
+     * the ones the request reproduces. */
+    if (slot->anchor_pos > 0 && slot->anchor_pos <= live_pos &&
+        ds4_session_anchor_pos(slot->session) == slot->anchor_pos) {
+        const bool text_key = req->image_count == 0 && ptext && slot->anchor_text &&
+                              slot->anchor_text_len < plen &&
+                              byte_prefix_match(ptext, plen, slot->anchor_text,
+                                                slot->anchor_text_len);
+        const bool token_key = req->image_count != 0 &&
+                               common >= slot->anchor_pos &&
+                               req->prompt.len > slot->anchor_pos;
+        if (text_key || token_key) {
+            pr.kind = REUSE_PROMPT_ANCHOR;
+            pr.reuse_tokens = slot->anchor_pos;
+            pr.suffix_off = text_key ? slot->anchor_text_len : 0;
+            return pr;
+        }
     }
 
     return pr;
@@ -11852,19 +11865,42 @@ static void slot_refresh_live_text(server *s, server_slot *slot) {
 /* A Qwen3.8 prompt anchor sits on the last turn marker the prefill will
  * reach, just before the assistant header the client appended: whatever a
  * later request renders after it, the transcript up to it stays the same.
- * Returns -1 when the prompt has no marker past the prefill start. */
-static int prompt_anchor_split(server *s, const ds4_tokens *prompt, int start) {
+ * Returns -1 when the prompt has no marker past the prefill start.
+ *
+ * With images the anchor must sit past the end of every vision span: the
+ * anchor only captures the recurrent (GDN/PLE/mrope-delta) state, while the
+ * image-conditioned attention rows live in the append-only raw window.  A
+ * split inside an image span would leave half of the image rows written and
+ * the head sync would reject a span that does not fit inside the head. */
+static int prompt_anchor_split(server *s, const ds4_tokens *prompt, int start,
+                               const ds4_vision_span *images, size_t image_count) {
     const int marker = ds4_token_turn_start(s->engine);
     if (marker < 0 || !prompt || prompt->len < PROMPT_ANCHOR_MIN_TOKENS) return -1;
+    if (image_count && !images) return -1;
+    uint64_t last_image_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const uint64_t end = (uint64_t)images[i].token_start +
+                             images[i].embedding.token_count;
+        if (end > last_image_end) last_image_end = end;
+    }
     for (int i = prompt->len - 1; i >= start && i >= PROMPT_ANCHOR_MIN_TOKENS; i--) {
-        if (prompt->v[i] == marker) return i;
+        if (prompt->v[i] != marker) continue;
+        if ((uint64_t)i < last_image_end) continue;
+        return i;
     }
     return -1;
 }
 
 /* Called with the session at prompt[0, pos).  The anchor text must be a byte
  * prefix of the request's rendered prompt, so live tiers that keep reasoning
- * the client did not replay never leave an anchor behind. */
+ * the client did not replay never leave an anchor behind.
+ *
+ * A multimodal head cannot be keyed by text at all: the checkpoint renders an
+ * image span as vision placeholder tokens while the client renders the same
+ * image as a request marker, so the two strings differ at the image no matter
+ * how identical the rest of the transcript is.  For those sessions the anchor
+ * keeps only its position, and the reuse probe validates it with an exact
+ * token prefix instead of a byte prefix. */
 static void slot_save_prompt_anchor(server *s, server_slot *slot,
                                     const request *req,
                                     const ds4_tokens *prompt, int pos) {
@@ -11875,7 +11911,9 @@ static void slot_save_prompt_anchor(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     const bool saved = ds4_session_anchor_save(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
-    if (!saved || !req->prompt_text) return;
+    if (!saved) return;
+    slot->anchor_pos = pos;
+    if (!req->prompt_text || req->image_count != 0) return;
     ds4_tokens head = *prompt;
     head.len = pos;
     size_t len = 0;
@@ -13690,21 +13728,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_lock(&s->inference_mu);
         const bool restored = ds4_session_anchor_restore(slot->session);
         pthread_mutex_unlock(&s->inference_mu);
-        if (!restored ||
-            !build_live_prompt_suffix(s, slot, &j->req,
-                                      j->req.prompt_text + reuse.suffix_off,
-                                      &effective_prompt)) {
+        if (!restored) {
             cached = 0;
             cache_source = "none";
             break;
         }
+        if (multimodal) {
+            /* The anchor tier proved that the request's canonical tokens
+             * reproduce the retained checkpoint exactly up to the anchor, so
+             * the canonical prompt is already the effective prompt: nothing
+             * needs re-tokenizing, and the image spans keep the positions the
+             * live session was conditioned on. */
+            prompt_for_sync = &j->req.prompt;
+        } else if (!build_live_prompt_suffix(s, slot, &j->req,
+                                            j->req.prompt_text + reuse.suffix_off,
+                                            &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        } else {
+            prompt_for_sync = &effective_prompt;
+        }
         live_materialized = true;
         cache_source = "prompt-anchor";
         cache_diag.rewind_to = reuse.reuse_tokens;
-        prompt_for_sync = &effective_prompt;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: rewound live kv to prompt anchor %d (live %d, prompt %d)",
-                   reuse.reuse_tokens, old_pos, effective_prompt.len);
+                   reuse.reuse_tokens, old_pos, prompt_for_sync->len);
         break;
     }
     case REUSE_NONE:
@@ -13905,18 +13955,27 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     int prompt_sync_rc = 0;
-    if (!multimodal) {
-        /* Stop the prefill at the prompt anchor to save the state there. */
+    {
+        /* Stop the prefill at the prompt anchor to save the state there.
+         * Vision sessions need this most: their recurrent (GDN/PLE) state
+         * cannot be truncated in place, so without an anchor every request
+         * whose replay diverges from the sampled tokens anywhere in the
+         * history is rebuilt from token zero. */
         pthread_mutex_lock(&s->inference_mu);
         int start = ds4_session_pos(slot->session);
         if (ds4_session_common_prefix(slot->session, prompt_for_sync) != start) start = 0;
         const int held = ds4_session_anchor_pos(slot->session);
         pthread_mutex_unlock(&s->inference_mu);
-        const int split = prompt_anchor_split(s, prompt_for_sync, start);
+        const int split = prompt_anchor_split(s, prompt_for_sync, start,
+                                             multimodal ? j->req.images : NULL,
+                                             multimodal ? j->req.image_count : 0);
         if (split > start) {
             ds4_tokens head = *prompt_for_sync;
             head.len = split;
-            prompt_sync_rc = server_session_sync(s, slot, &head, err, sizeof(err));
+            prompt_sync_rc = multimodal ?
+                server_session_sync_multimodal(s, slot, &head, j->req.images,
+                                               j->req.image_count, err, sizeof(err)) :
+                server_session_sync(s, slot, &head, err, sizeof(err));
             if (prompt_sync_rc == 0)
                 slot_save_prompt_anchor(s, slot, &j->req, prompt_for_sync, split);
         } else if (split == start && held != split) {

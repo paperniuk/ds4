@@ -5417,3 +5417,110 @@ kernel void kernel_qwen4_q8_concat(
     if (group.x < first) kernel_mul_mv_q8_0_f32_impl<2, constant ds4_metal_args_mul_mv &>(a, wa, x, oa, shared, group, lane, sg);
     else { group.x -= first; kernel_mul_mv_q8_0_f32_impl<2, constant ds4_metal_args_mul_mv &>(b, wb, x, ob, shared, group, lane, sg); }
 }
+
+/* Neural Engine projection (experimental): fp32 rows to the ANE's fp16 input
+ * surface, and its fp16 output rows back to fp32 times each column's weight
+ * scale.  a = { width, rows, surface stride in halfs, ld, col0, gpu_cols }. */
+kernel void kernel_ane_pack_f16(
+        device const float *x [[buffer(0)]],
+        device half        *y [[buffer(1)]],
+        constant uint      *a [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a[0] || gid.y >= a[1]) return;
+    const float v = x[(ulong)gid.y * a[0] + gid.x];
+    y[(ulong)gid.y * a[2] + gid.x] = (half)clamp(v, -65504.0f, 65504.0f);
+}
+
+kernel void kernel_ane_unpack_f32(
+        device const half  *y      [[buffer(0)]],
+        device float       *out    [[buffer(1)]],
+        device const float *scale  [[buffer(2)]],
+        constant uint      *a      [[buffer(4)]],
+        device atomic_uint *status [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a[0] || gid.y >= a[1]) return;
+    const float v = (float)y[(ulong)gid.y * a[2] + gid.x];
+    if (!isfinite(v)) atomic_store_explicit(status, 1u, memory_order_relaxed);
+    out[(ulong)gid.y * a[3] + a[4] + gid.x] = v * scale[gid.x];
+}
+
+/* One pass over a split projection's rows: the GPU's leading columns from
+ * its own output, the ANE's from its surface. */
+kernel void kernel_ane_join_f32(
+        device const half  *y     [[buffer(0)]],
+        device float       *out   [[buffer(1)]],
+        device const float *scale [[buffer(2)]],
+        device const float *gpu   [[buffer(3)]],
+        constant uint      *a     [[buffer(4)]],
+        device atomic_uint *status [[buffer(5)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a[3] || gid.y >= a[1]) return;
+    const ulong o = (ulong)gid.y * a[3] + gid.x;
+    if (gid.x < a[5]) {
+        out[o] = gpu[(ulong)gid.y * a[5] + gid.x];
+    } else if (gid.x >= a[4] && gid.x < a[4] + a[0]) {
+        const uint n = gid.x - a[4];
+        const float v = (float)y[(ulong)gid.y * a[2] + n];
+        if (!isfinite(v)) atomic_store_explicit(status, 1u, memory_order_relaxed);
+        out[o] = v * scale[n];
+    }
+}
+
+/* Stages `rows` rows of a quantized weight of K columns for the Neural
+ * Engine, 16 weights per thread through the type's dequantizer:
+ * a = { K, rows, row bytes, surface stride in bytes, mode }.  Mode 0
+ * writes int8 against each row's scale (s[row] / 128, the factor the
+ * unpack applies), 1 writes fp16, 2 folds |w| into the row maxima s, kept
+ * as float bits. */
+template <typename block_t, short nl, void (*deq)(device const block_t *, short, thread float4x4 &)>
+kernel void kernel_ane_stage(
+        device const char *w [[buffer(0)]],
+        device char       *y [[buffer(1)]],
+        device float      *s [[buffer(2)]],
+        constant uint     *a [[buffer(4)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= a[0] / 16u || gid.y >= a[1]) return;
+    device const block_t *xb = (device const block_t *)(w + (ulong)gid.y * a[2]) + gid.x / nl;
+    float4x4 v;
+    deq(xb, (short)(gid.x % nl), v);
+    if (a[4] == 2u) {
+        float m = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            const float4 f = fabs(v[i]);
+            m = max(m, max(max(f.x, f.y), max(f.z, f.w)));
+        }
+        atomic_fetch_max_explicit((device atomic_uint *)s + gid.y, as_type<uint>(m), memory_order_relaxed);
+        return;
+    }
+    device char *row = y + (ulong)gid.y * a[3];
+    if (a[4] == 1u) {
+        device half4 *o = (device half4 *)(row + gid.x * 32u);
+        for (int i = 0; i < 4; i++) o[i] = half4(clamp(v[i], -65504.0f, 65504.0f));
+        return;
+    }
+    const float inv = 128.0f / s[gid.y];
+    device char4 *o = (device char4 *)(row + gid.x * 16u);
+    for (int i = 0; i < 4; i++) o[i] = char4(clamp(rint(v[i] * inv), -127.0f, 127.0f));
+}
+
+typedef decltype(kernel_ane_stage<block_q8_0, 2, dequantize_q8_0>) ane_stage_t;
+#define DS4_ANE_STAGE(name, block_t, nl, deq) \
+template [[host_name("kernel_ane_stage_" #name)]] kernel ane_stage_t kernel_ane_stage<block_t, nl, deq>;
+DS4_ANE_STAGE(f32,     float4x4,             1,  dequantize_f32)
+DS4_ANE_STAGE(f16,     half4x4,              1,  dequantize_f16)
+DS4_ANE_STAGE(q8_0,    block_q8_0,           2,  dequantize_q8_0)
+DS4_ANE_STAGE(q4_0,    ds4_dense_block_q4_0, 2,  dequantize_dense_q4_0)
+DS4_ANE_STAGE(q4_K,    ds4_dense_block_q4_K, 16, dequantize_dense_q4_K)
+DS4_ANE_STAGE(q2_0,    block_q2_0,           4,  ds4q_dequantize_q2_0)
+DS4_ANE_STAGE(q5_0,    block_q5_0,           2,  ds4q_dequantize_q5_0)
+DS4_ANE_STAGE(iq4_nl,  block_iq4_nl,         2,  ds4q_dequantize_iq4_nl)
+DS4_ANE_STAGE(q3_K,    block_q3_K,           16, ds4q_dequantize_q3_K)
+DS4_ANE_STAGE(q5_K,    block_q5_K,           16, dequantize_q5_K)
+DS4_ANE_STAGE(q6_K,    block_q6_K,           16, dequantize_q6_K)
+DS4_ANE_STAGE(iq4_xs,  block_iq4_xs,         16, ds4q_dequantize_iq4_xs)
+DS4_ANE_STAGE(iq2_xs,  block_iq2_xs,         16, ds4q_dequantize_iq2_xs)
+DS4_ANE_STAGE(iq2_s,   block_iq2_s,          16, ds4q_dequantize_iq2_s)
+DS4_ANE_STAGE(iq3_xxs, block_iq3_xxs,        16, ds4q_dequantize_iq3_xxs)
+DS4_ANE_STAGE(iq3_s,   block_iq3_s,          16, ds4q_dequantize_iq3_s)
+DS4_ANE_STAGE(bf16,    ds4q_bf16x16,         1,  ds4q_dequantize_bf16)
+#undef DS4_ANE_STAGE

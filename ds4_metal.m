@@ -16,6 +16,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
@@ -50877,4 +50878,584 @@ int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor
     }
     return qwen4_dispatch(QWEN4_K_HC_MIX_ROWS, &args, sizeof(args), b, 3,
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* ------------------------------------------------------------------------
+ * Neural Engine projections for the prefill (ds4.c's DS4_ANE).
+ *
+ * A projection program multiplies a token-major fp16 input [R][K] by an
+ * int8 weight [N][K] with a per-row scale into a token-major fp16 output
+ * [R][N]; an FFN program runs a SwiGLU with fp16 weights.  Each holds one
+ * weight surface, which the GPU stages from the model's quantized rows
+ * before every evaluation.  The GPU packs its fp32 input into the input
+ * surface and signals a shared event; the ANE evaluation waits on it, runs,
+ * and signals the next value, which the GPU waits on before it unpacks the
+ * output.  Uses the private AppleNeuralEngine client (the Core ML service),
+ * as Splash does.
+ * ------------------------------------------------------------------------ */
+#import <IOSurface/IOSurface.h>
+#include <dlfcn.h>
+
+@protocol DS4AneModel
++ (id)modelAtURL:(NSURL *)url key:(NSString *)key;
+- (NSDictionary *)modelAttributes;
+@end
+@protocol DS4AneClient
++ (id)sharedConnection;
+- (BOOL)compileModel:(id)model options:(NSDictionary *)options qos:(unsigned)qos error:(NSError **)error;
+- (BOOL)compiledModelExistsFor:(id)model;
+- (void)purgeCompiledModel:(id)model;
+- (BOOL)loadModel:(id)model options:(NSDictionary *)options qos:(unsigned)qos error:(NSError **)error;
+- (BOOL)evaluateWithModel:(id)model options:(NSDictionary *)options request:(id)request qos:(unsigned)qos
+                    error:(NSError **)error;
+@end
+@protocol DS4AneSurface
++ (id)objectWithIOSurface:(IOSurfaceRef)surface;
+@end
+@protocol DS4AneRequest
++ (id)requestWithInputs:(NSArray *)inputs inputIndices:(NSArray *)inputIndices outputs:(NSArray *)outputs
+          outputIndices:(NSArray *)outputIndices weightsBuffer:(id)weights perfStats:(id)stats
+         procedureIndex:(NSNumber *)procedure sharedEvents:(id)events transactionHandle:(NSNumber *)transaction;
+- (void)setCompletionHandler:(void (^)(BOOL success, NSError *error))handler;
+@end
+@protocol DS4AneEvents
++ (id)waitEventWithValue:(uint64_t)value sharedEvent:(id)event eventType:(uint64_t)type;
++ (id)signalEventWithValue:(uint64_t)value symbolIndex:(unsigned)symbol eventType:(int64_t)type sharedEvent:(id)event;
++ (id)sharedEventsWithSignalEvents:(NSArray *)signals waitEvents:(NSArray *)waits;
+@end
+
+typedef struct {
+    IOSurfaceRef surface;
+    id object;              /* the service's wrapper */
+    id<MTLBuffer> buffer;   /* Metal's view of the same memory */
+    uint32_t stride;        /* bytes per row */
+} ds4_ane_surface;
+
+typedef struct {
+    id model;
+    /* one function per row bucket, all over the same surfaces */
+    uint32_t n_proc, proc_rows[8];
+    NSNumber *proc_id[8];
+    NSArray *proc_in[8], *proc_out[8], *proc_names[8];
+    int kind;               /* 0: y = x W^T, int8 W; 1: y = down(silu(x G^T) * x U^T), fp16 */
+    uint32_t K, N, R, F, n_slots, n_w;
+    ds4_ane_surface x, y;
+    ds4_ane_surface w[3];   /* n_w weight surfaces, staged per slot by the GPU */
+    id<MTLBuffer> scales;   /* n_slots * N floats */
+    uint64_t pending_done;  /* value the GPU waits on before unpacking */
+} ds4_ane_prog;
+
+#define DS4_ANE_MAX_PROGS 16
+#define DS4_ANE_RING 4096u
+/* How long an evaluation may run once the GPU signalled its input ready:
+ * one takes 2-60 ms, and Metal fails a command buffer whose wait stays unmet
+ * for about 5 s. */
+#define DS4_ANE_TIMEOUT_NS (2ull * NSEC_PER_SEC)
+static struct {
+    int resolved;
+    id<DS4AneClient> client;
+    Class<DS4AneModel> model_class;
+    Class<DS4AneSurface> surface_class;
+    Class<DS4AneRequest> request_class;
+    Class<DS4AneEvents> events_class, signal_class, wait_class;
+    ds4_ane_prog prog[DS4_ANE_MAX_PROGS];
+    int n_prog;
+    id<MTLSharedEvent> event;
+    uint64_t seq, last_ready;
+    _Atomic int failed;
+    uint64_t evals;                    /* queued */
+    _Atomic uint64_t completed;        /* finished, failed or timed out */
+    _Atomic uint64_t ring[DS4_ANE_RING];   /* done value of each finished evaluation */
+    id<MTLBuffer> status;              /* set by the unpack on non-finite rows */
+    MTLSharedEventListener *listener;
+    dispatch_queue_t queue;
+    id<MTLCommandBuffer> measure_cb;   /* row maxima of the int8 weights, run once */
+} g_ane;
+
+static int ds4_ane_make_surface(ds4_ane_surface *s, uint32_t rows, uint32_t width, uint32_t eb) {
+    const uint32_t stride = (width * eb + 63u) / 64u * 64u;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t size = ((uint64_t)stride * rows + page - 1u) / page * page;
+    NSDictionary *p = @{
+        (id)kIOSurfaceWidth : @(width), (id)kIOSurfaceHeight : @(rows),
+        (id)kIOSurfaceBytesPerElement : @(eb), (id)kIOSurfaceBytesPerRow : @(stride),
+        (id)kIOSurfaceAllocSize : @(size),
+        (id)kIOSurfacePixelFormat : @(eb == 1 ? 0x4c303038 : 0x4c303068),
+    };
+    s->surface = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+    if (!s->surface || IOSurfaceGetBytesPerRow(s->surface) != stride) return 0;
+    s->stride = stride;
+    s->object = [g_ane.surface_class objectWithIOSurface:s->surface];
+    s->buffer = [g_device newBufferWithBytesNoCopy:IOSurfaceGetBaseAddress(s->surface)
+                                            length:(NSUInteger)size
+                                           options:MTLResourceStorageModeShared
+                                       deallocator:nil];
+    return s->object && s->buffer;
+}
+
+static NSString *ds4_ane_dims(uint64_t r, uint64_t w) {
+    return [NSString stringWithFormat:@"[1, 1, %llu, %llu]", (unsigned long long)r, (unsigned long long)w];
+}
+
+static NSString *ds4_ane_buffer_type(const ds4_ane_surface *s, uint32_t eb, uint32_t rows, uint32_t width) {
+    const uint64_t st = s->stride / eb, plane = (uint64_t)rows * st;
+    return [NSString stringWithFormat:@"tensor_buffer<%s, shape=%@, strides=[%llu, %llu, %llu, 1], interleave_factors=[1, 1, 1, 1]>",
+            eb == 1 ? "int8" : "fp16", ds4_ane_dims(rows, width),
+            (unsigned long long)plane, (unsigned long long)plane, (unsigned long long)st];
+}
+
+static int ds4_ane_resolve(void) {
+    if (g_ane.resolved) return g_ane.resolved > 0;
+    g_ane.resolved = -1;
+    if (!dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW)) {
+        fprintf(stderr, "ds4: ANE: AppleNeuralEngine does not load\n");
+        return 0;
+    }
+    g_ane.client = [(Class<DS4AneClient>)NSClassFromString(@"_ANEClient") sharedConnection];
+    g_ane.model_class = NSClassFromString(@"_ANEModel");
+    g_ane.surface_class = NSClassFromString(@"_ANEIOSurfaceObject");
+    g_ane.request_class = NSClassFromString(@"_ANERequest");
+    g_ane.events_class = NSClassFromString(@"_ANESharedEvents");
+    g_ane.signal_class = NSClassFromString(@"_ANESharedSignalEvent");
+    g_ane.wait_class = NSClassFromString(@"_ANESharedWaitEvent");
+    if (!g_ane.client || !g_ane.model_class || !g_ane.surface_class || !g_ane.request_class ||
+        !g_ane.events_class || !g_ane.signal_class || !g_ane.wait_class) {
+        fprintf(stderr, "ds4: ANE: private interface missing\n");
+        return 0;
+    }
+    g_ane.event = [g_device newSharedEvent];
+    g_ane.status = [g_device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    g_ane.queue = dispatch_queue_create("ds4.ane", DISPATCH_QUEUE_SERIAL);
+    g_ane.listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:g_ane.queue];
+    if (!g_ane.event || !g_ane.status || !g_ane.listener) return 0;
+    *(uint32_t *)[g_ane.status contents] = 0;
+    g_ane.resolved = 1;
+    return 1;
+}
+
+/* Writes path only when it does not already hold these bytes: the service
+ * keys its compilation by the directory, and a rewrite can strand it. */
+static void ds4_ane_write_if_changed(NSString *path, NSData *data) {
+    NSData *old = [NSData dataWithContentsOfFile:path];
+    if (!old || ![old isEqualToData:data]) [data writeToFile:path atomically:YES];
+}
+
+static int ds4_ane_load(ds4_ane_prog *p, NSString *mil, NSString *tag) {
+    /* the service caches its compilation by this directory: keep it */
+    const char *cache = getenv("DS4_ANE_CACHE_DIR");
+    NSString *root = cache && cache[0] ? @(cache) :
+        [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+            stringByAppendingPathComponent:@"ds4"];
+    NSString *dir = [root stringByAppendingPathComponent:[@"ane-" stringByAppendingString:tag]];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    uint8_t blob[128] = {0};
+    blob[0] = 1; blob[4] = 2;
+    ds4_ane_write_if_changed([dir stringByAppendingPathComponent:@"model.mil"], [mil dataUsingEncoding:NSUTF8StringEncoding]);
+    ds4_ane_write_if_changed([dir stringByAppendingPathComponent:@"weights.bin"], [NSData dataWithBytes:blob length:sizeof blob]);
+    p->model = [g_ane.model_class modelAtURL:[NSURL fileURLWithPath:dir isDirectory:YES]
+                                         key:[@"ds4-ane-" stringByAppendingString:tag]];
+    NSDictionary *copts = @{@"kANEFModelType" : @"kANEFModelMIL", @"kANEFNetPlistFilenameKey" : @"model.mil"};
+    NSError *err = nil;
+    if (![g_ane.client compiledModelExistsFor:p->model] &&
+        ![g_ane.client compileModel:p->model options:copts qos:21 error:&err]) {
+        fprintf(stderr, "ds4: ANE: compile failed: %s\n", err.description.UTF8String);
+        return 0;
+    }
+    if (![g_ane.client loadModel:p->model options:@{} qos:21 error:&err]) {
+        err = nil;
+        [g_ane.client purgeCompiledModel:p->model];
+        if (![g_ane.client compileModel:p->model options:copts qos:21 error:&err] ||
+            ![g_ane.client loadModel:p->model options:@{} qos:21 error:&err]) {
+            fprintf(stderr, "ds4: ANE: load failed: %s\n", err.description.UTF8String);
+            return 0;
+        }
+    }
+    NSDictionary *desc = [p->model modelAttributes][@"ANEFModelDescription"];
+    NSDictionary *ids = desc[@"kANEFModelProcedureNameToIDMapKey"];
+    NSArray *procs = desc[@"ANEFModelProcedures"];
+    NSArray *syms = desc[@"kANEFModelInputSymbolsArrayKey"];
+    for (uint32_t k = 0; k < p->n_proc; k++) {
+        NSNumber *pid = ids[[NSString stringWithFormat:@"r%u", p->proc_rows[k]]];
+        NSDictionary *entry = nil;
+        for (NSDictionary *e in procs) if (pid && [e[@"ANEFModelProcedureID"] isEqual:pid]) entry = e;
+        if (!entry) {
+            fprintf(stderr, "ds4: ANE: program %s has no function r%u\n", tag.UTF8String, p->proc_rows[k]);
+            return 0;
+        }
+        p->proc_id[k] = pid;
+        p->proc_in[k] = entry[@"ANEFModelInputSymbolIndexArray"];
+        p->proc_out[k] = entry[@"ANEFModelOutputSymbolIndexArray"];
+        NSMutableArray *names = [NSMutableArray array];
+        for (NSNumber *x in p->proc_in[k]) [names addObject:syms[x.unsignedIntValue]];
+        p->proc_names[k] = names;
+        if (p->proc_out[k].count != 1) return 0;
+    }
+    return 1;
+}
+
+/* Row buckets: a chunk of T rows runs the smallest function that holds it,
+ * over the leading rows of the same surfaces. */
+static void ds4_ane_set_buckets(ds4_ane_prog *p, uint32_t R) {
+    p->n_proc = 0;
+    for (uint32_t r = 512; r < R && p->n_proc < 7; r += 512) p->proc_rows[p->n_proc++] = r;
+    p->proc_rows[p->n_proc++] = R;
+}
+
+/* A projection K -> N over R token rows with int8 weight rows, whose row
+ * scales (n_slots sets of N) the unpack applies. */
+int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_ane_resolve() || g_ane.n_prog >= DS4_ANE_MAX_PROGS) return -1;
+    @autoreleasepool {
+        ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
+        p->K = K; p->N = N; p->R = R; p->n_slots = n_slots;
+        if (!ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, N, 2)) {
+            fprintf(stderr, "ds4: ANE: surface allocation failed\n");
+            return -1;
+        }
+        p->n_w = 1;
+        if (!ds4_ane_make_surface(&p->w[0], N, K, 1)) {
+            fprintf(stderr, "ds4: ANE: weight surface allocation failed\n");
+            return -1;
+        }
+        p->scales = [g_device newBufferWithLength:(NSUInteger)n_slots * N * sizeof(float)
+                                          options:MTLResourceStorageModeShared];
+        if (!p->scales) return -1;
+        memset([p->scales contents], 0, (size_t)n_slots * N * sizeof(float));
+
+        ds4_ane_set_buckets(p, R);
+        NSMutableString *mil = [NSMutableString stringWithString:@"program(1.3)\n{\n"];
+        for (uint32_t b = 0; b < p->n_proc; b++) {
+            const uint32_t r = p->proc_rows[b];
+            [mil appendFormat:@"    func r%u<ios18>(%@ x, %@ w) {\n", r,
+                ds4_ane_buffer_type(&p->x, 2, r, K), ds4_ane_buffer_type(&p->w[0], 1, N, K)];
+            [mil appendFormat:@"        tensor<fp16, %@> x_t = tensor_buffer_to_tensor<ios17>(input = x);\n", ds4_ane_dims(r, K)];
+            [mil appendFormat:@"        tensor<int8, %@> w_t = tensor_buffer_to_tensor<ios17>(input = w);\n", ds4_ane_dims(N, K)];
+            /* int8 / 128: the row scales carry the factor back */
+            [mil appendFormat:@"        tensor<fp16, %@> w_d = dequantize(input = w_t, scale = fp16(0x1p-7));\n", ds4_ane_dims(N, K)];
+            [mil appendFormat:@"        tensor<fp16, %@> yt = matmul(transpose_x = bool(false), transpose_y = bool(true), x = x_t, y = w_d);\n",
+                ds4_ane_dims(r, N)];
+            const uint64_t yst = p->y.stride / 2, yplane = (uint64_t)r * yst;
+            [mil appendFormat:@"        %@ y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>([%llu, %llu, %llu, 1]));\n",
+                ds4_ane_buffer_type(&p->y, 2, r, N), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
+            [mil appendString:@"    } -> (y);\n"];
+        }
+        [mil appendString:@"}\n"];
+        if (!ds4_ane_load(p, mil, [NSString stringWithFormat:@"mm-%u-%u-%u", K, N, R])) return -1;
+    }
+    return g_ane.n_prog++;
+}
+
+
+/* A SwiGLU FFN K -> F -> K over R token rows, fp16 weights: gate and up
+ * [F][K], down [K][F].  silu(g) = g/2 (1 + tanh(g/2)), as Splash computes
+ * it on the ANE for accuracy. */
+int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots) {
+    if (!g_initialized && !ds4_gpu_init()) return -1;
+    if (!ds4_ane_resolve() || g_ane.n_prog >= DS4_ANE_MAX_PROGS) return -1;
+    @autoreleasepool {
+        ds4_ane_prog *p = &g_ane.prog[g_ane.n_prog];
+        p->kind = 1; p->K = K; p->N = K; p->F = F; p->R = R; p->n_slots = n_slots; p->n_w = 3;
+        if (!ds4_ane_make_surface(&p->x, R, K, 2) || !ds4_ane_make_surface(&p->y, R, K, 2)) return -1;
+        if (!ds4_ane_make_surface(&p->w[0], F, K, 2) || !ds4_ane_make_surface(&p->w[1], F, K, 2) ||
+            !ds4_ane_make_surface(&p->w[2], K, F, 2)) return -1;
+        p->scales = [g_device newBufferWithLength:(NSUInteger)n_slots * K * sizeof(float) options:MTLResourceStorageModeShared];
+        float *sc = [p->scales contents];
+        for (uint64_t i = 0; i < (uint64_t)n_slots * K; i++) sc[i] = 1.0f;
+        ds4_ane_set_buckets(p, R);
+        NSMutableString *mil = [NSMutableString stringWithString:@"program(1.3)\n{\n"];
+        for (uint32_t b = 0; b < p->n_proc; b++) {
+            const uint32_t r = p->proc_rows[b];
+            [mil appendFormat:@"    func r%u<ios18>(%@ x, %@ wg, %@ wu, %@ wd) {\n", r,
+                ds4_ane_buffer_type(&p->x, 2, r, K), ds4_ane_buffer_type(&p->w[0], 2, F, K),
+                ds4_ane_buffer_type(&p->w[1], 2, F, K), ds4_ane_buffer_type(&p->w[2], 2, K, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> x_t = tensor_buffer_to_tensor<ios17>(input = x);\n", ds4_ane_dims(r, K)];
+            [mil appendFormat:@"        tensor<fp16, %@> wg_t = tensor_buffer_to_tensor<ios17>(input = wg);\n", ds4_ane_dims(F, K)];
+            [mil appendFormat:@"        tensor<fp16, %@> wu_t = tensor_buffer_to_tensor<ios17>(input = wu);\n", ds4_ane_dims(F, K)];
+            [mil appendFormat:@"        tensor<fp16, %@> wd_t = tensor_buffer_to_tensor<ios17>(input = wd);\n", ds4_ane_dims(K, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> g = matmul(transpose_x = bool(false), transpose_y = bool(true), x = x_t, y = wg_t);\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> u = matmul(transpose_x = bool(false), transpose_y = bool(true), x = x_t, y = wu_t);\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> gh = mul(x = g, y = fp16(0x1p-1));\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> th = tanh(x = gh);\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> tp = add(x = th, y = fp16(0x1p+0));\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> sg = mul(x = gh, y = tp);\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> hh = mul(x = sg, y = u);\n", ds4_ane_dims(r, F)];
+            [mil appendFormat:@"        tensor<fp16, %@> yt = matmul(transpose_x = bool(false), transpose_y = bool(true), x = hh, y = wd_t);\n", ds4_ane_dims(r, K)];
+            const uint64_t yst = p->y.stride / 2, yplane = (uint64_t)r * yst;
+            [mil appendFormat:@"        %@ y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>([%llu, %llu, %llu, 1]));\n",
+                ds4_ane_buffer_type(&p->y, 2, r, K), (unsigned long long)yplane, (unsigned long long)yplane, (unsigned long long)yst];
+            [mil appendString:@"    } -> (y);\n"];
+        }
+        [mil appendString:@"}\n"];
+        if (!ds4_ane_load(p, mil, [NSString stringWithFormat:@"ffn-%u-%u-%u", K, F, R])) return -1;
+    }
+    return g_ane.n_prog++;
+}
+
+static const struct { uint32_t type; const char *kernel; } ds4_ane_stage_kinds[] = {
+    { 0u,                       "kernel_ane_stage_f32" },
+    { 1u,                       "kernel_ane_stage_f16" },
+    { DS4_METAL_TENSOR_Q8_0,    "kernel_ane_stage_q8_0" },
+    { DS4_METAL_TENSOR_Q4_0,    "kernel_ane_stage_q4_0" },
+    { DS4_METAL_TENSOR_Q4_K,    "kernel_ane_stage_q4_K" },
+    { DS4_METAL_TENSOR_Q2_0,    "kernel_ane_stage_q2_0" },
+    { DS4_METAL_TENSOR_Q5_0,    "kernel_ane_stage_q5_0" },
+    { DS4_METAL_TENSOR_IQ4_NL,  "kernel_ane_stage_iq4_nl" },
+    { DS4_METAL_TENSOR_Q3_K,    "kernel_ane_stage_q3_K" },
+    { DS4_METAL_TENSOR_Q5_K,    "kernel_ane_stage_q5_K" },
+    { DS4_METAL_TENSOR_Q6_K,    "kernel_ane_stage_q6_K" },
+    { DS4_METAL_TENSOR_IQ4_XS,  "kernel_ane_stage_iq4_xs" },
+    { DS4_METAL_TENSOR_IQ2_XS,  "kernel_ane_stage_iq2_xs" },
+    { DS4_METAL_TENSOR_IQ2_S,   "kernel_ane_stage_iq2_s" },
+    { DS4_METAL_TENSOR_IQ3_XXS, "kernel_ane_stage_iq3_xxs" },
+    { DS4_METAL_TENSOR_IQ3_S,   "kernel_ane_stage_iq3_s" },
+    { DS4_METAL_TENSOR_BF16,    "kernel_ane_stage_bf16" },
+};
+
+int ds4_gpu_ane_type_ok(uint32_t type) {
+    for (size_t i = 0; i < sizeof(ds4_ane_stage_kinds) / sizeof(ds4_ane_stage_kinds[0]); i++)
+        if (ds4_ane_stage_kinds[i].type == type) return 1;
+    return 0;
+}
+
+/* Encodes kernel_ane_stage over `rows` rows of K columns at `offset` of the
+ * model map: mode 0 int8 rows to dst against the row scales, 1 fp16 rows to
+ * dst, 2 the row maxima into scales. */
+static int ds4_ane_encode_stage(id<MTLCommandBuffer> cb, uint32_t mode, const ds4_gpu_ane_weight *wt,
+                                uint32_t K, uint32_t rows, id<MTLBuffer> dst, uint32_t dst_stride,
+                                id<MTLBuffer> scales, NSUInteger scales_off) {
+    const char *name = NULL;
+    for (size_t i = 0; i < sizeof(ds4_ane_stage_kinds) / sizeof(ds4_ane_stage_kinds[0]); i++)
+        if (ds4_ane_stage_kinds[i].type == wt->type) name = ds4_ane_stage_kinds[i].kernel;
+    id<MTLComputePipelineState> pipeline = name ? ds4_gpu_get_pipeline(name) : nil;
+    if (!pipeline || K % 16u || wt->row_bytes > UINT32_MAX) return 0;
+    uint64_t inner = 0;
+    id<MTLBuffer> wb = ds4_gpu_wrap_model_range(wt->map, wt->size, wt->offset + (uint64_t)wt->r0 * wt->row_bytes,
+                                                (uint64_t)rows * wt->row_bytes, &inner);
+    if (!wb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:wb offset:(NSUInteger)inner atIndex:0];
+    [enc setBuffer:dst ? dst : scales offset:0 atIndex:1];
+    [enc setBuffer:scales offset:scales_off atIndex:2];
+    const uint32_t args[8] = { K, rows, (uint32_t)wt->row_bytes, dst_stride, mode, 0, 0, 0 };
+    [enc setBytes:args length:sizeof args atIndex:4];
+    const NSUInteger tw = MIN(256u, K / 16u), th = MAX(1u, 256u / tw);
+    [enc dispatchThreads:MTLSizeMake(K / 16u, rows, 1) threadsPerThreadgroup:MTLSizeMake(tw, th, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* Queues the int8 row maxima of slot's weight; ds4_gpu_ane_measure_done
+ * runs them and turns them into the row scales. */
+int ds4_gpu_ane_measure(int h, uint32_t slot, const ds4_gpu_ane_weight *wt) {
+    if (h < 0 || h >= g_ane.n_prog) return 0;
+    ds4_ane_prog *p = &g_ane.prog[h];
+    if (p->kind != 0 || slot >= p->n_slots) return 0;
+    if (!g_ane.measure_cb) g_ane.measure_cb = [g_queue commandBuffer];
+    return ds4_ane_encode_stage(g_ane.measure_cb, 2, wt, p->K, p->N, nil, 0, p->scales,
+                                (NSUInteger)slot * p->N * sizeof(float));
+}
+
+int ds4_gpu_ane_measure_done(void) {
+    if (!g_ane.measure_cb) return 1;
+    [g_ane.measure_cb commit];
+    [g_ane.measure_cb waitUntilCompleted];
+    const BOOL ok = g_ane.measure_cb.status == MTLCommandBufferStatusCompleted;
+    g_ane.measure_cb = nil;
+    if (!ok) return 0;
+    for (int h = 0; h < g_ane.n_prog; h++) {
+        ds4_ane_prog *p = &g_ane.prog[h];
+        if (p->kind != 0) continue;
+        float *sc = [p->scales contents];
+        /* the program dequantizes int8 by 1/128 */
+        for (uint64_t i = 0; i < (uint64_t)p->n_slots * p->N; i++)
+            sc[i] = sc[i] > 0.0f ? sc[i] / 127.0f * 128.0f : 128.0f;
+    }
+    return 1;
+}
+
+/* Encodes into the batch the staging of slot's weight j (FFN: 0 gate, 1 up,
+ * 2 down) into h's weight surface.  The next pack's signal orders it before
+ * the evaluation, and the GPU waited for the surface's last reader before. */
+int ds4_gpu_ane_stage(int h, uint32_t slot, uint32_t j, const ds4_gpu_ane_weight *wt) {
+    if (h < 0 || h >= g_ane.n_prog || !g_batch_cb) return 0;
+    ds4_ane_prog *p = &g_ane.prog[h];
+    if (slot >= p->n_slots || j >= p->n_w) return 0;
+    const uint32_t K = p->kind == 1 && j == 2 ? p->F : p->K;
+    const uint32_t rows = p->kind == 1 ? (j == 2 ? p->K : p->F) : p->N;
+    return ds4_ane_encode_stage(g_batch_cb, p->kind == 0 ? 0 : 1, wt, K, rows, p->w[j].buffer, p->w[j].stride,
+                                p->scales, (NSUInteger)slot * p->N * sizeof(float));
+}
+
+int ds4_gpu_ane_failed(void) {
+    return g_ane.failed;
+}
+
+static int ds4_ane_dispatch(const char *name, __unsafe_unretained id<MTLBuffer> bufs[4], const NSUInteger offs[4],
+                            const uint32_t args[8], uint32_t width, uint32_t rows) {
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(name);
+    if (!pipeline || !g_batch_cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:pipeline];
+    for (int i = 0; i < 4; i++) if (bufs[i]) [enc setBuffer:bufs[i] offset:offs[i] atIndex:(NSUInteger)i];
+    [enc setBytes:args length:8 * sizeof(uint32_t) atIndex:4];
+    [enc setBuffer:g_ane.status offset:0 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(width, rows, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    return 1;
+}
+
+/* Packs x [T][K] fp32 into h's input surface, signals it ready and ends the
+ * command buffer: Metal delivers a signal when its command buffer's work is
+ * submitted through it, so without the split the ANE would start only once
+ * the GPU reached its wait. */
+int ds4_gpu_ane_pack(int h, const ds4_gpu_tensor *x, uint32_t T) {
+    if (h < 0 || h >= g_ane.n_prog || g_ane.failed || !g_batch_cb) return 0;
+    ds4_ane_prog *p = &g_ane.prog[h];
+    if (T == 0 || T > p->R) return 0;
+    @autoreleasepool {
+        __unsafe_unretained id<MTLBuffer> bufs[4] = { ds4_gpu_tensor_buffer(x), p->x.buffer, nil, nil };
+        const NSUInteger offs[4] = { ds4_gpu_tensor_offset(x), 0, 0, 0 };
+        const uint32_t args[8] = { p->K, T, p->x.stride / 2u, 0, 0, 0, 0, 0 };
+        if (!ds4_ane_dispatch("kernel_ane_pack_f16", bufs, offs, args, p->K, T)) return 0;
+        ds4_gpu_close_batch_encoder();
+        g_ane.last_ready = ++g_ane.seq;
+        [g_batch_cb encodeSignalEvent:g_ane.event value:g_ane.last_ready];
+        if (!ds4_gpu_flush_commands()) return 0;
+    }
+    return 1;
+}
+
+/* Records the evaluation that signals `done` as finished, once: by its
+ * completion handler, or failed by the watchdog first.  A failure stops the
+ * ANE for the session and releases the GPU's wait. */
+static bool ds4_ane_finish(uint64_t done) {
+    _Atomic uint64_t *slot = &g_ane.ring[done % DS4_ANE_RING];
+    uint64_t prev = atomic_load(slot);
+    while (prev < done) {
+        if (atomic_compare_exchange_weak(slot, &prev, done)) {
+            atomic_fetch_add(&g_ane.completed, 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ds4_ane_fail(uint64_t done, const char *why) {
+    if (!atomic_exchange(&g_ane.failed, 1))
+        fprintf(stderr, "ds4: ANE evaluation %s; the GPU runs the prefill alone from now on\n", why);
+    if (g_ane.event.signaledValue < done) g_ane.event.signaledValue = done;
+}
+
+int ds4_gpu_ane_settle(void) {
+    if (!g_ane.resolved || g_ane.resolved < 0) return 1;
+    for (int i = 0; i < 3000 && atomic_load(&g_ane.completed) < g_ane.evals; i++) usleep(1000);
+    uint32_t *status = [g_ane.status contents];
+    if (atomic_load(&g_ane.completed) < g_ane.evals) ds4_ane_fail(g_ane.seq, "did not finish");
+    else if (*status) ds4_ane_fail(g_ane.seq, "wrote non-finite rows");
+    *status = 0;
+    return !g_ane.failed;
+}
+
+/* DS4_ANE_TEST_FAIL=N[:error|:nan|:hang] replaces the Nth evaluation by a
+ * failure of that kind, to test the fallback. */
+static int ds4_ane_test_fault(void) {
+    static uint64_t at;
+    static int kind = -1;
+    if (kind < 0) {
+        const char *e = getenv("DS4_ANE_TEST_FAIL");
+        kind = 0;
+        if (e && e[0]) {
+            at = strtoull(e, NULL, 10);
+            const char *k = strchr(e, ':');
+            kind = !k || !strcmp(k, ":error") ? 1 : !strcmp(k, ":nan") ? 2 : 3;
+        }
+    }
+    return kind && g_ane.evals + 1 == at ? kind : 0;
+}
+
+/* Queues h's evaluation for `slot` on the input xh packed last. */
+int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
+    if (h < 0 || h >= g_ane.n_prog || xh < 0 || xh >= g_ane.n_prog || g_ane.failed) return 0;
+    ds4_ane_prog *p = &g_ane.prog[h];
+    ds4_ane_prog *px = &g_ane.prog[xh];
+    if (slot >= p->n_slots || px->K != p->K || px->R != p->R) return 0;
+    @autoreleasepool {
+        uint32_t b = 0;
+        while (b + 1 < p->n_proc && p->proc_rows[b] < T) b++;
+        if (T == 0 || p->proc_rows[b] < T) return 0;
+        const uint64_t ready = g_ane.last_ready, done = ++g_ane.seq;
+        id ev_signal = [g_ane.signal_class signalEventWithValue:done symbolIndex:0 eventType:0 sharedEvent:g_ane.event];
+        id ev_wait = [g_ane.wait_class waitEventWithValue:ready sharedEvent:g_ane.event eventType:0];
+        id events = [g_ane.events_class sharedEventsWithSignalEvents:@[ ev_signal ] waitEvents:@[ ev_wait ]];
+        NSMutableArray *ins = [NSMutableArray array];
+        for (NSString *nm in p->proc_names[b]) {
+            if ([nm isEqualToString:@"x"]) [ins addObject:px->x.object];
+            else if ([nm isEqualToString:@"w"]) [ins addObject:p->w[0].object];
+            else if ([nm isEqualToString:@"wg"]) [ins addObject:p->w[0].object];
+            else if ([nm isEqualToString:@"wu"]) [ins addObject:p->w[1].object];
+            else [ins addObject:p->w[2].object];
+        }
+        id req = [g_ane.request_class requestWithInputs:ins inputIndices:p->proc_in[b] outputs:@[ p->y.object ]
+                                          outputIndices:p->proc_out[b] weightsBuffer:nil perfStats:nil
+                                         procedureIndex:p->proc_id[b] sharedEvents:events transactionHandle:nil];
+        if (!events || !req) return 0;
+        [req setCompletionHandler:^(BOOL ok, NSError *e) {
+            if (ds4_ane_finish(done) && !ok)
+                ds4_ane_fail(done, [NSString stringWithFormat:@"failed (%@)", e ? e.localizedDescription : @"no reason"].UTF8String);
+        }];
+        /* The watchdog starts when the GPU signals the input ready, and so
+         * do the test faults, as a real evaluation would. */
+        const int fault = ds4_ane_test_fault();
+        ds4_ane_prog *pf = p;
+        [g_ane.event notifyListener:g_ane.listener atValue:ready block:^(id<MTLSharedEvent> ev, uint64_t v) {
+            (void)v;
+            if (fault == 1) {
+                if (ds4_ane_finish(done)) ds4_ane_fail(done, "failed (test)");
+                return;
+            }
+            if (fault == 2) {
+                uint16_t *y = pf->y.buffer.contents;
+                for (uint64_t i = 0; i < pf->y.buffer.length / 2u; i++) y[i] = 0x7e00u;
+                ds4_ane_finish(done);
+                if (ev.signaledValue < done) ev.signaledValue = done;
+                return;
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)DS4_ANE_TIMEOUT_NS), g_ane.queue, ^{
+                if (ds4_ane_finish(done)) ds4_ane_fail(done, "timed out");
+            });
+        }];
+        g_ane.evals++;
+        p->pending_done = done;
+        if (fault == 0) {
+            NSError *err = nil;
+            if (![g_ane.client evaluateWithModel:p->model options:@{} request:req qos:21 error:&err] &&
+                ds4_ane_finish(done)) {
+                ds4_ane_fail(done, [NSString stringWithFormat:@"was not queued (%@)", err.localizedDescription].UTF8String);
+            }
+        }
+    }
+    return 1;
+}
+
+/* Waits for h's evaluation and writes out[t][col0 + n] = y[t][n] * scale[n]
+ * for T rows of ld columns; with gpu_part, also out[t][c] = gpu_part[t][c]
+ * for the leading gpu_cols columns (the GPU's share of a split projection). */
+int ds4_gpu_ane_unpack(int h, uint32_t slot, ds4_gpu_tensor *out, uint32_t T, uint32_t ld, uint32_t col0,
+                       const ds4_gpu_tensor *gpu_part, uint32_t gpu_cols) {
+    if (h < 0 || h >= g_ane.n_prog || !g_batch_cb) return 0;
+    ds4_ane_prog *p = &g_ane.prog[h];
+    if (slot >= p->n_slots || col0 + p->N > ld) return 0;
+    @autoreleasepool {
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_ane.event value:p->pending_done];
+        __unsafe_unretained id<MTLBuffer> bufs[4] = { p->y.buffer, ds4_gpu_tensor_buffer(out), p->scales,
+                                  gpu_part ? ds4_gpu_tensor_buffer(gpu_part) : nil };
+        const NSUInteger offs[4] = { 0, ds4_gpu_tensor_offset(out), (NSUInteger)slot * p->N * sizeof(float),
+                                     gpu_part ? ds4_gpu_tensor_offset(gpu_part) : 0 };
+        const uint32_t args[8] = { p->N, T, p->y.stride / 2u, ld, col0, gpu_part ? gpu_cols : 0u, 0, 0 };
+        const uint32_t width = gpu_part ? ld : p->N;
+        return ds4_ane_dispatch(gpu_part ? "kernel_ane_join_f32" : "kernel_ane_unpack_f32", bufs, offs, args, width, T);
+    }
 }

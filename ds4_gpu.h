@@ -3393,6 +3393,29 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* Neural Engine projections for the prefill (ds4_metal.m, Apple only). */
+int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots);
+/* Rows [r0, r0 + rows) of a model weight: `type` rows of row_bytes at
+ * `offset` of the mapped model. */
+typedef struct {
+    const void *map;
+    uint64_t size, offset, row_bytes;
+    uint32_t type, r0;
+} ds4_gpu_ane_weight;
+int ds4_gpu_ane_type_ok(uint32_t type);
+int ds4_gpu_ane_measure(int h, uint32_t slot, const ds4_gpu_ane_weight *w);
+int ds4_gpu_ane_measure_done(void);
+int ds4_gpu_ane_stage(int h, uint32_t slot, uint32_t j, const ds4_gpu_ane_weight *w);
+int ds4_gpu_ane_pack(int h, const ds4_gpu_tensor *x, uint32_t T);
+int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T);
+int ds4_gpu_ane_unpack(int h, uint32_t slot, ds4_gpu_tensor *out, uint32_t T, uint32_t ld, uint32_t col0,
+                       const ds4_gpu_tensor *gpu_part, uint32_t gpu_cols);
+int ds4_gpu_ane_create_ffn(uint32_t K, uint32_t F, uint32_t R, uint32_t n_slots);
+int ds4_gpu_ane_failed(void);
+/* Waits for the evaluations queued so far: 0 if one failed, timed out or
+ * wrote non-finite rows, after which the ANE stays off. */
+int ds4_gpu_ane_settle(void);
+
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

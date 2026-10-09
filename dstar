@@ -59,6 +59,8 @@ usage: dstar <command> [options]
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
       --no-vision        do not load the vision encoder
+      --ane              run part of the prompt processing on the Neural
+                         Engine: about 15% faster prefill, 0.4 GB more memory
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
@@ -209,7 +211,9 @@ parse_power() {
     echo "$1"
 }
 
-need_mib() { awk -v c="$1" -v b="$BASE_GIB" 'BEGIN { printf "%d", (b + c * 3.315e-5 + 2) * 1024 }'; }
+# --ane adds the Neural Engine's surfaces and the chunk's state copy.
+ANE_GIB=0
+need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" 'BEGIN { printf "%d", (b + a + c * 3.315e-5 + 2) * 1024 }'; }
 
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
 
@@ -311,7 +315,7 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0 model="" power=""
+    local ctx="" mtp=1 vision=1 dry=0 model="" power="" ane=0
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
@@ -319,6 +323,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --no-vision) vision=0 ;;
+            --ane) ane=1; ANE_GIB=0.4 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
@@ -383,6 +388,7 @@ cmd_serve() {
 
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     export DS4_QWEN4_MOE_TAILS=1
+    if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
     set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
         --kv-cache-continued-interval-tokens "$kv_every" "$@"
@@ -395,7 +401,7 @@ cmd_serve() {
     if [ "$vision" = 1 ] && [ -f "$F_VISION" ]; then set -- --vision "$F_VISION" "$@"; fi
 
     if [ "$dry" = 1 ]; then
-        env | grep '^DS4_QWEN' | sort
+        env | grep -E '^DS4_(QWEN|ANE)' | sort
         echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
         return
     fi

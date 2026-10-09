@@ -58,6 +58,7 @@
 /tests/test_qwen4_kernels
 /tests/test_quant_types
 /tests/test_qwen4_moe_mm_specialize
+/tests/test_metal_ane_prefill
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_image_decode

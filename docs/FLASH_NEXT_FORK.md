@@ -108,6 +108,19 @@ top-1 counts before and after the kernel work (0.45044 vs 0.45045 short,
   to 327). The first two leave the output byte for byte the same; the last
   one is more accurate than the tile it replaces and `DS4_QWEN4_MOE_REG=0`
   turns it off.
+- **Neural Engine in prefill**, off by default: `DS4_ANE=1`, or
+  `dstar serve --ane`. As in Splash, the Neural Engine computes part of the
+  dense projections of every 512 to 2048 token prefill chunk while the GPU
+  computes the rest: the GDN gate, half of the GDN qkv and of attn_q, 40% of
+  ssm_out and the shared expert. The GPU writes each layer's int8 weights
+  for it from the quantized rows right before they are needed, so the cost
+  is 0.2 GB of surfaces and a 120 MB copy of the recurrent state. If an
+  evaluation fails, hangs or returns non-finite values, the chunk runs again
+  on the GPU from that copy and the Neural Engine stays off. Prefill on an
+  8K prompt went from 357 to 416 tok/s with Q2_0 and from 302 to 344 with
+  IQ3_XXS; the NLL moves inside the noise. The split is tuned for the M1
+  Max; on another chip `DS4_ANE_QKV`, `DS4_ANE_ATTNQ` and `DS4_ANE_SSMOUT`
+  set how many leading columns stay on the GPU.
 
 Each change is a separate commit with a test.
 

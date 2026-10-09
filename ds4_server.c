@@ -11891,6 +11891,12 @@ static int prompt_anchor_split(server *s, const ds4_tokens *prompt, int start,
     return -1;
 }
 
+static bool tokens_prefix_equal(const ds4_tokens *a, const ds4_tokens *b, int n) {
+    if (a == b) return true;
+    if (n < 0 || a->len < n || b->len < n) return false;
+    return memcmp(a->v, b->v, (size_t)n * sizeof(a->v[0])) == 0;
+}
+
 /* Called with the session at prompt[0, pos).  The anchor text must be a byte
  * prefix of the request's rendered prompt, so live tiers that keep reasoning
  * the client did not replay never leave an anchor behind.
@@ -13965,10 +13971,23 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         int start = ds4_session_pos(slot->session);
         if (ds4_session_common_prefix(slot->session, prompt_for_sync) != start) start = 0;
         const int held = ds4_session_anchor_pos(slot->session);
+        const bool held_canonical = held > 0 &&
+            ds4_session_common_prefix(slot->session, &j->req.prompt) >= held;
         pthread_mutex_unlock(&s->inference_mu);
-        const int split = prompt_anchor_split(s, prompt_for_sync, start,
-                                             multimodal ? j->req.images : NULL,
-                                             multimodal ? j->req.image_count : 0);
+        int split = prompt_anchor_split(s, prompt_for_sync, start,
+                                        multimodal ? j->req.images : NULL,
+                                        multimodal ? j->req.image_count : 0);
+        /* A live tier can keep reasoning the client never replays.  An anchor
+         * past it cannot match the next request, so keep a held anchor that
+         * still sits inside the request's own tokens. */
+        if (split >= 0 && held_canonical &&
+            !tokens_prefix_equal(prompt_for_sync, &j->req.prompt, split))
+        {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kept prompt anchor %d (new anchor %d is past hidden tokens)",
+                       held, split);
+            split = -1;
+        }
         if (split > start) {
             ds4_tokens head = *prompt_for_sync;
             head.len = split;

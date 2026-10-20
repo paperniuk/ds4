@@ -79,6 +79,8 @@ kernel void kernel_qwen4_hc_norm(
         device const char  *w_inject,   /* [n_inject][hc*E] */
         device float       *xn,         /* [T][hc*E] */
         device float       *inj_part,   /* [T][hc*chunks][n_inject] */
+        device const uint4 *pf,         /* pad0 > 0: 128-byte lines the next dispatch reads */
+        device uint        *sink,       /* never written in practice; keeps the loads live */
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
         ushort3 ntg [[threads_per_threadgroup]],
@@ -87,6 +89,18 @@ kernel void kernel_qwen4_hc_norm(
     const uint s = tgpig.x / QWEN4_HC_CHUNKS;
     const uint chunk = tgpig.x % QWEN4_HC_CHUNKS;
     const uint tok = tgpig.y;
+    if (args.pad0 && s >= args.n_hc && tok == 0) {
+        /* Threadgroups past the norm groups pull the low-rank projection's
+         * weights into the system cache: the norm is latency-bound and
+         * leaves DRAM idle, the projection after it is bandwidth-bound.
+         * One load per line; reads only. */
+        const uint line = (tgpig.x - args.n_hc * QWEN4_HC_CHUNKS) * ntg.x + tid;
+        for (uint l = line; l < args.pad0; l += args.pad1) {
+            const uint4 v = pf[(uint64_t)l * 8u];
+            if ((v.x ^ v.y ^ v.z ^ v.w) == args.pad2) sink[0] = l;
+        }
+        return;
+    }
     if (s >= args.n_hc || tok >= args.n_tokens) return;
     const uint E = args.n_embd, dim = E * args.n_hc;
     const uint nth = ntg.x, nsg = nth / 32;
@@ -135,7 +149,8 @@ kernel void kernel_qwen4_hc_norm(
 #define QWEN4_HC_NORM_INSTANCE(SUFFIX, W) \
 template [[host_name("kernel_qwen4_hc_norm_" #SUFFIX)]] \
 kernel void kernel_qwen4_hc_norm<W>(constant ds4_metal_args_qwen4_hc_norm &, device const float *, \
-        device const float *, device const char *, device float *, device float *, uint3, ushort, ushort3, ushort, ushort);
+        device const float *, device const char *, device float *, device float *, device const uint4 *, \
+        device uint *, uint3, ushort, ushort3, ushort, ushort);
 QWEN4_HC_NORM_INSTANCE(f16, qwen4_w_f16)
 QWEN4_HC_NORM_INSTANCE(f32, qwen4_w_f32)
 QWEN4_HC_NORM_INSTANCE(q8, qwen4_w_q8)

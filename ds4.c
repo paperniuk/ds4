@@ -61006,6 +61006,12 @@ static int qwen4_idx_select(ds4_gpu_tensor *sel, const ds4_gpu_tensor *score, co
 static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_tensor *norm, const ds4_tensor *down,
                                const ds4_tensor *up, const ds4_tensor *inject, uint32_t T) {
+#ifdef DS4_HAS_QWEN4_METAL
+    /* The norm leaves DRAM idle; have it prefetch the down projection. */
+    static int no_prefetch = -1;
+    if (no_prefetch < 0) no_prefetch = getenv("DS4_QWEN4_NO_PREFETCH") != NULL;
+    if (T == 1u && !no_prefetch) ds4_gpu_qwen4_prefetch_next(m->map, m->size, down->abs_offset, down->bytes);
+#endif
     bool ok = ds4_gpu_qwen4_hc_norm_tensor(g->xn, g->inj, g->R, m->map, m->size, norm->abs_offset,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&

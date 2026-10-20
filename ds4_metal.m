@@ -51087,7 +51087,7 @@ static MTLSize qwen4_moe_mm_grid(uint32_t row_blocks, uint32_t n_expert, uint32_
 }
 
 static id<MTLComputePipelineState> g_qwen4_pipelines[QWEN4_K_COUNT];
-#define QWEN4_ATTN_NSG 4
+#define QWEN4_ATTN_NSG 6
 #define QWEN4_ATTN_MAX_SPLITS 64
 #define QWEN4_ATTN_ROWS_MAX 64     /* decode batch rows the attention rows kernels take */
 

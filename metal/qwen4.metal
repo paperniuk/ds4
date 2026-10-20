@@ -2353,8 +2353,11 @@ struct ds4_metal_args_qwen4_attn_decode {
     uint32_t pad1;
 };
 
-#define QWEN4_ATTN_NSG 4          /* simdgroups per threadgroup, each owning a slice of the q-head group */
-#define QWEN4_ATTN_HPS 3          /* q heads per simdgroup: group <= NSG * HPS */
+#define QWEN4_ATTN_NSG 6          /* simdgroups per threadgroup, each owning a slice of the q-head group */
+#define QWEN4_ATTN_HPS 2          /* q heads per simdgroup: group <= NSG * HPS */
+/* Two heads per simdgroup over six simdgroups: with three over four, the
+ * decode tile took 1.6x as long on M5 (each head's arithmetic is unchanged;
+ * only which simdgroup folds it moves). */
 
 /* Decode attention for one (key split, kv head, token).  The simdgroups of
  * a threadgroup share the K/V rows but own disjoint query heads, so every

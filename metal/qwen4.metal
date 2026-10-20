@@ -96,7 +96,13 @@ kernel void kernel_qwen4_hc_norm(
     device float *o = xn + ((uint64_t)tok * args.n_hc + s) * E;
     const W w(w_inject);
     float ss = 0.0f;
-    for (uint i = tid; i < E; i += nth) ss += r[i] * r[i];
+    /* eight of the thread's elements load before they are summed in order:
+     * one per loop trip left each load waiting on the previous add */
+    for (uint i0 = tid; i0 < E; i0 += 8u * nth) {
+        float v[8];
+        for (uint k = 0; k < 8u; k++) v[k] = r[min(i0 + k * nth, E - 1u)];
+        for (uint k = 0; k < 8u; k++) if (i0 + k * nth < E) ss += v[k] * v[k];
+    }
     ss = simd_sum(ss);
     if (tiisg == 0) red[0][sgitg] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -210,7 +216,14 @@ QWEN4_HC_NORM_REUSE_INSTANCE(bf16, qwen4_w_bf16)
 /* 2*sigmoid(inj/hc) with inj[s] = sum of the hc*chunks norm partials for s */
 static inline float qwen4_hc_inject_weight(device const float *inj_part, uint hc, uint s) {
     float a = 0.0f;
-    for (uint src = 0; src < hc * QWEN4_HC_CHUNKS; src++) a += inj_part[src * hc + s];
+    /* sixteen partials load before they are added in order: one per loop
+     * trip left each load waiting on the previous add */
+    const uint n = hc * QWEN4_HC_CHUNKS;
+    for (uint src0 = 0; src0 < n; src0 += 16u) {
+        float v[16];
+        for (uint k = 0; k < 16u; k++) v[k] = inj_part[min(src0 + k, n - 1u) * hc + s];
+        for (uint k = 0; k < 16u && src0 + k < n; k++) a += v[k];
+    }
     return 2.0f * qwen4_sigmoid(a / (float)hc);
 }
 

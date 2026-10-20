@@ -2590,7 +2590,14 @@ static inline void qwen4_attn_merge_wide_head(
     const uint64_t stride = (uint64_t)group * (2u + D);
     device const float *base = part + (((uint64_t)tok * Hkv + kvh) * part_splits * group + g) * (2u + D);
     float mm = -3.0e38f;
-    for (uint s = 0; s < n_splits; s++) mm = max(mm, base[s * stride]);
+    /* the maxima load sixteen at a time too: one split per loop trip left
+     * each load waiting on the previous max */
+    for (uint s0 = 0; s0 < n_splits; s0 += 16u) {
+        float pm[16];
+        const uint n_round = min(16u, n_splits - s0);
+        for (uint i = 0; i < 16u; i++) pm[i] = base[(s0 + min(i, n_round - 1u)) * stride];
+        for (uint i = 0; i < n_round; i++) mm = max(mm, pm[i]);
+    }
     float ll = 0.0f;
     float o = 0.0f;
     /* sixteen splits' values in flight per round; the chain below still

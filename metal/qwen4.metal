@@ -3033,6 +3033,9 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         acc = ds4q_row_dot_part(row, x, weight_type, in_dim, tiisg);
     } else {
         device const float *w = (device const float *)row;
+        /* Unrolled so the loads issue ahead of the in-order accumulation:
+         * the decode GDN alpha/beta rows are latency-bound otherwise. */
+#pragma unroll 4
         for (uint i = tiisg * 4; i < in_dim; i += 128) {
             acc += w[i] * x[i] + w[i + 1] * x[i + 1] + w[i + 2] * x[i + 2] + w[i + 3] * x[i + 3];
         }

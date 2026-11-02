@@ -201,8 +201,8 @@ parse_ctx() {
 }
 
 # GPU memory plan with MTP and vision, in MiB: about 39.1 GiB (47.9 for the
-# iq3 quant, 55.2 for iq3s) plus 33 KiB per context token, and 2 GiB of
-# headroom under the wired limit.
+# iq3 quant, 55.2 for iq3s) plus 22 KiB per context token (int8 KV; 35 KiB
+# with DS4_QWEN4_KV_F16=1), and 2 GiB of headroom under the wired limit.
 parse_power() {
     case $1 in
         ''|*[!0-9]*) die "--power needs a number from 1 to 100" ;;
@@ -214,7 +214,8 @@ parse_power() {
 # --ane adds the Neural Engine's two sets of surfaces, the second chunk's
 # rows and the state copy.
 ANE_GIB=0
-need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" 'BEGIN { printf "%d", (b + a + c * 3.315e-5 + 2) * 1024 }'; }
+if [ -n "${DS4_QWEN4_KV_F16:-}" ]; then KV_GIB_PER_TOKEN=3.315e-5; else KV_GIB_PER_TOKEN=2.075e-5; fi
+need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" -v k="$KV_GIB_PER_TOKEN" 'BEGIN { printf "%d", (b + a + c * k + 2) * 1024 }'; }
 
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
 
@@ -379,10 +380,14 @@ cmd_serve() {
     # Past the native 262144 window the positions need YaRN scaling. A
     # checkpoint only loads under the factor it was written with, so those
     # contexts keep their own cache directory and write snapshots less often.
-    local kv_dir=$HOME/.ds4/server-kv kv_mb=12288 kv_every=10000
+    # int8 and f16 KV checkpoints refuse each other, so each has its own
+    # directory.
+    local kv_tag=-i8
+    [ -z "${DS4_QWEN4_KV_F16:-}" ] || kv_tag=""
+    local kv_dir=$HOME/.ds4/server-kv$kv_tag kv_mb=12288 kv_every=10000
     if [ "$ctx" -gt 262144 ]; then
         export DS4_QWEN4_YARN_FACTOR=${YARN:-2}
-        kv_dir=$HOME/.ds4/server-kv-yarn$DS4_QWEN4_YARN_FACTOR
+        kv_dir=$HOME/.ds4/server-kv-yarn$DS4_QWEN4_YARN_FACTOR$kv_tag
         kv_mb=40960
         kv_every=32768
     fi

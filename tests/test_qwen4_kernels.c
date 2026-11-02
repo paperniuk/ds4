@@ -1400,7 +1400,11 @@ static void same_bytes(const char *what, uint32_t row, const ds4_gpu_tensor *ta,
  * bit for bit: the caches written, the block key, scores, selection, token
  * list and output.  Rows: dense, dense completing a block, sparse completing
  * a block on the plain selector's width, sparse on the prefiltered width. */
-static void test_attention_rows(arena_t *a) {
+/* q8: the int8 KV layout.  The caches hold the same random bytes either way;
+ * both paths read them through the same kernels, so the comparison stays
+ * byte-exact. */
+static void test_attention_rows(arena_t *a, bool q8) {
+    ds4_gpu_qwen4_set_kv_q8(q8);
     const uint32_t H = 8, Hkv = 2, D = 256, n_rot = 64, Hi = 4, Di = 128, k_blocks = 4, ratio = 4, R = 4;
     const uint32_t sparse_pos = (k_blocks + 1) * ratio - 1;
     const uint32_t pos_of[4] = { 5, 11, sparse_pos, 140 };
@@ -1536,7 +1540,8 @@ static void test_attention_rows(arena_t *a) {
         same_bytes("selected tokens", r, selt[0], (uint64_t)r * sel_stride * 4, selt[1], (uint64_t)r * sel_stride * 4,
                    (uint64_t)n_sel_a * 4);
     }
-    printf("  attention rows: dense, block-completing and sparse rows byte-exact against the per-row kernels\n");
+    printf("  attention rows (%s KV): dense, block-completing and sparse rows byte-exact against the per-row kernels\n",
+           q8 ? "int8" : "f16");
 
     ds4_gpu_tensor_free(partR); ds4_gpu_tensor_free(table); ds4_gpu_tensor_free(part1);
     for (uint32_t r = 0; r < R; r++) {
@@ -3264,6 +3269,12 @@ static int bench_p_attn_sparse(void *ud) {
     return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], NULL,
                                             1024, 24, 2, 256, 262144 - 1024, true, 2052, 0.0625f);
 }
+/* sparse decode attention: one query at the end of a 256k context, 2048 selected keys */
+static int bench_d_attn_sparse(void *ud) {
+    bench_ctx *c = ud;
+    return ds4_gpu_qwen4_attn_decode_tensor(c->t[37], c->t[33], c->t[34], c->t[31], c->t[32], c->n[2] ? c->t[36] : c->t[35], c->t[38], c->t[10],
+                                            1, 24, 2, 256, 262144 - 1, true, 2052, 0.0625f);
+}
 static int bench_p_gdn_r4(void *ud) { bench_ctx *c = ud; return ds4_gpu_qwen4_gdn_scan_tensor(c->t[15], c->t[1], c->t[11], c->t[13], c->t[14], 1024, 16, 48, 128, NULL, 0u, NULL, 0u); }
 static int bench_p_moe_mm(void *ud) {
     bench_ctx *c = ud;
@@ -3406,6 +3417,8 @@ static void bench_cold(arena_t *a) {
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
+    /* QWEN4_BENCH_KV_Q8=1: time the attention kernels on the int8 KV layout */
+    if (getenv("QWEN4_BENCH_KV_Q8")) ds4_gpu_qwen4_set_kv_q8(1);
     double *sh;
     c.off[0] = arena_q8_0(a, 48, 2560, &sh, 0.05f); free(sh);
     c.off[1] = arena_q8_0(a, 6144, 2560, &sh, 0.05f); free(sh);
@@ -3601,6 +3614,8 @@ static void bench_dispatch(arena_t *a) {
     unsetenv("DS4_QWEN4_NO_ATTN_MM");
     c.n[2] = 0; bench_run("attn sparse T=1024 ctx=256k random blocks", bench_p_attn_sparse, &c, 5);
     c.n[2] = 1; bench_run("attn sparse T=1024 ctx=256k blocks in last 8k", bench_p_attn_sparse, &c, 5);
+    c.n[2] = 0; bench_run("attn sparse decode T=1 ctx=256k random blocks", bench_d_attn_sparse, &c, 200);
+    c.n[2] = 1; bench_run("attn sparse decode T=1 ctx=256k blocks in last 8k", bench_d_attn_sparse, &c, 200);
     bench_run("router gemv f32 512x2560", bench_router_gemv, &c, 100);
     bench_run("router_topk (+gate logit)", bench_router_topk, &c, 100);
     bench_run("router_topk no gate", bench_router_topk_nogate, &c, 100);
@@ -3941,7 +3956,9 @@ int main(void) {
     test_attention(&arena, 24, 2, 256, 64, 4, 128, 2, 21);
     test_attention(&arena, 4, 2, 32, 8, 4, 32, 2, 30);
 #ifdef __APPLE__
-    test_attention_rows(&arena);
+    test_attention_rows(&arena, false);
+    test_attention_rows(&arena, true);
+    ds4_gpu_qwen4_set_kv_q8(0);
 #endif
     printf("routed experts\n");
     test_moe(&arena, 16, 10, 2560, 640, 2, 8u);

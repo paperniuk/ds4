@@ -7195,6 +7195,23 @@ static void config_read_qwen4_u64_array(
     *n_out = (uint32_t)arr.len;
 }
 
+/* Compact Qwen3.8 KV on Metal: K/V rows as int8 with one half scale per 32
+ * values (D + D/16 bytes per head instead of 2D) and half raw indexer keys.
+ * DS4_QWEN4_KV_F16=1 keeps the f16 K/V and f32 indexer keys. */
+static bool g_qwen4_kv_q8 = false;
+
+static bool qwen4_kv_q8_wanted(ds4_backend backend) {
+    return backend == DS4_BACKEND_METAL && getenv("DS4_QWEN4_KV_F16") == NULL &&
+           (DS4_N_HEAD_DIM == 256u || DS4_N_HEAD_DIM == 128u);
+}
+
+/* Bytes of one position's K (or V) rows, and of one raw indexer key value. */
+static inline uint64_t qwen4_kv_pos_bytes_for(bool q8) {
+    return q8 ? (uint64_t)DS4_N_HEAD_KV * (DS4_N_HEAD_DIM + DS4_N_HEAD_DIM / 16u)
+              : (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+}
+static inline uint64_t qwen4_ik_elem_bytes_for(bool q8) { return q8 ? 2u : 4u; }
+
 static float g_qwen4_rope_freq[32];
 static float g_qwen4_rope_mscale = 1.0f;
 static uint32_t g_qwen4_native_ctx = 0;
@@ -40782,18 +40799,21 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
-        /* per-token f16 K/V and raw indexer keys per attention layer, pooled
-         * block keys, rope positions; transients scale with the prefill chunk */
+        /* per-token K/V (f16, or int8 with block scales) and raw indexer keys
+         * per attention layer, pooled block keys, rope positions; transients
+         * scale with the prefill chunk */
+        const bool q8 = qwen4_kv_q8_wanted(backend);
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen4_prefill_chunk_tokens(ctx);
         const uint64_t blocks = ctx / 4u + 1u, E = DS4_N_EMBD, hc_dim = E * DS4_N_HC;
-        const uint64_t kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        const uint64_t kv_row = 2ull * qwen4_kv_pos_bytes_for(q8);
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += !ds4_qwen4_layer_is_linear(il);
         m.prefill_cap = (uint32_t)T;
         m.raw_cap = ctx;
         m.comp_cap = (uint32_t)blocks;
         m.raw_bytes = (uint64_t)n_attn * ctx * kv_row + (uint64_t)ctx * 16u;
-        m.compressed_bytes = (uint64_t)n_attn * (ctx * DS4_N_INDEXER_HEAD_DIM * 4u + blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
+        m.compressed_bytes = (uint64_t)n_attn * (ctx * DS4_N_INDEXER_HEAD_DIM * qwen4_ik_elem_bytes_for(q8) +
+                                                 blocks * DS4_N_INDEXER_HEAD_DIM * 2u);
         m.scratch_bytes = T * (12u * hc_dim + 24u * E + (uint64_t)(DS4_N_EXPERT_USED + 1u) * (E + 2u * DS4_N_FF_EXP) +
                                2u * blocks) * 4u;
         /* Recurrent layers have fixed state even at a tiny context. Reserve
@@ -60680,9 +60700,10 @@ private_state:
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
         } else {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * kv_dim * 2u);
-            g->layer_ik_cache[il] = qwen4_graph_alloc_f32((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM);
+            g->layer_k_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes_for(g_qwen4_kv_q8));
+            g->layer_v_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * qwen4_kv_pos_bytes_for(g_qwen4_kv_q8));
+            g->layer_ik_cache[il] = ds4_gpu_tensor_alloc((uint64_t)ctx_cap * DS4_N_INDEXER_HEAD_DIM *
+                                                         qwen4_ik_elem_bytes_for(g_qwen4_kv_q8));
             g->layer_block_key[il] = ds4_gpu_tensor_alloc((uint64_t)g->n_block_cap * DS4_N_INDEXER_HEAD_DIM * 2u);
             ok = ok && g->layer_k_cache[il] && g->layer_v_cache[il] && g->layer_ik_cache[il] && g->layer_block_key[il];
         }
@@ -66207,9 +66228,11 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
  * tag is unchanged and older checkpoints still load. */
 static uint32_t qwen4_payload_tag(void) {
     uint32_t bits = 0;
-    if (!g_qwen4_rope_yarn) return DS4_QWEN4_PAYLOAD_TAG;
+    /* a compact-KV checkpoint never loads into f16 caches, nor the reverse */
+    const uint32_t tag = DS4_QWEN4_PAYLOAD_TAG ^ (g_qwen4_kv_q8 ? 0x51384b56u : 0u);
+    if (!g_qwen4_rope_yarn) return tag;
     memcpy(&bits, &g_qwen4_rope_factor, sizeof(bits));
-    return DS4_QWEN4_PAYLOAD_TAG ^ (bits | 1u);
+    return tag ^ (bits | 1u);
 }
 
 static uint64_t qwen4_payload_lin_state_bytes(void) {
@@ -66220,10 +66243,10 @@ static uint64_t qwen4_payload_lin_hist_bytes(void) {
     return (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
 }
 static uint64_t qwen4_payload_kv_bytes(uint32_t rows) {
-    return (uint64_t)rows * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+    return (uint64_t)rows * qwen4_kv_pos_bytes_for(g_qwen4_kv_q8);
 }
 static uint64_t qwen4_payload_ik_bytes(uint32_t rows) {
-    return (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    return (uint64_t)rows * DS4_N_INDEXER_HEAD_DIM * qwen4_ik_elem_bytes_for(g_qwen4_kv_q8);
 }
 static uint64_t qwen4_payload_block_key_bytes(uint32_t rows) {
     return (uint64_t)(rows / 4u) * DS4_N_INDEXER_HEAD_DIM * 2u;
@@ -66341,7 +66364,7 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
         return 1;
     }
     if (h[12] != qwen4_payload_tag()) {
-        payload_set_err(err, errlen, "KV checkpoint was written by a different model family or YaRN factor");
+        payload_set_err(err, errlen, "KV checkpoint was written by a different model family, YaRN factor or KV format (int8 vs f16)");
         return 1;
     }
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
@@ -74468,6 +74491,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #ifndef DS4_NO_GPU
         g_qwen4_power_percent = (uint32_t)e->power_percent;
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+        g_qwen4_kv_q8 = ds4_gpu_qwen4_set_kv_q8(qwen4_kv_q8_wanted(e->backend)) != 0;
 #endif
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {

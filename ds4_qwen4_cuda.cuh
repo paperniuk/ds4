@@ -1931,6 +1931,8 @@ extern "C" int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *dst,
     return launched();
 }
 
+extern "C" int ds4_gpu_qwen4_set_kv_q8(int on) { (void)on; return 0; }
+
 extern "C" void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n, float scale) {
     qwen4_cuda::rope_set = freq != NULL;
     qwen4_cuda::rope_scale = freq ? scale : 1;

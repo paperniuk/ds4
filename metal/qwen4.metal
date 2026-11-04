@@ -3594,6 +3594,329 @@ template [[host_name("kernel_qwen4_moe_mid_iq3_xxs")]] kernel qwen4_moe_mid_grid
 template [[host_name("kernel_qwen4_moe_mid_iq3_s")]]   kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq3_s, ds4q_dequantize_iq3_s>;
 template [[host_name("kernel_qwen4_moe_mid_iq4_xs")]]  kernel qwen4_moe_mid_grid_t kernel_qwen4_moe_mid_grid<block_iq4_xs, ds4q_dequantize_iq4_xs>;
 
+/* Codebook routed experts, decode (kernel_qwen4_moe_mid_cb): the lane map of
+ * kernel_qwen4_moe_mid_grid (lane l takes chunk l % 16 of every second
+ * 256-block), with QWEN4_CB_MID_NR rows per SIMD group and a dot product
+ * per chunk that reads the codes as words, negates the grid bytes with a
+ * byte mask of the signs (one table lookup for eight weights) and applies
+ * the block scale once per chunk.  Grids and masks the type reads faster
+ * from threadgroup memory are copied there first; on M1 Max this took the
+ * pack's codebook mid from 101-144 to 79-98 us per decode token. */
+#define QWEN4_CB_MID_NR 2
+
+/* byte masks of 8 signs: 0xff where the weight is negative.  ksmask takes
+ * the 7-bit index of ds4_metal_ksigns_iq2xs, smask a raw sign byte. */
+static constant ulong qwen4_cb_ksmask[128] = {
+    0x0000000000000000, 0xff000000000000ff, 0xff0000000000ff00, 0x000000000000ffff,
+    0xff00000000ff0000, 0x0000000000ff00ff, 0x0000000000ffff00, 0xff00000000ffffff,
+    0xff000000ff000000, 0x00000000ff0000ff, 0x00000000ff00ff00, 0xff000000ff00ffff,
+    0x00000000ffff0000, 0xff000000ffff00ff, 0xff000000ffffff00, 0x00000000ffffffff,
+    0xff0000ff00000000, 0x000000ff000000ff, 0x000000ff0000ff00, 0xff0000ff0000ffff,
+    0x000000ff00ff0000, 0xff0000ff00ff00ff, 0xff0000ff00ffff00, 0x000000ff00ffffff,
+    0x000000ffff000000, 0xff0000ffff0000ff, 0xff0000ffff00ff00, 0x000000ffff00ffff,
+    0xff0000ffffff0000, 0x000000ffffff00ff, 0x000000ffffffff00, 0xff0000ffffffffff,
+    0xff00ff0000000000, 0x0000ff00000000ff, 0x0000ff000000ff00, 0xff00ff000000ffff,
+    0x0000ff0000ff0000, 0xff00ff0000ff00ff, 0xff00ff0000ffff00, 0x0000ff0000ffffff,
+    0x0000ff00ff000000, 0xff00ff00ff0000ff, 0xff00ff00ff00ff00, 0x0000ff00ff00ffff,
+    0xff00ff00ffff0000, 0x0000ff00ffff00ff, 0x0000ff00ffffff00, 0xff00ff00ffffffff,
+    0x0000ffff00000000, 0xff00ffff000000ff, 0xff00ffff0000ff00, 0x0000ffff0000ffff,
+    0xff00ffff00ff0000, 0x0000ffff00ff00ff, 0x0000ffff00ffff00, 0xff00ffff00ffffff,
+    0xff00ffffff000000, 0x0000ffffff0000ff, 0x0000ffffff00ff00, 0xff00ffffff00ffff,
+    0x0000ffffffff0000, 0xff00ffffffff00ff, 0xff00ffffffffff00, 0x0000ffffffffffff,
+    0xffff000000000000, 0x00ff0000000000ff, 0x00ff00000000ff00, 0xffff00000000ffff,
+    0x00ff000000ff0000, 0xffff000000ff00ff, 0xffff000000ffff00, 0x00ff000000ffffff,
+    0x00ff0000ff000000, 0xffff0000ff0000ff, 0xffff0000ff00ff00, 0x00ff0000ff00ffff,
+    0xffff0000ffff0000, 0x00ff0000ffff00ff, 0x00ff0000ffffff00, 0xffff0000ffffffff,
+    0x00ff00ff00000000, 0xffff00ff000000ff, 0xffff00ff0000ff00, 0x00ff00ff0000ffff,
+    0xffff00ff00ff0000, 0x00ff00ff00ff00ff, 0x00ff00ff00ffff00, 0xffff00ff00ffffff,
+    0xffff00ffff000000, 0x00ff00ffff0000ff, 0x00ff00ffff00ff00, 0xffff00ffff00ffff,
+    0x00ff00ffffff0000, 0xffff00ffffff00ff, 0xffff00ffffffff00, 0x00ff00ffffffffff,
+    0x00ffff0000000000, 0xffffff00000000ff, 0xffffff000000ff00, 0x00ffff000000ffff,
+    0xffffff0000ff0000, 0x00ffff0000ff00ff, 0x00ffff0000ffff00, 0xffffff0000ffffff,
+    0xffffff00ff000000, 0x00ffff00ff0000ff, 0x00ffff00ff00ff00, 0xffffff00ff00ffff,
+    0x00ffff00ffff0000, 0xffffff00ffff00ff, 0xffffff00ffffff00, 0x00ffff00ffffffff,
+    0xffffffff00000000, 0x00ffffff000000ff, 0x00ffffff0000ff00, 0xffffffff0000ffff,
+    0x00ffffff00ff0000, 0xffffffff00ff00ff, 0xffffffff00ffff00, 0x00ffffff00ffffff,
+    0x00ffffffff000000, 0xffffffffff0000ff, 0xffffffffff00ff00, 0x00ffffffff00ffff,
+    0xffffffffffff0000, 0x00ffffffffff00ff, 0x00ffffffffffff00, 0xffffffffffffffff,
+};
+static constant ulong qwen4_cb_smask[256] = {
+    0x0000000000000000, 0x00000000000000ff, 0x000000000000ff00, 0x000000000000ffff,
+    0x0000000000ff0000, 0x0000000000ff00ff, 0x0000000000ffff00, 0x0000000000ffffff,
+    0x00000000ff000000, 0x00000000ff0000ff, 0x00000000ff00ff00, 0x00000000ff00ffff,
+    0x00000000ffff0000, 0x00000000ffff00ff, 0x00000000ffffff00, 0x00000000ffffffff,
+    0x000000ff00000000, 0x000000ff000000ff, 0x000000ff0000ff00, 0x000000ff0000ffff,
+    0x000000ff00ff0000, 0x000000ff00ff00ff, 0x000000ff00ffff00, 0x000000ff00ffffff,
+    0x000000ffff000000, 0x000000ffff0000ff, 0x000000ffff00ff00, 0x000000ffff00ffff,
+    0x000000ffffff0000, 0x000000ffffff00ff, 0x000000ffffffff00, 0x000000ffffffffff,
+    0x0000ff0000000000, 0x0000ff00000000ff, 0x0000ff000000ff00, 0x0000ff000000ffff,
+    0x0000ff0000ff0000, 0x0000ff0000ff00ff, 0x0000ff0000ffff00, 0x0000ff0000ffffff,
+    0x0000ff00ff000000, 0x0000ff00ff0000ff, 0x0000ff00ff00ff00, 0x0000ff00ff00ffff,
+    0x0000ff00ffff0000, 0x0000ff00ffff00ff, 0x0000ff00ffffff00, 0x0000ff00ffffffff,
+    0x0000ffff00000000, 0x0000ffff000000ff, 0x0000ffff0000ff00, 0x0000ffff0000ffff,
+    0x0000ffff00ff0000, 0x0000ffff00ff00ff, 0x0000ffff00ffff00, 0x0000ffff00ffffff,
+    0x0000ffffff000000, 0x0000ffffff0000ff, 0x0000ffffff00ff00, 0x0000ffffff00ffff,
+    0x0000ffffffff0000, 0x0000ffffffff00ff, 0x0000ffffffffff00, 0x0000ffffffffffff,
+    0x00ff000000000000, 0x00ff0000000000ff, 0x00ff00000000ff00, 0x00ff00000000ffff,
+    0x00ff000000ff0000, 0x00ff000000ff00ff, 0x00ff000000ffff00, 0x00ff000000ffffff,
+    0x00ff0000ff000000, 0x00ff0000ff0000ff, 0x00ff0000ff00ff00, 0x00ff0000ff00ffff,
+    0x00ff0000ffff0000, 0x00ff0000ffff00ff, 0x00ff0000ffffff00, 0x00ff0000ffffffff,
+    0x00ff00ff00000000, 0x00ff00ff000000ff, 0x00ff00ff0000ff00, 0x00ff00ff0000ffff,
+    0x00ff00ff00ff0000, 0x00ff00ff00ff00ff, 0x00ff00ff00ffff00, 0x00ff00ff00ffffff,
+    0x00ff00ffff000000, 0x00ff00ffff0000ff, 0x00ff00ffff00ff00, 0x00ff00ffff00ffff,
+    0x00ff00ffffff0000, 0x00ff00ffffff00ff, 0x00ff00ffffffff00, 0x00ff00ffffffffff,
+    0x00ffff0000000000, 0x00ffff00000000ff, 0x00ffff000000ff00, 0x00ffff000000ffff,
+    0x00ffff0000ff0000, 0x00ffff0000ff00ff, 0x00ffff0000ffff00, 0x00ffff0000ffffff,
+    0x00ffff00ff000000, 0x00ffff00ff0000ff, 0x00ffff00ff00ff00, 0x00ffff00ff00ffff,
+    0x00ffff00ffff0000, 0x00ffff00ffff00ff, 0x00ffff00ffffff00, 0x00ffff00ffffffff,
+    0x00ffffff00000000, 0x00ffffff000000ff, 0x00ffffff0000ff00, 0x00ffffff0000ffff,
+    0x00ffffff00ff0000, 0x00ffffff00ff00ff, 0x00ffffff00ffff00, 0x00ffffff00ffffff,
+    0x00ffffffff000000, 0x00ffffffff0000ff, 0x00ffffffff00ff00, 0x00ffffffff00ffff,
+    0x00ffffffffff0000, 0x00ffffffffff00ff, 0x00ffffffffffff00, 0x00ffffffffffffff,
+    0xff00000000000000, 0xff000000000000ff, 0xff0000000000ff00, 0xff0000000000ffff,
+    0xff00000000ff0000, 0xff00000000ff00ff, 0xff00000000ffff00, 0xff00000000ffffff,
+    0xff000000ff000000, 0xff000000ff0000ff, 0xff000000ff00ff00, 0xff000000ff00ffff,
+    0xff000000ffff0000, 0xff000000ffff00ff, 0xff000000ffffff00, 0xff000000ffffffff,
+    0xff0000ff00000000, 0xff0000ff000000ff, 0xff0000ff0000ff00, 0xff0000ff0000ffff,
+    0xff0000ff00ff0000, 0xff0000ff00ff00ff, 0xff0000ff00ffff00, 0xff0000ff00ffffff,
+    0xff0000ffff000000, 0xff0000ffff0000ff, 0xff0000ffff00ff00, 0xff0000ffff00ffff,
+    0xff0000ffffff0000, 0xff0000ffffff00ff, 0xff0000ffffffff00, 0xff0000ffffffffff,
+    0xff00ff0000000000, 0xff00ff00000000ff, 0xff00ff000000ff00, 0xff00ff000000ffff,
+    0xff00ff0000ff0000, 0xff00ff0000ff00ff, 0xff00ff0000ffff00, 0xff00ff0000ffffff,
+    0xff00ff00ff000000, 0xff00ff00ff0000ff, 0xff00ff00ff00ff00, 0xff00ff00ff00ffff,
+    0xff00ff00ffff0000, 0xff00ff00ffff00ff, 0xff00ff00ffffff00, 0xff00ff00ffffffff,
+    0xff00ffff00000000, 0xff00ffff000000ff, 0xff00ffff0000ff00, 0xff00ffff0000ffff,
+    0xff00ffff00ff0000, 0xff00ffff00ff00ff, 0xff00ffff00ffff00, 0xff00ffff00ffffff,
+    0xff00ffffff000000, 0xff00ffffff0000ff, 0xff00ffffff00ff00, 0xff00ffffff00ffff,
+    0xff00ffffffff0000, 0xff00ffffffff00ff, 0xff00ffffffffff00, 0xff00ffffffffffff,
+    0xffff000000000000, 0xffff0000000000ff, 0xffff00000000ff00, 0xffff00000000ffff,
+    0xffff000000ff0000, 0xffff000000ff00ff, 0xffff000000ffff00, 0xffff000000ffffff,
+    0xffff0000ff000000, 0xffff0000ff0000ff, 0xffff0000ff00ff00, 0xffff0000ff00ffff,
+    0xffff0000ffff0000, 0xffff0000ffff00ff, 0xffff0000ffffff00, 0xffff0000ffffffff,
+    0xffff00ff00000000, 0xffff00ff000000ff, 0xffff00ff0000ff00, 0xffff00ff0000ffff,
+    0xffff00ff00ff0000, 0xffff00ff00ff00ff, 0xffff00ff00ffff00, 0xffff00ff00ffffff,
+    0xffff00ffff000000, 0xffff00ffff0000ff, 0xffff00ffff00ff00, 0xffff00ffff00ffff,
+    0xffff00ffffff0000, 0xffff00ffffff00ff, 0xffff00ffffffff00, 0xffff00ffffffffff,
+    0xffffff0000000000, 0xffffff00000000ff, 0xffffff000000ff00, 0xffffff000000ffff,
+    0xffffff0000ff0000, 0xffffff0000ff00ff, 0xffffff0000ffff00, 0xffffff0000ffffff,
+    0xffffff00ff000000, 0xffffff00ff0000ff, 0xffffff00ff00ff00, 0xffffff00ff00ffff,
+    0xffffff00ffff0000, 0xffffff00ffff00ff, 0xffffff00ffffff00, 0xffffff00ffffffff,
+    0xffffffff00000000, 0xffffffff000000ff, 0xffffffff0000ff00, 0xffffffff0000ffff,
+    0xffffffff00ff0000, 0xffffffff00ff00ff, 0xffffffff00ffff00, 0xffffffff00ffffff,
+    0xffffffffff000000, 0xffffffffff0000ff, 0xffffffffff00ff00, 0xffffffffff00ffff,
+    0xffffffffffff0000, 0xffffffffffff00ff, 0xffffffffffffff00, 0xffffffffffffffff,
+};
+
+/* eight grid magnitudes (bytes of g8, never 0) negated where m is 0xff, as
+ * two's complement bytes, times the inputs */
+static inline float qwen4_cb_dot8(ulong g8, ulong m, float4 ya, float4 yb) {
+    const ulong v = (g8 ^ m) + (m & 0x0101010101010101ul);
+    return dot(float4(as_type<char4>((uint)v)), ya) + dot(float4(as_type<char4>((uint)(v >> 32))), yb);
+}
+
+/* per type: grid entries, 8-byte (else 4-byte) entries, sign mask table
+ * (ksmask, else smask), and whether the tables live in threadgroup memory
+ * (QWEN4_CB_TG_GRID / QWEN4_CB_TG_MASK, one bit per type in this order:
+ * IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) */
+#ifndef QWEN4_CB_TG_GRID
+#define QWEN4_CB_TG_GRID 0x17u
+#endif
+#ifndef QWEN4_CB_TG_MASK
+#define QWEN4_CB_TG_MASK 0x0fu
+#endif
+template <uint T> struct qwen4_cb_cfg;
+template <> struct qwen4_cb_cfg<16> { static constexpr constant uint gn = 256,  bit = 1;  static constexpr constant bool g64 = true,  ks = true;  };
+template <> struct qwen4_cb_cfg<17> { static constexpr constant uint gn = 512,  bit = 2;  static constexpr constant bool g64 = true,  ks = true;  };
+template <> struct qwen4_cb_cfg<22> { static constexpr constant uint gn = 1024, bit = 4;  static constexpr constant bool g64 = true,  ks = false; };
+template <> struct qwen4_cb_cfg<18> { static constexpr constant uint gn = 256,  bit = 8;  static constexpr constant bool g64 = false, ks = true;  };
+template <> struct qwen4_cb_cfg<21> { static constexpr constant uint gn = 512,  bit = 16; static constexpr constant bool g64 = false, ks = false; };
+
+template <uint T>
+static inline ulong qwen4_cb_grid_const(uint i) {
+    if constexpr (T == 16u) return ds4_metal_iq2xxs_grid[i];
+    else if constexpr (T == 17u) return ds4q_iq2xs_grid[i];
+    else if constexpr (T == 22u) return ds4q_iq2s_grid[i];
+    else if constexpr (T == 18u) return ds4q_iq3xxs_grid[i];
+    else return ds4q_iq3s_grid[i];
+}
+
+/* ulongs before the threadgroup grid: the masks when they are there too */
+template <uint T>
+static constexpr constant uint qwen4_cb_grid_at =
+    (QWEN4_CB_TG_MASK & qwen4_cb_cfg<T>::bit) != 0 ? (qwen4_cb_cfg<T>::ks ? 128u : 256u) : 0u;
+
+template <uint T>
+static inline ulong qwen4_cb_grid(uint i, threadgroup const ulong *tg) {
+    typedef qwen4_cb_cfg<T> C;
+    constexpr uint mn = qwen4_cb_grid_at<T>;
+    if constexpr ((QWEN4_CB_TG_GRID & C::bit) == 0) return qwen4_cb_grid_const<T>(i);
+    else if constexpr (C::g64) return tg[mn + i];
+    else return ((threadgroup const uint *)(tg + mn))[i];
+}
+
+template <uint T>
+static inline ulong qwen4_cb_mask(uint i, threadgroup const ulong *tg) {
+    typedef qwen4_cb_cfg<T> C;
+    if constexpr ((QWEN4_CB_TG_MASK & C::bit) != 0) return tg[i];
+    else if constexpr (C::ks) return qwen4_cb_ksmask[i];
+    else return qwen4_cb_smask[i];
+}
+
+/* copy the tables a type keeps in threadgroup memory: masks first, then the
+ * grid (the host sizes the buffer with ds4_gpu's qwen4_cb_tg_bytes) */
+template <uint T>
+static inline void qwen4_cb_load_tables(threadgroup ulong *tg, uint tid, uint nt) {
+    typedef qwen4_cb_cfg<T> C;
+    constexpr uint mn = qwen4_cb_grid_at<T>;
+    if constexpr ((QWEN4_CB_TG_MASK & C::bit) != 0)
+        for (uint i = tid; i < mn; i += nt) tg[i] = C::ks ? qwen4_cb_ksmask[i] : qwen4_cb_smask[i];
+    if constexpr ((QWEN4_CB_TG_GRID & C::bit) != 0) {
+        if constexpr (C::g64) {
+            for (uint i = tid; i < C::gn; i += nt) tg[mn + i] = qwen4_cb_grid_const<T>(i);
+        } else {
+            threadgroup uint *g = (threadgroup uint *)(tg + mn);
+            for (uint i = tid; i < C::gn; i += nt) g[i] = (uint)qwen4_cb_grid_const<T>(i);
+        }
+    }
+}
+
+/* chunk il (16 weights, half h of 32-block ib32) of one 256-block, dotted
+ * with y[0..3] */
+template <uint T>
+static inline float qwen4_cb_dot16(device const uchar *blk, uint il, thread const float4 *y, threadgroup const ulong *tg) {
+    const uint ib32 = il / 2u, h = il % 2u;
+    const float d = (float)*(device const half *)blk;
+    if constexpr (T == 16u) {           /* IQ2_XXS, 66 bytes */
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4u * ib32;
+        const uint ag = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint as = (uint)q2[2] | ((uint)q2[3] << 16);
+        float s = 0.0f;
+        for (uint k = 0; k < 2u; k++) {
+            const uint q = 2u * h + k;
+            s += qwen4_cb_dot8(qwen4_cb_grid<T>((ag >> (8u * q)) & 0xFFu, tg),
+                               qwen4_cb_mask<T>((as >> (7u * q)) & 127u, tg), y[2u * k], y[2u * k + 1u]);
+        }
+        return d * (0.5f + (float)(as >> 28)) * 0.25f * s;
+    } else if constexpr (T == 17u) {    /* IQ2_XS, 74 bytes */
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4u * ib32 + 2u * h;
+        const uint sc = (blk[66 + ib32] >> (4u * h)) & 0xFu;
+        float s = 0.0f;
+        for (uint k = 0; k < 2u; k++) {
+            const uint q = q2[k];
+            s += qwen4_cb_dot8(qwen4_cb_grid<T>(q & 511u, tg), qwen4_cb_mask<T>(q >> 9, tg), y[2u * k], y[2u * k + 1u]);
+        }
+        return d * (0.5f + (float)sc) * 0.25f * s;
+    } else if constexpr (T == 22u) {    /* IQ2_S, 82 bytes */
+        device const uchar *qs = blk + 2 + 4u * ib32 + 2u * h;
+        const uint qh = blk[66 + ib32] >> (4u * h);
+        const uint sc = (blk[74 + ib32] >> (4u * h)) & 0xFu;
+        float s = 0.0f;
+        for (uint k = 0; k < 2u; k++) {
+            s += qwen4_cb_dot8(qwen4_cb_grid<T>((uint)qs[k] | ((qh << (8u - 2u * k)) & 0x300u), tg),
+                               qwen4_cb_mask<T>(qs[32 + k], tg), y[2u * k], y[2u * k + 1u]);
+        }
+        return d * (0.5f + (float)sc) * 0.25f * s;
+    } else if constexpr (T == 18u) {    /* IQ3_XXS, 98 bytes */
+        device const ushort *q3 = (device const ushort *)(blk + 2 + 8u * ib32 + 4u * h);
+        const uint q = (uint)q3[0] | ((uint)q3[1] << 16);
+        device const ushort *gas = (device const ushort *)(blk + 66) + 2u * ib32;
+        const uint aux = (uint)gas[0] | ((uint)gas[1] << 16);
+        float s = 0.0f;
+        for (uint k = 0; k < 2u; k++) {
+            const ulong g8 = qwen4_cb_grid<T>((q >> (16u * k)) & 0xFFu, tg) |
+                             (qwen4_cb_grid<T>((q >> (16u * k + 8u)) & 0xFFu, tg) << 32);
+            s += qwen4_cb_dot8(g8, qwen4_cb_mask<T>((aux >> (14u * h + 7u * k)) & 127u, tg), y[2u * k], y[2u * k + 1u]);
+        }
+        return d * (0.5f + (float)(aux >> 28)) * 0.5f * s;
+    } else {                            /* IQ3_S, 110 bytes */
+        device const ushort *q3 = (device const ushort *)(blk + 2 + 8u * ib32 + 4u * h);
+        const uint q = (uint)q3[0] | ((uint)q3[1] << 16);
+        const uint qh = blk[66 + ib32] >> (4u * h);
+        const uint sg = *(device const ushort *)(blk + 74 + 4u * ib32 + 2u * h);
+        const uint sc = (blk[106 + ib32 / 2u] >> (4u * (ib32 % 2u))) & 0xFu;
+        float s = 0.0f;
+        for (uint k = 0; k < 2u; k++) {
+            const ulong g8 = qwen4_cb_grid<T>(((q >> (16u * k)) & 0xFFu) | ((qh << (8u - 2u * k)) & 256u), tg) |
+                             (qwen4_cb_grid<T>(((q >> (16u * k + 8u)) & 0xFFu) | ((qh << (7u - 2u * k)) & 256u), tg) << 32);
+            s += qwen4_cb_dot8(g8, qwen4_cb_mask<T>((sg >> (8u * k)) & 0xFFu, tg), y[2u * k], y[2u * k + 1u]);
+        }
+        return d * (float)(1u + 2u * sc) * s;
+    }
+}
+
+template <uint T, uint BB>
+kernel void kernel_qwen4_moe_mid_cb(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *selected,
+        device const float   *x,
+        device float         *mid,
+        device const char    *sh_gate,
+        device const char    *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort tid [[thread_index_in_threadgroup]],
+        threadgroup ulong *tg [[threadgroup(0)]]) {
+    constexpr uint NR = QWEN4_CB_MID_NR;
+    constexpr bool TG = ((QWEN4_CB_TG_GRID | QWEN4_CB_TG_MASK) & qwen4_cb_cfg<T>::bit) != 0;
+    if (TG) {
+        qwen4_cb_load_tables<T>(tg, tid, ntg.x);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const uint tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const bool shared = tgpig.y >= args.n_slots;
+    const uint slot = shared ? args.n_slots : tgpig.y;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    device float *out = mid + ((uint64_t)tok * n_out + slot) * args.out_rows;
+    if (shared) {
+        /* the host adds NR - 1 grid slots: one row each */
+        const uint r = row0 + (tgpig.y - args.n_slots);
+        if (r < args.out_rows) {
+            const uint64_t off = (uint64_t)r * args.shared_row_bytes;
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            if (tiisg == 0) out[r] = qwen4_silu(g) * u;
+        }
+        return;
+    }
+    const uint64_t ebase = (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const uchar *gr[NR], *ur[NR];
+    for (uint r = 0; r < NR; r++) {
+        const uint64_t off = ebase + (uint64_t)min(row0 + r, args.out_rows - 1u) * args.row_bytes;
+        gr[r] = (device const uchar *)(gate_base + off);
+        ur[r] = (device const uchar *)(up_base + off);
+    }
+    const uint ix = tiisg / 16u, il = tiisg % 16u;
+    const uint nb = args.in_dim / 256u;
+    float sg[NR], su[NR];
+    for (uint r = 0; r < NR; r++) { sg[r] = 0.0f; su[r] = 0.0f; }
+    for (uint ib = ix; ib < nb; ib += 2u) {
+        device const float4 *yp = (device const float4 *)(xt + ib * 256u + il * 16u);
+        const float4 y[4] = { yp[0], yp[1], yp[2], yp[3] };
+        for (uint r = 0; r < NR; r++) {
+            sg[r] += qwen4_cb_dot16<T>(gr[r] + ib * BB, il, y, tg);
+            su[r] += qwen4_cb_dot16<T>(ur[r] + ib * BB, il, y, tg);
+        }
+    }
+    for (uint r = 0; r < NR; r++) {
+        const float g = simd_sum(sg[r]), u = simd_sum(su[r]);
+        if (tiisg == 0 && row0 + r < args.out_rows) out[row0 + r] = qwen4_silu(g) * u;
+    }
+}
+
+typedef decltype(kernel_qwen4_moe_mid_cb<16, 66>) qwen4_moe_mid_cb_t;
+template [[host_name("kernel_qwen4_moe_mid_cb_iq2_xxs")]] kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<16, 66>;
+template [[host_name("kernel_qwen4_moe_mid_cb_iq2_xs")]]  kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<17, 74>;
+template [[host_name("kernel_qwen4_moe_mid_cb_iq2_s")]]   kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<22, 82>;
+template [[host_name("kernel_qwen4_moe_mid_cb_iq3_xxs")]] kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<18, 98>;
+template [[host_name("kernel_qwen4_moe_mid_cb_iq3_s")]]   kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<21, 110>;
+
 /* IQ4_NL down rows, laid out as the Q2_0 ones: eight lanes share a row of
  * 640 inputs (40 chunks of 16) and the four lane groups of a SIMD group
  * take QWEN4_IQ4_NL_DOWN_NR rows each. */

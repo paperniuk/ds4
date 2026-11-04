@@ -50877,6 +50877,11 @@ enum {
     QWEN4_K_MOE_MID_IQ3_XXS,
     QWEN4_K_MOE_MID_IQ3_S,
     QWEN4_K_MOE_MID_IQ4_XS,
+    QWEN4_K_MOE_MID_CB_IQ2_XXS,
+    QWEN4_K_MOE_MID_CB_IQ2_XS,
+    QWEN4_K_MOE_MID_CB_IQ2_S,
+    QWEN4_K_MOE_MID_CB_IQ3_XXS,
+    QWEN4_K_MOE_MID_CB_IQ3_S,
     QWEN4_K_MOE_DOWN_IQ4_NL,
     QWEN4_K_ATTN_PREP_Q8,
     QWEN4_K_ATTN_PREP_ROWS_Q8,
@@ -51025,6 +51030,11 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mid_iq3_xxs",
     "kernel_qwen4_moe_mid_iq3_s",
     "kernel_qwen4_moe_mid_iq4_xs",
+    "kernel_qwen4_moe_mid_cb_iq2_xxs",
+    "kernel_qwen4_moe_mid_cb_iq2_xs",
+    "kernel_qwen4_moe_mid_cb_iq2_s",
+    "kernel_qwen4_moe_mid_cb_iq3_xxs",
+    "kernel_qwen4_moe_mid_cb_iq3_s",
     "kernel_qwen4_moe_down_iq4_nl",
     "kernel_qwen4_attn_prep_q8",
     "kernel_qwen4_attn_prep_rows_q8",
@@ -52313,6 +52323,20 @@ int ds4_gpu_qwen4_attn_decode_rows_tensor(
                           MTLSizeMake(n_head, n_rows, 1), MTLSizeMake(head_dim, 1, 1), 0);
 }
 
+/* threadgroup tables of kernel_qwen4_moe_mid_cb (QWEN4_CB_TG_GRID and
+ * QWEN4_CB_TG_MASK in metal/qwen4.metal): the sign masks (128 or 256
+ * ulongs) where the type keeps them there, then its grid */
+static NSUInteger qwen4_cb_tg_bytes(uint32_t weight_type) {
+    switch (weight_type) {
+    case 16u: return 128u * 8u + 256u * 8u;    /* IQ2_XXS: masks, grid */
+    case 17u: return 128u * 8u + 512u * 8u;    /* IQ2_XS: masks, grid */
+    case 22u: return 256u * 8u + 1024u * 8u;   /* IQ2_S: masks, grid */
+    case 18u: return 128u * 8u;                /* IQ3_XXS: masks */
+    case 21u: return 512u * 4u;                /* IQ3_S: grid */
+    default:  return 0u;
+    }
+}
+
 int ds4_gpu_qwen4_moe_mid_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
@@ -52373,6 +52397,19 @@ int ds4_gpu_qwen4_moe_mid_tensor(
         const uint32_t split = has_shared && shared_type != 42u ? 2u : 1u;
         return qwen4_dispatch(QWEN4_K_MOE_MID_Q2_0, &args, sizeof(args), b, 7,
                               MTLSizeMake((ff_dim + 7u) / 8u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
+    }
+    const int cb_kernel = weight_type == 16u ? QWEN4_K_MOE_MID_CB_IQ2_XXS :
+                          weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_CB_IQ2_XS :
+                          weight_type == DS4_METAL_TENSOR_IQ2_S ? QWEN4_K_MOE_MID_CB_IQ2_S :
+                          weight_type == DS4_METAL_TENSOR_IQ3_XXS ? QWEN4_K_MOE_MID_CB_IQ3_XXS :
+                          weight_type == DS4_METAL_TENSOR_IQ3_S ? QWEN4_K_MOE_MID_CB_IQ3_S : -1;
+    if (cb_kernel >= 0 && (in_dim % 256u) == 0 && ds4_gpu_env_bool("DS4_QWEN4_MOE_CB_MID") != 0) {
+        /* codebook experts: QWEN4_CB_MID_NR (2) gate and up rows per SIMD
+         * group; the shared expert spreads over NR - 1 extra slots (metal/qwen4.metal) */
+        const uint32_t nr = 2u;
+        return qwen4_dispatch(cb_kernel, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + 4u * nr - 1u) / (4u * nr), n_out + (has_shared ? nr - 1u : 0u), n_tokens),
+                              MTLSizeMake(128, 1, 1), qwen4_cb_tg_bytes(weight_type));
     }
     const int grid_kernel = weight_type == DS4_METAL_TENSOR_IQ2_XS ? QWEN4_K_MOE_MID_IQ2_XS :
                             weight_type == DS4_METAL_TENSOR_IQ2_S ? QWEN4_K_MOE_MID_IQ2_S :

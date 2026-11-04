@@ -3526,6 +3526,76 @@ static void bench_moe_pack(arena_t *a) {
     for (int i = 0; i < 6; i++) ds4_gpu_tensor_free(st[i]);
 }
 
+/* QWEN4_MOE_DECODE_BENCH=1: one-token routed expert matvecs of the pack
+ * types at model shape (512 experts, 10 slots), cycling through 64 expert
+ * selections so the weights stream from DRAM as in decode.  GB/s counts the
+ * expert bytes one call reads. */
+static void bench_moe_decode(arena_t *a) {
+    const uint32_t NE = 512, slots = 10, E = 2560, F = 640, NSEL = 64, CALLS = 256;
+    int32_t *sel = malloc((uint64_t)NSEL * slots * sizeof(int32_t));
+    uint32_t seed = 777u;
+    for (uint32_t t = 0; t < NSEL; t++)
+        for (uint32_t s = 0; s < slots; s++) {
+            int32_t e; bool dup;
+            do {
+                seed = seed * 1664525u + 1013904223u;
+                e = (int32_t)((seed >> 8) % NE);
+                dup = false;
+                for (uint32_t q = 0; q < s; q++) dup |= sel[t * slots + q] == e;
+            } while (dup);
+            sel[t * slots + s] = e;
+        }
+    ds4_gpu_tensor *gsel[64];
+    for (uint32_t t = 0; t < NSEL; t++) {
+        gsel[t] = ds4_gpu_tensor_alloc(slots * sizeof(int32_t));
+        require_ok(gsel[t] && ds4_gpu_tensor_write(gsel[t], 0, sel + t * slots, slots * sizeof(int32_t)), "decode bench sel");
+    }
+    free(sel);
+    float *xv = rand_vec(E, 1.0f);
+    ds4_gpu_tensor *gx = upload(xv, E); free(xv);
+    float *mv = rand_vec((uint64_t)slots * F, 0.5f);
+    ds4_gpu_tensor *gm = upload(mv, (uint64_t)slots * F); free(mv);
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)slots * F);
+    ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)slots * E);
+    static const uint32_t types[8] = { 16u, 17u, 22u, 18u, 21u, 42u, 20u, 42u };
+    static const char *names[8] = { "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q2_0", "iq4_nl down", "q2_0 down" };
+    const char *only = getenv("QWEN4_BENCH_ONLY");
+    printf("moe decode, 1 token x %u slots of %u experts, us per call and GB/s (best of 5 x %u)\n", slots, NE, CALLS);
+    for (int k = 0; k < 8; k++) {
+        if (only && only[0] && !strstr(names[k], only)) continue;
+        const bool down = k >= 6;
+        const uint32_t type = types[k];
+        const float sc = type == 42u ? 0.05f : type == 20u ? 0.0005f : 0.0002f;
+        const uint64_t used0 = a->used;
+        const uint64_t blk = type == 42u ? 64u : type == 20u ? 32u : 256u;
+        const uint64_t bb = type == 42u || type == 20u ? 18u : type == 16u ? 66u : type == 17u ? 74u :
+                            type == 22u ? 82u : type == 18u ? 98u : 110u;
+        const uint64_t row_bytes = (down ? F : E) / blk * bb;
+        uint64_t g_off, u_off = 0;
+        if (down) g_off = arena_bench_quant(a, type, (uint64_t)NE * E, F, sc);
+        else { g_off = arena_bench_quant(a, type, (uint64_t)NE * F, E, sc); u_off = arena_bench_quant(a, type, (uint64_t)NE * F, E, sc); }
+        const double bytes = (double)slots * (down ? E : 2.0 * F) * row_bytes;
+        double best = 1e30;
+        const double tw = bench_now();
+        for (int rep = 0; rep < 6 || bench_now() - tw < 0.3; rep++) {
+            const double t0 = bench_now();
+            require_ok(ds4_gpu_begin_commands(), "begin");
+            for (uint32_t c = 0; c < CALLS; c++) {
+                ds4_gpu_tensor *s = gsel[(c * 17u) % NSEL];
+                if (down) require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gm, s, a->base, a->size, g_off, type, NE, 1, slots, F, E, 0, UINT32_MAX), "decode bench down");
+                else require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid, gx, s, a->base, a->size, g_off, u_off, type, NE, 1, slots, E, F, 0, 0, UINT32_MAX), "decode bench mid");
+            }
+            require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "sync");
+            const double us = 1e6 * (bench_now() - t0) / CALLS;
+            if (rep >= 1 && us < best) best = us;
+        }
+        printf("  %-14s %7.1f us %6.1f GB/s\n", names[k], best, bytes / best / 1e3);
+        a->used = used0;
+    }
+    for (uint32_t t = 0; t < NSEL; t++) ds4_gpu_tensor_free(gsel[t]);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gm); ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
+}
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -3947,7 +4017,7 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)(getenv("QWEN4_MOE_PACK_BENCH") ? 8192 : 2048) << 20;
+    arena.size = (uint64_t)(getenv("QWEN4_MOE_PACK_BENCH") || getenv("QWEN4_MOE_DECODE_BENCH") ? 8192 : 2048) << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -4019,6 +4089,10 @@ int main(void) {
     }
     if (getenv("QWEN4_MOE_PACK_BENCH")) {
         bench_moe_pack(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_MOE_DECODE_BENCH")) {
+        bench_moe_decode(&arena);
         return 0;
     }
     printf("hyper-connections\n");

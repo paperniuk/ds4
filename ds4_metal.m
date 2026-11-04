@@ -50817,6 +50817,12 @@ enum {
     QWEN4_K_MOE_MM_DOWN_REGH,
     QWEN4_K_MOE_MM_DOWN_REGH_NT1,
     QWEN4_K_MOE_MM_DOWN_REGH_NT2,
+    QWEN4_K_MOE_MM_MID_REGC,
+    QWEN4_K_MOE_MM_MID_REGC_NT1,
+    QWEN4_K_MOE_MM_MID_REGC_NT2,
+    QWEN4_K_MOE_MM_DOWN_REGC,
+    QWEN4_K_MOE_MM_DOWN_REGC_NT1,
+    QWEN4_K_MOE_MM_DOWN_REGC_NT2,
     QWEN4_K_MOE_MM_DOWN_NT8,
     QWEN4_K_MOE_MM_MID_NT8,
     QWEN4_K_MOE_MM_MID_NAX,
@@ -50959,6 +50965,12 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_regh",
     "kernel_qwen4_moe_mm_down_regh_nt1",
     "kernel_qwen4_moe_mm_down_regh_nt2",
+    "kernel_qwen4_moe_mm_mid_regc",
+    "kernel_qwen4_moe_mm_mid_regc_nt1",
+    "kernel_qwen4_moe_mm_mid_regc_nt2",
+    "kernel_qwen4_moe_mm_down_regc",
+    "kernel_qwen4_moe_mm_down_regc_nt1",
+    "kernel_qwen4_moe_mm_down_regc_nt2",
     "kernel_qwen4_moe_mm_down_nt8",
     "kernel_qwen4_moe_mm_mid_nt8",
     "kernel_qwen4_moe_mm_mid_nax",
@@ -51136,8 +51148,10 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
              * loop. M3 Ultra and M5 have balanced full-model measurements;
              * other devices can opt in, and zero restores the generic kernel. */
             const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_SPECIALIZE");
+            /* the codebook register tiles always take their one dequantizer */
+            const bool regc = kernel >= QWEN4_K_MOE_MM_MID_REGC && kernel <= QWEN4_K_MOE_MM_DOWN_REGC_NT2;
             const bool specialize = override >= 0 ? override != 0 :
-                ds4_gpu_device_name_contains("M3 Ultra") ||
+                regc || ds4_gpu_device_name_contains("M3 Ultra") ||
                 ds4_gpu_device_is_m5_apple_silicon();
             const uint32_t type = specialize ?
                 ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
@@ -52690,13 +52704,28 @@ static bool qwen4_moe_mm_reg_half(void) {
     return ds4_gpu_env_bool("DS4_QWEN4_MOE_REG_HALF") != 0;
 }
 
+static bool qwen4_moe_mm_reg_cb(uint32_t type, uint32_t nt) {
+    /* Register tiles for the codebook experts (IQ2_XXS .. IQ3_S, IQ4_NL),
+     * with half activations; the IQ3_XXS pack mixes them with Q2_0 down
+     * experts.  Measured on M1 Max; DS4_QWEN4_MOE_REG_CB=0 keeps the staged
+     * tiles. */
+    const bool cb = type == 16u || type == DS4_METAL_TENSOR_IQ2_XS || type == DS4_METAL_TENSOR_IQ2_S ||
+                    type == DS4_METAL_TENSOR_IQ3_XXS || type == DS4_METAL_TENSOR_IQ3_S ||
+                    type == DS4_METAL_TENSOR_IQ4_NL;
+    const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_REG_CB");
+    return cb && nt <= 4u && qwen4_moe_mm_reg_half() &&
+           (override >= 0 ? override != 0 : ds4_gpu_device_name_contains("M1"));
+}
+
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     /* Remainder tiles measured on M3 Ultra for the low-bit experts, on M5
      * for Q4_K gate/up with MXFP4 down, and on M1 Max for Q2_0 experts, where
-     * a 300-token prefill gains 22% and a 2048-token chunk 3 to 6%. */
+     * a 300-token prefill gains 22% and a 2048-token chunk 3 to 6%, and for
+     * the codebook register tiles, where a 2048-token chunk of 512 experts
+     * takes 20% less in gate/up and down. */
     const int override = ds4_gpu_env_bool("DS4_QWEN4_MOE_TAILS");
     return nt > 1u && (override >= 0 ? override != 0 :
-        (type == 42u && ds4_gpu_device_name_contains("M1")) ||
+        (type == 42u && ds4_gpu_device_name_contains("M1")) || qwen4_moe_mm_reg_cb(type, nt) ||
         ((type == 16u || type == 10u) && ds4_gpu_device_name_contains("M3 Ultra")) ||
         ((type == 12u || type == 39u) && ds4_gpu_device_is_m5_apple_silicon()));
 }
@@ -52710,11 +52739,12 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, true);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_MID_NT");
+    const bool regc = qwen4_moe_mm_reg_cb(weight_type, nt);
     const bool reg = qwen4_moe_mm_reg(weight_type, nt);
     const int regh = reg && qwen4_moe_mm_reg_half() ? QWEN4_K_MOE_MM_MID_REGH - QWEN4_K_MOE_MM_MID_REG : 0;
-    const int k_nt1 = reg ? QWEN4_K_MOE_MM_MID_REG_NT1 + regh : QWEN4_K_MOE_MM_MID_NT1;
-    const int k_nt2 = reg ? QWEN4_K_MOE_MM_MID_REG_NT2 + regh : QWEN4_K_MOE_MM_MID_NT2;
-    const int k_nt4 = reg ? QWEN4_K_MOE_MM_MID_REG + regh : QWEN4_K_MOE_MM_MID;
+    const int k_nt1 = regc ? QWEN4_K_MOE_MM_MID_REGC_NT1 : reg ? QWEN4_K_MOE_MM_MID_REG_NT1 + regh : QWEN4_K_MOE_MM_MID_NT1;
+    const int k_nt2 = regc ? QWEN4_K_MOE_MM_MID_REGC_NT2 : reg ? QWEN4_K_MOE_MM_MID_REG_NT2 + regh : QWEN4_K_MOE_MM_MID_NT2;
+    const int k_nt4 = regc ? QWEN4_K_MOE_MM_MID_REGC : reg ? QWEN4_K_MOE_MM_MID_REG + regh : QWEN4_K_MOE_MM_MID;
     const int kernel = nt == 1u ? k_nt1 : nt == 2u ? k_nt2 :
                        nt == 8u ? QWEN4_K_MOE_MM_MID_NT8 : k_nt4;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
@@ -52775,7 +52805,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
                               qwen4_moe_mm_grid((ff_dim + 63u) / 64u, n_expert, 1, args.expert_major),
                               MTLSizeMake(128, 1, 1), nax_fx || nax_comp ? 12288u : 10240u);
     }
-    if (regh) {
+    if (regh || regc) {
         /* the half tiles read a half copy of x and also write mid in half,
          * which the down tiles of the same launch read */
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
@@ -52786,7 +52816,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
         g_qwen4_nax_half_mid_for = mid;
         g_qwen4_nax_half_mid_count = mid_count;
     }
-    const int nb = regh ? 7 : 6;
+    const int nb = regh || regc ? 7 : 6;
     if (!qwen4_dispatch(kernel, &args, sizeof(args), b, nb,
                           qwen4_moe_mm_grid((ff_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
                           MTLSizeMake(128, 1, 1), 0)) return 0;
@@ -52809,13 +52839,14 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
+    const bool regc = qwen4_moe_mm_reg_cb(weight_type, nt);
     const bool reg = qwen4_moe_mm_reg(weight_type, nt);
     /* the register tiles take 64 down rows, the staged ones 32 */
-    const uint32_t rows_tg = reg ? 64u : 32u;
+    const uint32_t rows_tg = reg || regc ? 64u : 32u;
     const int regh = reg && qwen4_moe_mm_reg_half() ? QWEN4_K_MOE_MM_DOWN_REGH - QWEN4_K_MOE_MM_DOWN_REG : 0;
-    const int k_nt1 = reg ? QWEN4_K_MOE_MM_DOWN_REG_NT1 + regh : QWEN4_K_MOE_MM_DOWN_NT1;
-    const int k_nt2 = reg ? QWEN4_K_MOE_MM_DOWN_REG_NT2 + regh : QWEN4_K_MOE_MM_DOWN_NT2;
-    const int k_nt4 = reg ? QWEN4_K_MOE_MM_DOWN_REG + regh : QWEN4_K_MOE_MM_DOWN;
+    const int k_nt1 = regc ? QWEN4_K_MOE_MM_DOWN_REGC_NT1 : reg ? QWEN4_K_MOE_MM_DOWN_REG_NT1 + regh : QWEN4_K_MOE_MM_DOWN_NT1;
+    const int k_nt2 = regc ? QWEN4_K_MOE_MM_DOWN_REGC_NT2 : reg ? QWEN4_K_MOE_MM_DOWN_REG_NT2 + regh : QWEN4_K_MOE_MM_DOWN_NT2;
+    const int k_nt4 = regc ? QWEN4_K_MOE_MM_DOWN_REGC : reg ? QWEN4_K_MOE_MM_DOWN_REG + regh : QWEN4_K_MOE_MM_DOWN;
     const int kernel = nt == 1u ? k_nt1 : nt == 2u ? k_nt2 :
                        nt == 8u ? QWEN4_K_MOE_MM_DOWN_NT8 : k_nt4;
     qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
@@ -52877,7 +52908,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
                               qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, 1, args.expert_major),
                               MTLSizeMake(128, 1, 1), 8192u);
     }
-    if (regh) {
+    if (regh || regc) {
         /* the half tiles read the mid tiles' half copy of mid */
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
         ds4_gpu_tensor *mh = g_qwen4_nax_half_mid_for == mid && g_qwen4_nax_half_mid_count == mid_count && g_qwen4_nax_half_mid

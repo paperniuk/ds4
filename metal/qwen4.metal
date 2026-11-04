@@ -4281,6 +4281,29 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
     }
 }
 
+/* 16 values of the codebook register tiles: quarters q0 and q0 + 1 of
+ * 32-block b, IQ2_XXS as the staged tiles' 8-value steps, the others through
+ * qwen4_mm_deq16 */
+static inline void qwen4_reg_deq16(device const char *row, uint b, uint q0, uint type, thread float4x4 &w) {
+    if (type == 16) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 66);
+        const float d = (float)(*(device const half *)blk);
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+        const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+        const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+        for (uint h = 0; h < 2; h++) {
+            const uint q = q0 + h;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((aux_g >> (8 * q)) & 0xFFu));
+            const uint signs = ds4_metal_ksigns_iq2xs[(aux_s >> (7 * q)) & 127u];
+            for (uint i = 0; i < 8; i++) w[2 * h + i / 4][i % 4] = dl * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f);
+        }
+        return;
+    }
+    qwen4_mm_deq16(row, b, q0, type, w);
+}
+
 #define QWEN4_MM_KS 64   /* K per staging step (two 32-blocks) */
 
 /* mid[t][slot][r] = silu(gate . x) * (up . x) for every (token, slot) routed
@@ -4429,8 +4452,12 @@ kernel void kernel_qwen4_moe_mm_mid(
  * tile reads a half copy of x and leaves a half copy of mid beside the float
  * one for the down tile, which halves the bytes each tile stages.  On an
  * M1 Max that takes a 2048-token chunk from 27.7 to 23.6 ms a layer for
- * gate/up and from 14.5 to 12.6 for down. */
-template <uint NT, uint NA, uint RF, bool H = false>
+ * gate/up and from 14.5 to 12.6 for down.  CB takes the codebook types of
+ * qwen4_mm_deq16 (IQ2/IQ3/IQ4_NL) instead of Q2_0: a lane dequantizes its 16
+ * weights of a K step (k = 8 fn .. 8 fn + 15, one half of a 32-block) with
+ * the staged tiles' dequantizer, keeps them as half pairs in registers and
+ * accumulates straight into acc, the scale being part of each value. */
+template <uint NT, uint NA, uint RF, bool H = false, bool CB = false>
 static inline void qwen4_moe_reg_tile(
         constant ds4_metal_args_qwen4_moe_mm & args,
         device const char    *w0,
@@ -4473,6 +4500,7 @@ static inline void qwen4_moe_reg_tile(
     bool live[RF];
     /* an 18-byte block is 9 ushorts: the scale, then 8 codes in each of the rest */
     device const ushort *wq[NA][RF];
+    const uint atype = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
 #pragma unroll
     for (uint f = 0; f < RF; f++) {
         row[f] = rb * QWEN4_MM_ROWS * RF + (sgitg * RF + f) * 8u + fm;
@@ -4514,8 +4542,10 @@ static inline void qwen4_moe_reg_tile(
             for (uint f = 0; f < RF; f++) {
 #pragma unroll
                 for (uint j = 0; j < NT; j++) acc[i][f][j] = float2(0.0f);
-                w[i][f] = live[f] ? ((uint)wq[i][f][1 + fn] | ((uint)wq[i][f][2 + fn] << 16)) : 0u;
-                d[i][f] = live[f] ? (float)as_type<half>(wq[i][f][0]) : 0.0f;
+                if constexpr (!CB) {
+                    w[i][f] = live[f] ? ((uint)wq[i][f][1 + fn] | ((uint)wq[i][f][2 + fn] << 16)) : 0u;
+                    d[i][f] = live[f] ? (float)as_type<half>(wq[i][f][0]) : 0.0f;
+                }
             }
         }
         /* the activations of the next K step are read during this one's multiplies */
@@ -4523,6 +4553,23 @@ static inline void qwen4_moe_reg_tile(
 #pragma unroll
         for (uint j = 0; j < KPT / 4; j++) xv[j] = s_pair >= 0 ? *(device const ST4 *)(s_x + s_kq * KPT + 4u * j) : ST4(0.0f);
         for (uint kb = 0; kb < nk; kb++) {
+            /* CB: this K step's weights, lane pair (k = 8 fn + ks, 8 fn + 8 + ks),
+             * read before the barrier so the loads wait behind it */
+            half2 cav[NA][RF][8];
+            if constexpr (CB) {
+                const uint b = kb * 2u + (fn >> 2), q0 = fn & 2u;
+#pragma unroll
+                for (uint i = 0; i < NA; i++) {
+#pragma unroll
+                    for (uint f = 0; f < RF; f++) {
+                        float4x4 wv = float4x4(0.0f);
+                        if (live[f]) qwen4_reg_deq16((device const char *)wq[i][f], b, q0, atype, wv);
+#pragma unroll
+                        for (uint ks = 0; ks < 8; ks++)
+                            cav[i][f][ks] = half2((half)wv[ks >> 2][ks & 3u], (half)wv[2u + (ks >> 2)][ks & 3u]);
+                    }
+                }
+            }
 #pragma unroll
             for (uint j = 0; j < KPT / 4; j++) {
                 Bs[(s_kq * KPT + 4u * j + 0) * TT + s_tok] = (BT)xv[j].x;
@@ -4545,7 +4592,7 @@ static inline void qwen4_moe_reg_tile(
                 for (uint f = 0; f < RF; f++) {
                     cw[i][f] = w[i][f];
                     cd[i][f] = d[i][f];
-                    if (live[f] && kb + 1 < nk) {   /* read ahead: the wait hides behind the multiply */
+                    if (!CB && live[f] && kb + 1 < nk) {   /* read ahead: the wait hides behind the multiply */
                         device const ushort *nq = wq[i][f] + (kb + 1) * 9u;
                         w[i][f] = (uint)nq[1 + fn] | ((uint)nq[2 + fn] << 16);
                         d[i][f] = (float)as_type<half>(nq[0]);
@@ -4561,10 +4608,14 @@ static inline void qwen4_moe_reg_tile(
                 for (uint i = 0; i < NA; i++) {
 #pragma unroll
                     for (uint f = 0; f < RF; f++) {
-                        /* 0x6400 is half 1024 with an ulp of 1: the OR adds the code exactly */
-                        half2 q = as_type<half2>(((cw[i][f] >> (2u * ks)) & 0x00030003u) | 0x64006400u) - half2(1025.0h);
-                        if constexpr (H) q *= half2((half)cd[i][f]);   /* the scale times -1, 0, 1 or 2 is exact */
-                        reinterpret_cast<thread half2 &>(a[i][f].thread_elements()) = q;
+                        if constexpr (CB) {
+                            reinterpret_cast<thread half2 &>(a[i][f].thread_elements()) = cav[i][f][ks];
+                        } else {
+                            /* 0x6400 is half 1024 with an ulp of 1: the OR adds the code exactly */
+                            half2 q = as_type<half2>(((cw[i][f] >> (2u * ks)) & 0x00030003u) | 0x64006400u) - half2(1025.0h);
+                            if constexpr (H) q *= half2((half)cd[i][f]);   /* the scale times -1, 0, 1 or 2 is exact */
+                            reinterpret_cast<thread half2 &>(a[i][f].thread_elements()) = q;
+                        }
                     }
                 }
 #pragma unroll
@@ -4576,7 +4627,7 @@ static inline void qwen4_moe_reg_tile(
                     for (uint i = 0; i < NA; i++) {
 #pragma unroll
                         for (uint f = 0; f < RF; f++) {
-                            thread float2 &sum = H ? acc[i][f][j] : dot[i][f][j];
+                            thread float2 &sum = H || CB ? acc[i][f][j] : dot[i][f][j];
                             reinterpret_cast<thread float2 &>(c.thread_elements()) = sum;
                             simdgroup_multiply_accumulate(r, a[i][f], b, c);
                             sum = reinterpret_cast<thread float2 &>(r.thread_elements());
@@ -4585,7 +4636,7 @@ static inline void qwen4_moe_reg_tile(
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if constexpr (!H) {
+            if constexpr (!H && !CB) {
 #pragma unroll
                 for (uint i = 0; i < NA; i++) {
 #pragma unroll
@@ -4680,6 +4731,39 @@ kernel void kernel_qwen4_moe_mm_down_regh(
     qwen4_moe_reg_tile<NT, 1, 2, true>(args, down_base, down_base, lists, counts, midh, part, nullptr, Bs, tgpig, sgitg, lane);
 }
 
+/* the codebook tiles (CB), half activations as the H tiles */
+template <uint NT>
+kernel void kernel_qwen4_moe_mm_mid_regc(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *gate_base,
+        device const char    *up_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const half    *xh,
+        device float         *mid,
+        device half          *midh,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half Bs[64 * QWEN4_MM_TOKS * NT];
+    qwen4_moe_reg_tile<NT, 2, 1, true, true>(args, gate_base, up_base, lists, counts, xh, mid, midh, Bs, tgpig, sgitg, lane);
+}
+
+template <uint NT>
+kernel void kernel_qwen4_moe_mm_down_regc(
+        constant ds4_metal_args_qwen4_moe_mm & args,
+        device const char    *down_base,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        device const half    *midh,
+        device float         *part,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half Bs[64 * QWEN4_MM_TOKS * NT];
+    qwen4_moe_reg_tile<NT, 1, 2, true, true>(args, down_base, down_base, lists, counts, midh, part, nullptr, Bs, tgpig, sgitg, lane);
+}
+
 #define QWEN4_MM_MID_REG_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort
 #define QWEN4_MM_MID_REGH_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, device half *, uint3, ushort, ushort
 #define QWEN4_MM_DOWN_REG_SIG constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort
@@ -4696,6 +4780,12 @@ template [[host_name("kernel_qwen4_moe_mm_down_reg")]] kernel void kernel_qwen4_
 template [[host_name("kernel_qwen4_moe_mm_down_regh_nt1")]] kernel void kernel_qwen4_moe_mm_down_regh<1>(QWEN4_MM_DOWN_REGH_SIG);
 template [[host_name("kernel_qwen4_moe_mm_down_regh_nt2")]] kernel void kernel_qwen4_moe_mm_down_regh<2>(QWEN4_MM_DOWN_REGH_SIG);
 template [[host_name("kernel_qwen4_moe_mm_down_regh")]] kernel void kernel_qwen4_moe_mm_down_regh<4>(QWEN4_MM_DOWN_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_mid_regc_nt1")]] kernel void kernel_qwen4_moe_mm_mid_regc<1>(QWEN4_MM_MID_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_mid_regc_nt2")]] kernel void kernel_qwen4_moe_mm_mid_regc<2>(QWEN4_MM_MID_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_mid_regc")]] kernel void kernel_qwen4_moe_mm_mid_regc<4>(QWEN4_MM_MID_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_regc_nt1")]] kernel void kernel_qwen4_moe_mm_down_regc<1>(QWEN4_MM_DOWN_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_regc_nt2")]] kernel void kernel_qwen4_moe_mm_down_regc<2>(QWEN4_MM_DOWN_REGH_SIG);
+template [[host_name("kernel_qwen4_moe_mm_down_regc")]] kernel void kernel_qwen4_moe_mm_down_regc<4>(QWEN4_MM_DOWN_REGH_SIG);
 
 template [[host_name("kernel_qwen4_moe_mm_mid_nt1")]]
 kernel void kernel_qwen4_moe_mm_mid<1>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const char *, device const int32_t *, device const int32_t *, device const float *, device float *, uint3, ushort, ushort);

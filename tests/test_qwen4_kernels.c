@@ -3414,6 +3414,118 @@ static void bench_cold(arena_t *a) {
     }
 }
 
+/* QWEN4_MOE_PACK_BENCH=1: prompt tiles of the IQ3_XXS pack's expert types at
+ * model shape (512 experts, 10 slots, a 2048-token chunk), staged tiles
+ * (DS4_QWEN4_MOE_REG_CB=0) against the codebook register tiles.  Random
+ * blocks with a small scale, no reference: correctness is test_moe_types. */
+static uint64_t arena_bench_quant(arena_t *a, uint32_t type, uint64_t rows, uint64_t cols, float scale) {
+    const uint64_t blk = type == 42u ? 64u : type == 20u ? 32u : 256u;
+    const uint64_t bb = type == 42u ? 18u : type == 20u ? 18u : type == 16u ? 66u : type == 17u ? 74u :
+                        type == 22u ? 82u : type == 18u ? 98u : 110u;
+    const uint64_t bytes = rows * (cols / blk) * bb;
+    const uint64_t off = arena_alloc(a, bytes);
+    uint8_t *w = a->base + off;
+    for (uint64_t i = 0; i < bytes; i++) w[i] = (uint8_t)(frand() * 128.0f + 128.0f);
+    for (uint64_t b = 0; b < bytes / bb; b++) {
+        const uint16_t dh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
+        memcpy(w + b * bb, &dh, 2);
+    }
+    return off;
+}
+
+static double bench_moe_pack_time(arena_t *a, uint32_t gtype, uint32_t dtype, uint64_t g_off, uint64_t u_off, uint64_t d_off,
+                                  ds4_gpu_tensor **st, bool with_down, uint32_t NE, uint32_t T, uint32_t slots,
+                                  uint32_t E, uint32_t F, uint32_t cap) {
+    double best = 1e30;
+    for (int rep = 0; rep < 5; rep++) {
+        const double t0 = bench_now();
+        require_ok(ds4_gpu_begin_commands(), "begin");
+        for (int r = 0; r < 10; r++) {
+            require_ok(ds4_gpu_qwen4_moe_mm_mid_tensor(st[4], st[3], st[1], st[2], a->base, a->size, g_off, u_off, gtype,
+                                                       NE, T, slots, slots, E, F, cap), "pack bench mid");
+            if (with_down)
+                require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(st[5], st[4], st[1], st[2], a->base, a->size, d_off, dtype,
+                                                            NE, T, slots, slots, F, E, cap), "pack bench down");
+        }
+        require_ok(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "sync");
+        const double ms = 1e3 * (bench_now() - t0) / 10;
+        if (ms < best) best = ms;
+    }
+    return best;
+}
+
+static void bench_moe_pack(arena_t *a) {
+    const uint32_t NE = 512, T = 2048, slots = 10, E = 2560, F = 640, cap = 512;
+    ds4_gpu_tensor *st[6] = {0};
+    int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
+    uint32_t seed = 4242u;
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) {   /* distinct experts per token, as the router picks them */
+            int32_t e;
+            bool dup;
+            do {
+                seed = seed * 1664525u + 1013904223u;
+                e = (int32_t)((seed >> 8) % NE);
+                dup = false;
+                for (uint32_t q = 0; q < s; q++) dup |= sel[t * slots + q] == e;
+            } while (dup);
+            sel[t * slots + s] = e;
+        }
+    st[0] = ds4_gpu_tensor_alloc((uint64_t)T * slots * sizeof(int32_t));
+    require_ok(st[0] && ds4_gpu_tensor_write(st[0], 0, sel, (uint64_t)T * slots * sizeof(int32_t)), "pack bench selection");
+    free(sel);
+    st[1] = ds4_gpu_tensor_alloc((uint64_t)NE * cap * sizeof(int32_t));
+    st[2] = ds4_gpu_tensor_alloc(NE * sizeof(int32_t));
+    float *xv = rand_vec((uint64_t)T * E, 1.0f);
+    st[3] = upload(xv, (uint64_t)T * E); free(xv);
+    st[4] = upload(NULL, (uint64_t)T * slots * F);
+    st[5] = upload(NULL, (uint64_t)T * slots * E);
+    require_ok(st[1] && st[2] && st[3] && st[4] && st[5], "pack bench buffers");
+    require_ok(ds4_gpu_begin_commands() && ds4_gpu_qwen4_moe_build_lists_tensor(st[1], st[2], st[0], T, slots, NE, cap) &&
+               ds4_gpu_end_commands() && ds4_gpu_synchronize(), "pack bench lists");
+    const uint64_t d_q2 = arena_bench_quant(a, 42u, (uint64_t)NE * E, F, 0.05f);
+    const uint64_t d_nl = arena_bench_quant(a, 20u, (uint64_t)NE * E, F, 0.0005f);
+    static const uint32_t gtypes[6] = { 16u, 17u, 22u, 18u, 21u, 42u };
+    static const char *gnames[6] = { "iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q2_0" };
+    const char *only = getenv("QWEN4_BENCH_ONLY");
+    printf("moe pack tiles, %u experts, T=%u x %u slots, ms per layer (best of 5 x 10)\n", NE, T, slots);
+    printf("  %-20s %23s   %23s\n", "gate/up + down", "mid: staged reg +tails", "down: staged reg +tails");
+    for (int g = 0; g < 6; g++) {
+        if (only && only[0] && !strstr(gnames[g], only)) continue;
+        const float sc = gtypes[g] == 42u ? 0.05f : 0.0002f;
+        const uint64_t g_off = arena_bench_quant(a, gtypes[g], (uint64_t)NE * F, E, sc);
+        const uint64_t u_off = arena_bench_quant(a, gtypes[g], (uint64_t)NE * F, E, sc);
+        for (int d = 0; d < 2; d++) {
+            const uint32_t dtype = d ? 20u : 42u;
+            const uint64_t d_off = d ? d_nl : d_q2;
+            /* warm the clocks for ~0.3 s */
+            const double tw = bench_now();
+            while (bench_now() - tw < 0.3) (void)bench_moe_pack_time(a, gtypes[g], dtype, g_off, u_off, d_off, st, true, NE, T, slots, E, F, cap);
+            /* staged, register, register + remainder tiles; the modes take
+             * turns for four rounds and keep their best, so a clock or
+             * thermal change hits all three alike */
+            static const char *cb_env[3] = { "0", "1", "1" }, *tail_env[3] = { "0", "0", "1" };
+            double mid[3] = { 1e30, 1e30, 1e30 }, both[3] = { 1e30, 1e30, 1e30 };
+            for (int round = 0; round < 4; round++)
+                for (int mode = 0; mode < 3; mode++) {
+                    setenv("DS4_QWEN4_MOE_REG_CB", cb_env[mode], 1);
+                    setenv("DS4_QWEN4_MOE_TAILS", tail_env[mode], 1);
+                    const double m = bench_moe_pack_time(a, gtypes[g], dtype, g_off, u_off, d_off, st, false, NE, T, slots, E, F, cap);
+                    const double b = bench_moe_pack_time(a, gtypes[g], dtype, g_off, u_off, d_off, st, true, NE, T, slots, E, F, cap);
+                    if (m < mid[mode]) mid[mode] = m;
+                    if (b < both[mode]) both[mode] = b;
+                }
+            unsetenv("DS4_QWEN4_MOE_REG_CB");
+            unsetenv("DS4_QWEN4_MOE_TAILS");
+            char name[48];
+            snprintf(name, sizeof(name), "%s + %s", gnames[g], d ? "iq4_nl" : "q2_0");
+            printf("  %-20s %7.2f %7.2f %7.2f   %7.2f %7.2f %7.2f\n", name, mid[0], mid[1], mid[2],
+                   both[0] - mid[0], both[1] - mid[1], both[2] - mid[2]);
+        }
+    }
+    for (int i = 0; i < 6; i++) ds4_gpu_tensor_free(st[i]);
+}
+
 /* QWEN4_BENCH=1: per-dispatch cost of the decode kernels at full-model shapes */
 static void bench_dispatch(arena_t *a) {
     bench_ctx c = { .a = a };
@@ -3835,7 +3947,7 @@ static void test_dense_mm_large(arena_t *a, uint32_t wtype) {
 
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)2048 << 20;
+    arena.size = (uint64_t)(getenv("QWEN4_MOE_PACK_BENCH") ? 8192 : 2048) << 20;
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
@@ -3903,6 +4015,10 @@ int main(void) {
     }
     if (getenv("QWEN4_BENCH")) {
         bench_dispatch(&arena);
+        return 0;
+    }
+    if (getenv("QWEN4_MOE_PACK_BENCH")) {
+        bench_moe_pack(&arena);
         return 0;
     }
     printf("hyper-connections\n");

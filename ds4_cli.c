@@ -282,6 +282,18 @@ static void log_context_memory(ds4_backend backend,
             reset);
 }
 
+/* Options the user left unset take the loaded model's defaults
+ * (Qwen3.8: its model card, with top_k 20). */
+static ds4_sampling cli_sampling(const cli_generation_options *g, ds4_think_mode think_mode) {
+    const ds4_sampling def = ds4_default_sampling(ds4_think_mode_enabled(think_mode));
+    return (ds4_sampling){
+        .temperature = g->temperature_set ? g->temperature : def.temperature,
+        .top_p = g->top_p_set ? g->top_p : def.top_p,
+        .min_p = g->min_p_set ? g->min_p : def.min_p,
+        .top_k = def.top_k,
+    };
+}
+
 static ds4_think_mode cli_effective_think_mode(const cli_generation_options *gen) {
     return ds4_think_mode_for_context(gen->think_mode, gen->ctx_size);
 }
@@ -552,6 +564,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
     char err[160];
     ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+    const ds4_sampling smp = cli_sampling(&cfg->gen, think_mode);
     token_printer printer = {
         .engine = engine,
         .fp = stdout,
@@ -593,11 +606,11 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
+    const bool speculative_argmax = smp.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
           getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
-    const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
+    const bool greedy_argmax = smp.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
@@ -608,8 +621,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = greedy_next;
             have_greedy_next = false;
         } else {
-            token = ds4_session_sample(session, cfg->gen.temperature, 0,
-                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+            token = ds4_session_sample(session, smp.temperature, smp.top_k,
+                                       smp.top_p, smp.min_p, &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
@@ -620,8 +633,8 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
-                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                ds4_token_eos(engine), smp.temperature, smp.top_k,
+                smp.top_p, smp.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
             cli_dist_busy_set(cfg, false);
@@ -1521,6 +1534,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
 
     ds4_think_mode think_mode = ds4_think_mode_for_context(cfg->gen.think_mode,
                                                            chat->ctx_size);
+    const ds4_sampling smp = cli_sampling(&cfg->gen, think_mode);
     if (!repl_chat_apply_think_prefix(engine, chat, think_mode)) return 1;
     const int rollback_len = chat->transcript.len;
     const size_t rollback_images = chat->image_count;
@@ -1595,11 +1609,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
     int generated = 0;
-    const bool speculative_argmax = cfg->gen.temperature <= 0.0f &&
+    const bool speculative_argmax = smp.temperature <= 0.0f &&
         ((ds4_engine_mtp_draft_tokens(engine) > 1 &&
           getenv("DS4_MTP_SPEC_DISABLE") == NULL) ||
          cli_splitkv_spec_requested());
-    const bool greedy_argmax = cfg->gen.temperature <= 0.0f &&
+    const bool greedy_argmax = smp.temperature <= 0.0f &&
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
@@ -1611,10 +1625,10 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             have_greedy_next = false;
         } else {
             token = ds4_session_sample(chat->session,
-                                       cfg->gen.temperature,
-                                       0,
-                                       cfg->gen.top_p,
-                                       cfg->gen.min_p,
+                                       smp.temperature,
+                                       smp.top_k,
+                                       smp.top_p,
+                                       smp.min_p,
                                        &rng);
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
@@ -1626,8 +1640,8 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat,
             cli_dist_busy_set(cfg, true);
             ntok = ds4_session_eval_speculative(
                 chat->session, token, max_tokens - generated,
-                ds4_token_eos(engine), cfg->gen.temperature, 0,
-                cfg->gen.top_p, cfg->gen.min_p, &rng,
+                ds4_token_eos(engine), smp.temperature, smp.top_k,
+                smp.top_p, smp.min_p, &rng,
                 toks, (int)(sizeof(toks) / sizeof(toks[0])),
                 err, sizeof(err));
             cli_dist_busy_set(cfg, false);

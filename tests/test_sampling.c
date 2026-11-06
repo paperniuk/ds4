@@ -354,7 +354,28 @@ static void check_speculative_distribution(void) {
            (double)counts[2] / trials);
 }
 
+/* Unset request knobs: Qwen3.8 follows its model card (thinking 1.0 / 0.95 /
+ * top_k 20, otherwise 0.7 / 0.8 / 20, no min_p); other models keep the
+ * DeepSeek defaults in either mode. */
+static void check_default_sampling(void) {
+    ds4_sampling q = ds4_default_sampling_for(true, true);
+    CHECK(q.temperature == 1.0f && q.top_p == 0.95f && q.top_k == 20 && q.min_p == 0.0f,
+          "qwen thinking defaults %.2f %.2f %d %.2f",
+          q.temperature, q.top_p, q.top_k, q.min_p);
+    q = ds4_default_sampling_for(true, false);
+    CHECK(q.temperature == 0.7f && q.top_p == 0.8f && q.top_k == 20 && q.min_p == 0.0f,
+          "qwen non-thinking defaults %.2f %.2f %d %.2f",
+          q.temperature, q.top_p, q.top_k, q.min_p);
+    for (int think = 0; think <= 1; think++) {
+        const ds4_sampling d = ds4_default_sampling_for(false, think != 0);
+        CHECK(d.temperature == DS4_DEFAULT_TEMPERATURE && d.top_p == DS4_DEFAULT_TOP_P &&
+              d.top_k == 0 && d.min_p == DS4_DEFAULT_MIN_P,
+              "deepseek defaults think=%d", think);
+    }
+}
+
 int main(void) {
+    check_default_sampling();
     check_speculative_distribution();
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));

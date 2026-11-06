@@ -58,6 +58,9 @@ usage: dstar <command> [options]
       --port N           port (default $PORT)
       --lan              listen on every interface (there is no authentication)
       --no-mtp           plain decoding without the speculative MTP block
+      --fast-mtp         accept MTP drafts that match the most likely token
+                         instead of sampling them: faster decode, but most
+                         tokens are then picked greedily
       --no-vision        do not load the vision encoder
       --ane              run part of the prompt processing on the Neural
                          Engine: about 30% faster prefill, 0.9 GB more memory
@@ -317,13 +320,14 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 vision=1 dry=0 model="" power="" ane=0
+    local ctx="" mtp=1 fast_mtp=0 vision=1 dry=0 model="" power="" ane=0
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
             --port) [ $# -ge 2 ] || die "--port needs a value"; PORT=$2; shift ;;
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
+            --fast-mtp) fast_mtp=1 ;;
             --no-vision) vision=0 ;;
             --ane) ane=1; ANE_GIB=0.9 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
@@ -400,6 +404,9 @@ cmd_serve() {
         --kv-cache-continued-interval-tokens "$kv_every" "$@"
     if [ "$mtp" = 1 ] && [ -f "$F_MTP" ]; then
         export DS4_QWEN_MTP_GGUF=$F_MTP
+        # Exact by default: accepting drafts that match the argmax picks most
+        # tokens greedily, which Qwen advises against while thinking.
+        if [ "$fast_mtp" = 0 ]; then set -- --mtp-exact-sampling "$@"; fi
         set -- --mtp "$@"
     elif [ "$mtp" = 1 ]; then
         echo "dstar: no MTP block in $MODELS, decoding without it (run: $0 pull)" >&2
@@ -454,7 +461,7 @@ cmd_chat() {
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     if [ -f "$F_MTP" ]; then
         export DS4_QWEN_MTP_GGUF=$F_MTP
-        set -- --mtp "$@"
+        set -- --mtp --mtp-exact-sampling "$@"
     fi
     cd "$HERE"
     exec ./ds4 -m "$F_SHARD1" --ctx 32768 "$@"

@@ -1003,6 +1003,19 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
+/* Knobs the client left out take the model's defaults (Qwen3.8: its model
+ * card); an explicit request value (e.g. temperature 0 from a benchmark
+ * harness) always wins. */
+static ds4_sampling request_sampling(const request *r) {
+    const ds4_sampling def = ds4_default_sampling(ds4_think_mode_enabled(r->think_mode));
+    return (ds4_sampling){
+        .temperature = r->temperature_set ? r->temperature : def.temperature,
+        .top_p = r->top_p_set ? r->top_p : def.top_p,
+        .min_p = r->min_p_set ? r->min_p : def.min_p,
+        .top_k = r->top_k_set ? r->top_k : def.top_k,
+    };
+}
+
 static bool parse_ignore_eos_value(const char **p, request *r) {
     return p && r && json_bool(p, &r->ignore_eos);
 }
@@ -12159,6 +12172,7 @@ static uint64_t trace_begin(
     if (!s->trace) return 0;
 
     pthread_mutex_lock(&s->trace_mu);
+    const ds4_sampling sampling = request_sampling(&j->req);
     uint64_t id = ++s->trace_seq;
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
@@ -12173,10 +12187,10 @@ static uint64_t trace_begin(
             effective_prompt_tokens,
             cached,
             j->req.max_tokens,
-            j->req.temperature,
-            j->req.top_k,
-            j->req.top_p,
-            j->req.min_p,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            sampling.min_p,
             j->req.ignore_eos ? 1 : 0,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
@@ -14212,20 +14226,11 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        float temperature = j->req.temperature;
-        int top_k = j->req.top_k;
-        float top_p = j->req.top_p;
-        float min_p = j->req.min_p;
-        if (ds4_think_mode_enabled(j->req.think_mode)) {
-            /* Thinking keeps the fixed DeepSeek-style sampling defaults, but
-             * only for knobs the client left out: an explicit request value
-             * (e.g. temperature 0 from a benchmark harness) must win, or the
-             * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
-            if (!j->req.top_k_set) top_k = 0;
-            if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
-            if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
-        }
+        const ds4_sampling sampling = request_sampling(&j->req);
+        float temperature = sampling.temperature;
+        const int top_k = sampling.top_k;
+        const float top_p = sampling.top_p;
+        const float min_p = sampling.min_p;
         const bool greedy_tool_syntax = !thinking.inside && in_tool_call &&
             !dsml_decode_state_uses_payload_sampling(dsml_state);
         const float payload_temperature = temperature;
@@ -18425,6 +18430,18 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
+    /* Unset knobs follow the loaded model's defaults, set ones win. */
+    const ds4_sampling def = ds4_default_sampling(true);
+    ds4_sampling got = request_sampling(&r);
+    TEST_ASSERT(got.temperature == def.temperature && got.top_p == def.top_p &&
+                got.min_p == def.min_p && got.top_k == def.top_k);
+    r.temperature = 0.3f; r.temperature_set = true;
+    r.top_k = 5; r.top_k_set = true;
+    r.top_p = 0.5f; r.top_p_set = true;
+    r.min_p = 0.1f; r.min_p_set = true;
+    got = request_sampling(&r);
+    TEST_ASSERT(got.temperature == 0.3f && got.top_k == 5 &&
+                got.top_p == 0.5f && got.min_p == 0.1f);
     request_free(&r);
 }
 

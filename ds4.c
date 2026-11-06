@@ -75834,6 +75834,27 @@ bool ds4_engine_is_qwen4(ds4_engine *e) {
     return ds4_model_is_qwen4();
 }
 
+/* Qwen3.8 uses its model card (also general.sampling.* in the GGUF):
+ * thinking temperature 1.0, top_p 0.95, top_k 20; otherwise 0.7, 0.8, 20;
+ * no min_p. The DeepSeek defaults (no top_k, top_p 1, min_p 0.05) sample
+ * from a much wider tail on this model. */
+ds4_sampling ds4_default_sampling_for(bool qwen, bool think) {
+    if (qwen) {
+        return think ? (ds4_sampling){ .temperature = 1.0f, .top_p = 0.95f, .min_p = 0.0f, .top_k = 20 }
+                     : (ds4_sampling){ .temperature = 0.7f, .top_p = 0.8f, .min_p = 0.0f, .top_k = 20 };
+    }
+    return (ds4_sampling){
+        .temperature = DS4_DEFAULT_TEMPERATURE,
+        .top_p = DS4_DEFAULT_TOP_P,
+        .min_p = DS4_DEFAULT_MIN_P,
+        .top_k = 0,
+    };
+}
+
+ds4_sampling ds4_default_sampling(bool think) {
+    return ds4_default_sampling_for(ds4_model_is_qwen4(), think);
+}
+
 /* The official template's default effort is xhigh; medium adds no text. */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {

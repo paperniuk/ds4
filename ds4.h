@@ -60,6 +60,18 @@ typedef struct {
 #define DS4_DEFAULT_TOP_P 1.0f
 #define DS4_DEFAULT_MIN_P 0.05f
 
+/* Sampling for the knobs a request leaves unset. */
+typedef struct {
+    float temperature;
+    float top_p;
+    float min_p;
+    int top_k;
+} ds4_sampling;
+
+ds4_sampling ds4_default_sampling_for(bool qwen, bool think);
+/* For the loaded model. */
+ds4_sampling ds4_default_sampling(bool think);
+
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
 

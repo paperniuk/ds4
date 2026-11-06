@@ -21970,17 +21970,43 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.continued_last_store_tokens = 4096;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
+    /* Past the first steps a checkpoint needs half again the last one:
+     * each store writes the whole prefix, so a fixed interval wrote
+     * O(n^2) bytes (63 GiB to fill 262K tokens of Qwen3.8). */
     kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 40960) == 40960);
 
     kc.continued_last_store_tokens = 10240;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
-    kc.continued_last_store_tokens = 20480;
+    kc.continued_last_store_tokens = 20000;
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+}
+
+static void test_kv_cache_continued_writes_grow_linearly(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+
+    /* Prefill 262144 tokens in 2048-token chunks, as the server does. */
+    const int expect[] = {10240, 20480, 30720, 51200, 81920, 122880, 184320};
+    const int n_expect = (int)(sizeof(expect) / sizeof(expect[0]));
+    int n = 0;
+    long long written = 0;
+    for (int live = 2048; live <= 262144; live += 2048) {
+        const int target = kv_cache_continued_store_target(&kc, live);
+        if (!target) continue;
+        TEST_ASSERT(n < n_expect && target == expect[n]);
+        n++;
+        written += target;
+        kc.continued_last_store_tokens = target;
+    }
+    TEST_ASSERT(n == n_expect);
+    TEST_ASSERT(written < 3LL * 262144);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -23487,6 +23513,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_chat_anchor_chatml_role_names();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_writes_grow_linearly();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

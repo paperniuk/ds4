@@ -756,7 +756,13 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
     if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    const int last = kc->continued_last_store_tokens;
+    if (live_tokens <= last) return 0;
+    /* Every store writes the whole prefix, so a fixed interval writes
+     * O(n^2) bytes as the context grows: about 63 GiB to fill 262K tokens of
+     * Qwen3.8 at 19 KB a token. Asking each checkpoint to be half again the
+     * last one keeps the total under three times the final file. */
+    if (live_tokens - last < last / 2) return 0;
     return live_tokens;
 }
 

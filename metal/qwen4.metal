@@ -365,6 +365,77 @@ QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows", 1)
 QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt2", 2)
 QWEN4_HC_MIX_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_bf16_rows_nt3", 3)
 
+/* Q8_0 rows of the same shape: per d the stream's 8-lane group reads one
+ * 32-weight block per step, four weights per lane, scaled once per block.
+ * Blocks are 34 bytes, so the quads are read as two 2-byte halves. */
+template <short NT>
+kernel void kernel_qwen4_hc_gate_mix_q8_rows(
+        constant ds4_metal_args_qwen4_hc_gate_mix & args,
+        device const float *xn,       /* [T][hc*E] */
+        device const float *lo,       /* [T][n_rank] raw */
+        device const char  *w_up,     /* [hc*E][n_rank] q8_0 */
+        device float       *mixed,    /* [T][E] */
+        threadgroup float  *act [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint hc = args.n_hc, E = args.n_embd, R = args.n_rank;
+    const uint tok0 = tgpig.y * NT;
+    for (short t = 0; t < NT; t++) {
+        device const float *l = lo + (uint64_t)min(tok0 + t, args.n_tokens - 1u) * R;
+        for (uint r = tid; r < R; r += ntg.x) act[t * R + r] = qwen4_silu(l[r] / (float)hc);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint d0 = (tgpig.x * (ntg.x / 32u) + sgitg) * QWEN4_HC_MIX_ROWS;
+    if (d0 >= E) return;
+    const uint s = tiisg / 8, lane = tiisg % 8, nb = R / 32, nq = R / 4;
+    threadgroup const float4 *a4 = (threadgroup const float4 *)act;
+    device const char *w[QWEN4_HC_MIX_ROWS];
+    for (uint k = 0; k < QWEN4_HC_MIX_ROWS; k++) {
+        const uint d = min(d0 + k, E - 1u);
+        w[k] = w_up + (uint64_t)(s * E + d) * nb * 34u;
+    }
+    float acc[NT][QWEN4_HC_MIX_ROWS] = {{ 0.0f }};
+    for (uint b = 0; b < nb; b++) {
+        const uint q = b * 8u + lane;
+        float4 a[NT];
+        for (short t = 0; t < NT; t++) a[t] = a4[t * nq + q];
+        for (uint k = 0; k < QWEN4_HC_MIX_ROWS; k++) {
+            device const char *blk = w[k] + b * 34u;
+            const float dk = (float)*(device const half *)blk;
+            device const ushort *h = (device const ushort *)(blk + 2u + 4u * lane);
+            const char4 c = as_type<char4>(uint(h[0]) | (uint(h[1]) << 16));
+            const float4 wf = float4(c);
+            for (short t = 0; t < NT; t++) acc[t][k] += dk * dot(wf, a[t]);
+        }
+    }
+    for (short t = 0; t < NT; t++) {
+        const uint tok = tok0 + t;
+        device const float *x = xn + (uint64_t)min(tok, args.n_tokens - 1u) * E * hc + s * E;
+        for (uint k = 0; k < QWEN4_HC_MIX_ROWS; k++) {
+            float v = acc[t][k];
+            v += simd_shuffle_xor(v, 1);
+            v += simd_shuffle_xor(v, 2);
+            v += simd_shuffle_xor(v, 4);
+            const uint d = d0 + k;
+            float g = qwen4_sigmoid(v) * x[min(d, E - 1u)];
+            g += simd_shuffle_xor(g, 8);
+            g += simd_shuffle_xor(g, 16);
+            if (tiisg == 0 && d < E && tok < args.n_tokens) mixed[(uint64_t)tok * E + d] = g / (float)hc;
+        }
+    }
+}
+
+#define QWEN4_HC_MIX_Q8_ROWS_INSTANCE(NAME, NT) \
+template [[host_name(NAME)]] kernel void kernel_qwen4_hc_gate_mix_q8_rows<NT>( \
+        constant ds4_metal_args_qwen4_hc_gate_mix &, device const float *, device const float *, \
+        device const char *, device float *, threadgroup float *, uint3, ushort, ushort3, ushort, ushort);
+QWEN4_HC_MIX_Q8_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows", 1)
+QWEN4_HC_MIX_Q8_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_nt2", 2)
+QWEN4_HC_MIX_Q8_ROWS_INSTANCE("kernel_qwen4_hc_gate_mix_q8_rows_nt3", 3)
+
 /* F16 gate/mix with eight terms loaded ahead per lane round.  Under the
  * library's fast math the shipped loop compiles to x = l*(1/hc);
  * sig = sigmoid(x); acc += (x*w)*sig (the compiler reassociates

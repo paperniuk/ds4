@@ -4110,6 +4110,7 @@ int main(void) {
     test_hc(&arena, 2560, 320, 1, 0u);
     test_hc(&arena, 2560, 320, 2, 8u);
     test_hc(&arena, 2560, 320, 1, 8u);
+    test_hc(&arena, 2560, 320, 3, 8u);
     test_hc(&arena, 64, 8, 5, 1u);
     test_hc(&arena, 64, 8, 2, 0u);
     test_hc(&arena, 64, 8, 1, 8u);

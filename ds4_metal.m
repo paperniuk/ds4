@@ -50872,6 +50872,9 @@ enum {
     QWEN4_K_HC_GATE_MIX_BF16_ROWS,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2,
     QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3,
+    QWEN4_K_HC_GATE_MIX_Q8_ROWS,
+    QWEN4_K_HC_GATE_MIX_Q8_ROWS_NT2,
+    QWEN4_K_HC_GATE_MIX_Q8_ROWS_NT3,
     QWEN4_K_MOE_MID_IQ2_XS,
     QWEN4_K_MOE_MID_IQ2_S,
     QWEN4_K_MOE_MID_IQ3_XXS,
@@ -51025,6 +51028,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_bf16_rows",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt2",
     "kernel_qwen4_hc_gate_mix_bf16_rows_nt3",
+    "kernel_qwen4_hc_gate_mix_q8_rows",
+    "kernel_qwen4_hc_gate_mix_q8_rows_nt2",
+    "kernel_qwen4_hc_gate_mix_q8_rows_nt3",
     "kernel_qwen4_moe_mid_iq2_xs",
     "kernel_qwen4_moe_mid_iq2_s",
     "kernel_qwen4_moe_mid_iq3_xxs",
@@ -51407,11 +51413,14 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
     /* BF16 rows: the activated low-rank inputs sit in threadgroup memory
      * and each simdgroup streams QWEN4_HC_MIX_ROWS output rows for up to
      * three tokens (MTP verification) per weight read. */
-    if (weight_type == 30u && getenv("DS4_QWEN4_NO_HC_MIX_ROWS") == NULL) {
+    if ((weight_type == 30u || (weight_type == 8u && (n_rank % 32u) == 0)) &&
+        getenv("DS4_QWEN4_NO_HC_MIX_ROWS") == NULL) {
         const uint32_t rows_ptg = 4u * 4u;
         const uint32_t nt = n_tokens == 2u || n_tokens == 4u ? 2u : n_tokens >= 3u ? 3u : 1u;
-        const int rows_kernel = nt == 3u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3 :
-                                nt == 2u ? QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2 : QWEN4_K_HC_GATE_MIX_BF16_ROWS;
+        const bool q8 = weight_type == 8u;
+        const int rows_kernel = nt == 3u ? (q8 ? QWEN4_K_HC_GATE_MIX_Q8_ROWS_NT3 : QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT3) :
+                                nt == 2u ? (q8 ? QWEN4_K_HC_GATE_MIX_Q8_ROWS_NT2 : QWEN4_K_HC_GATE_MIX_BF16_ROWS_NT2) :
+                                           (q8 ? QWEN4_K_HC_GATE_MIX_Q8_ROWS : QWEN4_K_HC_GATE_MIX_BF16_ROWS);
         return qwen4_dispatch(rows_kernel, &args, sizeof(args), b, 4,
                               MTLSizeMake((n_embd + rows_ptg - 1u) / rows_ptg, (n_tokens + nt - 1u) / nt, 1),
                               MTLSizeMake(128, 1, 1), (NSUInteger)nt * n_rank * sizeof(float));

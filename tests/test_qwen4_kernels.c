@@ -3360,7 +3360,9 @@ static int bench_cold_fn(void *ud) {
     const uint64_t off = c->off0 + (uint64_t)(c->i++ % c->copies) * c->stride;
     if (c->mix) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->y, c->x, c->lo, c->a->base, c->a->size, off, c->type,
                                                         1, 2560, 4, 320);
-    return ds4_gpu_matmul_quant_tensor(c->y, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim, c->x, 1);
+    const char *nt = getenv("QWEN4_COLD_NT");
+    return ds4_gpu_matmul_quant_tensor(c->y, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim, c->x,
+                                       nt && atoi(nt) > 0 ? (uint32_t)atoi(nt) : 1u);
 }
 
 static void bench_cold(arena_t *a) {
@@ -3372,6 +3374,8 @@ static void bench_cold(arena_t *a) {
         { "iq4_xs 2560->10240", 23u, 2560, 10240, 4.25, 0 },
         { "iq4_xs 6144->2560", 23u, 6144, 2560, 4.25, 0 },
         { "q5_K 2560->12288", 13u, 2560, 12288, 5.5, 0 },
+        { "q6_K 2560->6144", 14u, 2560, 6144, 6.5625, 0 },
+        { "q4_K 2560->6144", 12u, 2560, 6144, 4.5, 0 },
         { "q2_0 2560->6144", 42u, 2560, 6144, 2.125, 0 },
         { "bf16 big 2560->12288", 30u, 2560, 12288, 16.0, 0 },
         { "q3_K big 2560->49152", 11u, 2560, 49152, 3.4375, 0 },
@@ -3384,8 +3388,8 @@ static void bench_cold(arena_t *a) {
     const uint64_t off0 = arena_alloc(a, span + (16ull << 20));
     memset(a->base + off0, 0x11, span + (16ull << 20));   /* small finite weights, pages resident */
     cold_ctx c = { .a = a, .off0 = off0 };
-    c.x = upload(NULL, 4ull * 10240);
-    c.y = upload(NULL, 4ull * 12288);
+    c.x = upload(NULL, 4ull * 3 * 10240);
+    c.y = upload(NULL, 4ull * 3 * 12288);
     c.lo = upload(NULL, 320);
     for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
         const uint64_t bytes = (uint64_t)((double)cases[k].in_dim * cases[k].out_dim * cases[k].bpw / 8.0);

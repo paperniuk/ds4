@@ -17315,7 +17315,7 @@ static bool sample_build_probabilities(const float *logits,
                                        float *probs);
 static int sample_probabilities(const float *probs, uint32_t n_vocab,
                                 uint64_t *rng);
-#if defined(DS4_TEST_HOOKS) || defined(DS4_HAS_DEEPSEEK41_GPU)
+#if defined(DS4_TEST_HOOKS) || defined(DS4_HAS_DEEPSEEK41_GPU) || defined(DS4_HAS_QWEN4_GPU)
 static int sample_residual_probabilities(float *target_probs,
                                          const float *draft_probs,
                                          uint32_t n_vocab,
@@ -46855,7 +46855,7 @@ static int sample_probabilities(const float *probs, uint32_t n_vocab,
 /* Replace target_probs with normalized max(0, p-q) and sample it. This is the
  * correction that keeps speculative decoding distributed exactly as p after
  * a rejected draft token. */
-#if defined(DS4_TEST_HOOKS) || defined(DS4_HAS_DEEPSEEK41_GPU)
+#if defined(DS4_TEST_HOOKS) || defined(DS4_HAS_DEEPSEEK41_GPU) || defined(DS4_HAS_QWEN4_GPU)
 static int sample_residual_probabilities(float *target_probs,
                                          const float *draft_probs,
                                          uint32_t n_vocab,
@@ -60297,6 +60297,7 @@ typedef struct ds4_qwen4_gpu_graph {
     int32_t snap_mrope_delta;
     const ds4_vision_span *vis_spans;
     uint32_t mtp_last_rows;  /* rows of the last predictor pass resident in mtp_R */
+    uint64_t fwd_seq;        /* bumped whenever the trunk rows in R or the state may change */
     size_t vis_span_count;
     float *host_row;
     float *host_logits;
@@ -60811,6 +60812,7 @@ static void qwen4_graph_dump_last_attn(ds4_qwen4_gpu_graph *g, uint32_t il, uint
 
 static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
     (void)ds4_gpu_synchronize();
+    g->fwd_seq++;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -61932,6 +61934,7 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
                                             const float *ple_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
     if (all_rows && T > g->n_logit_rows) return false;
+    g->fwd_seq++;
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     const double power_t0 = g_qwen4_power_percent < 100u ? now_sec() : 0.0;
@@ -62181,6 +62184,7 @@ static bool qwen4_graph_forward_pair_once(ds4_qwen4_gpu_graph *g, const ds4_mode
                                           const float *ple_rows) {
     const uint32_t pos0 = g->pos;
     if (TA == 0 || TB == 0 || TA > g->cap_tokens || TB > g->cap_tokens || pos0 + TA + TB > g->ctx_cap) return false;
+    g->fwd_seq++;
     for (uint32_t t = 0; t < TA + TB; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
             fprintf(stderr, "ds4: Qwen3.8 token id %d is outside the vocabulary\n", tokens[t]);
@@ -62291,6 +62295,7 @@ static bool qwen4_graph_state_copy_set(ds4_qwen4_gpu_graph *g, bool save,
                                        ds4_gpu_tensor **snap_ple, int *snap_prev,
                                        uint32_t *snap_pos, int32_t *snap_mrope) {
     if (!*snap_ple) return false;
+    if (!save) g->fwd_seq++;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
@@ -62383,6 +62388,7 @@ static bool qwen4_graph_ensure_anchor(ds4_qwen4_gpu_graph *g) {
  * DS4_QWEN4_MTP_SWAP_RESTORE=0 keeps the copying restore for comparisons. */
 static bool qwen4_graph_state_swap(ds4_qwen4_gpu_graph *g) {
     if (!g->snap_ple_hist) return false;
+    g->fwd_seq++;
     const char *env = getenv("DS4_QWEN4_MTP_SWAP_RESTORE");
     if (env && env[0] && strcmp(env, "0") == 0) return qwen4_graph_state_copy(g, false);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -62453,6 +62459,7 @@ static bool qwen4_graph_ensure_snap0(ds4_qwen4_gpu_graph *g) {
  * 3-row verify that accepted its first draft but rejected the second. */
 static bool qwen4_graph_state_swap2(ds4_qwen4_gpu_graph *g) {
     if (!g->snap2_ple_hist) return false;
+    g->fwd_seq++;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!g->snap2_lin_state[il]) continue;
         ds4_gpu_tensor *t = g->layer_lin_state[il];
@@ -63748,6 +63755,18 @@ struct ds4_session {
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+    /* Sampled MTP (exact sampling at temperature > 0): the draft is made at
+     * the start of the next cycle, from the token the caller actually
+     * sampled, and is itself sampled from the predictor's distribution.
+     * qwen4_lazy_* describe that pending predictor pass; it is valid while
+     * the trunk rows it reads are untouched (fwd_seq and pos unchanged). */
+    bool qwen4_lazy;
+    uint32_t qwen4_lazy_row, qwen4_lazy_idx, qwen4_lazy_n, qwen4_lazy_pos;
+    int qwen4_lazy_prefix[2];
+    uint64_t qwen4_lazy_seq;
+    float *qwen4_draft_logits;
+    float *qwen4_draft_q;
+    uint64_t qwen4_q_cycles, qwen4_q_accepted, qwen4_q_nodraft;
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -77406,7 +77425,16 @@ void ds4_session_free(ds4_session *s) {
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
                 qwen4_spec_timing_report();
             }
+            if (s->engine && s->engine->glm_mtp_timing && (s->qwen4_q_cycles || s->qwen4_q_nodraft)) {
+                fprintf(stderr, "ds4: Qwen3.8 sampled mtp: %" PRIu64 " verify cycles, %" PRIu64
+                        " drafts accepted (%.1f%%), %" PRIu64 " cycles without a draft\n",
+                        s->qwen4_q_cycles, s->qwen4_q_accepted,
+                        s->qwen4_q_cycles ? 100.0 * (double)s->qwen4_q_accepted / (double)s->qwen4_q_cycles : 0.0,
+                        s->qwen4_q_nodraft);
+            }
             free(s->qwen4_verify_logits);
+            free(s->qwen4_draft_logits);
+            free(s->qwen4_draft_q);
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
@@ -78171,6 +78199,61 @@ static int qwen4_spec_depth(ds4_session *s) {
     return s->qwen4_depth3_engaged ? 3 : 2;
 }
 
+/* DS4_QWEN4_MTP_POINT=1 keeps the older exact-sampling cycle: the draft is
+ * the predictor's argmax for the target's argmax token, accepted with
+ * probability p(draft).  The default samples it instead (see qwen4_lazy). */
+static bool qwen4_mtp_sampled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN4_MTP_POINT") == NULL;
+    return v != 0;
+}
+
+/* Remember the predictor pass for the next cycle: rows from `row` of the
+ * last trunk forward, the n tokens that follow them, then the token the
+ * caller samples next, at predictor positions from idx. */
+static void qwen4_lazy_note(ds4_session *s, uint32_t row, const int *prefix, uint32_t n, uint32_t idx) {
+    s->qwen4_lazy = true;
+    s->qwen4_lazy_row = row;
+    s->qwen4_lazy_n = n;
+    for (uint32_t i = 0; i < n && i < 2u; i++) s->qwen4_lazy_prefix[i] = prefix[i];
+    s->qwen4_lazy_idx = idx;
+    s->qwen4_lazy_pos = s->qwen4_graph.pos;
+    s->qwen4_lazy_seq = s->qwen4_graph.fwd_seq;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+}
+
+/* Run the pending predictor pass with the sampled boundary token and sample
+ * the draft from the predictor's distribution under the request's sampling
+ * knobs.  The verify accepts it with min(1, p/q) and otherwise samples the
+ * residual max(0, p - q), so the output keeps the target distribution. */
+static void qwen4_lazy_draft(ds4_session *s, int first_token, float temperature, int top_k,
+                             float top_p, float min_p, uint64_t *rng) {
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const bool valid = s->qwen4_lazy && s->qwen4_lazy_seq == g->fwd_seq && s->qwen4_lazy_pos == g->pos &&
+        s->qwen4_lazy_n <= 2u;
+    s->qwen4_lazy = false;
+    s->glm_mtp_have = 0;
+    s->glm_mtp_have2 = false;
+    if (!valid || !rng) return;
+    const uint32_t V = DS4_N_VOCAB;
+    int toks[3];
+    for (uint32_t i = 0; i < s->qwen4_lazy_n; i++) toks[i] = s->qwen4_lazy_prefix[i];
+    toks[s->qwen4_lazy_n] = first_token;
+    if (!s->qwen4_draft_logits) s->qwen4_draft_logits = xmalloc((size_t)V * sizeof(float));
+    if (!s->qwen4_draft_q) s->qwen4_draft_q = xmalloc((size_t)V * sizeof(float));
+    int argmax = -1;
+    if (!qwen4_graph_mtp_steps(g, &s->engine->model, &s->engine->weights, s->qwen4_lazy_row, toks,
+                               s->qwen4_lazy_n + 1u, s->qwen4_lazy_idx, true, s->qwen4_draft_logits, &argmax) ||
+        !sample_build_probabilities(s->qwen4_draft_logits, V, temperature, top_k, top_p, min_p,
+                                    s->qwen4_draft_q)) return;
+    const int d = sample_probabilities(s->qwen4_draft_q, V, rng);
+    if (d < 0 || d >= (int)V || !(s->qwen4_draft_q[d] > 0.0f)) return;
+    s->glm_mtp_draft = d;
+    s->glm_mtp_parent = first_token;
+    s->glm_mtp_have = 1;
+}
+
 static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     s->qwen4_depth_window = (s->qwen4_depth_window << 1u) | (accepted_first ? 1u : 0u);
     s->qwen4_depth_cycles++;
@@ -78196,6 +78279,9 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     const uint32_t V = DS4_N_VOCAB;
     const int depth = (exact_sampling && temperature > 0.0f) || getenv("DS4_QWEN4_NO_MTP_BATCH") != NULL
         ? 2 : qwen4_spec_depth(s);
+    const bool sampled = exact_sampling && temperature > 0.0f && qwen4_mtp_sampled();
+    if (sampled) qwen4_lazy_draft(s, first_token, temperature, top_k, top_p, min_p, rng);
+    else s->qwen4_lazy = false;
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 && !g->snap2_ple_hist &&
         accepted_cap >= 3 && pos + 3u <= g->ctx_cap && g->cap_tokens >= 3u) {
@@ -78210,6 +78296,12 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
+        if (sampled) {
+            s->qwen4_q_nodraft++;
+            if (g->pos == pos + 1u) qwen4_lazy_note(s, 0, NULL, 0, pos);
+            accepted[0] = first_token;
+            return 1;
+        }
         const int parent = sample_argmax(s->logits, V);
         int draft = -1;
         s->glm_mtp_have2 = false;
@@ -78289,9 +78381,16 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             s->checkpoint_valid = false;
             return -1;
         }
-        accept = speculative_point_accept(s->sample_probs[d], 1.0f, rng);
+        if (sampled) {
+            s->qwen4_q_cycles++;
+            accept = speculative_point_accept(s->sample_probs[d], s->qwen4_draft_q[d], rng);
+            if (accept) s->qwen4_q_accepted++;
+        } else {
+            accept = speculative_point_accept(s->sample_probs[d], 1.0f, rng);
+        }
         if (!accept) {
-            replacement = speculative_point_replacement(s, d, rng);
+            replacement = sampled ? sample_residual_probabilities(s->sample_probs, s->qwen4_draft_q, V, rng)
+                                  : speculative_point_replacement(s, d, rng);
             if (replacement < 0) {
                 if (errlen) snprintf(err, errlen, "Qwen3.8 mtp: replacement sampling failed");
                 s->checkpoint_valid = false;
@@ -78312,6 +78411,14 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
         token_vec_push(&s->checkpoint, d);
         if (deep) token_vec_push(&s->checkpoint, d2);
         memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
+        if (sampled && !deep) {
+            /* the predictor catches up over row 0 (followed by d) next cycle */
+            qwen4_lazy_note(s, 0, &d, 1u, pos);
+            s->qwen4_spec_accepted++;
+            accepted[0] = first_token;
+            accepted[1] = d;
+            return 2;
+        }
         const int parent = sample_argmax(s->logits, V);
         bool have_next = false;
         int draft = -1;
@@ -78389,7 +78496,8 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             return -1;
         }
         token_vec_push(&s->checkpoint, replacement);
-        qwen4_session_draft(s, 0, sample_argmax(s->logits, V), pos + 1u);
+        if (sampled) qwen4_lazy_note(s, 0, NULL, 0, pos + 1u);
+        else qwen4_session_draft(s, 0, sample_argmax(s->logits, V), pos + 1u);
         accepted[0] = first_token;
         accepted[1] = replacement;
         return 2;

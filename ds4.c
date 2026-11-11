@@ -46629,6 +46629,14 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
     if (logit1) *logit1 = v1;
 }
 
+/* isfinite() is a libm call per element in this build (finite-math is turned
+ * back on for glibc), which dominated vocabulary scans; test the exponent. */
+static inline bool sample_finitef(float v) {
+    uint32_t u;
+    memcpy(&u, &v, sizeof(u));
+    return (u & 0x7f800000u) != 0x7f800000u;
+}
+
 static uint64_t sample_rng_next(uint64_t *state) {
     uint64_t x = *state;
     if (x == 0) x = 0x9e3779b97f4a7c15ULL;
@@ -46726,7 +46734,7 @@ static bool sample_build_probabilities(
     uint32_t heap_n = 0;
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < n_vocab; i++) {
-        if (!isfinite(logits[i])) continue;
+        if (!sample_finitef(logits[i])) continue;
         finite++;
         if (logits[i] > max_logit) max_logit = logits[i];
     }
@@ -46737,25 +46745,54 @@ static bool sample_build_probabilities(
 
     float full_sum = 0.0f;
     float heap_sum = 0.0f;
-    for (uint32_t i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (!isfinite(v)) continue;
-        const float raw = expf((v - max_logit) / temperature);
-        full_sum += raw;
-        sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
-        if (heap_n < heap_cap) {
-            heap[heap_n] = cand;
-            heap_sum += raw;
+    if (top_k > 0) {
+        /* Top-k only needs the k largest logits; the vocabulary-wide
+         * exponentials and their sum are never used, so rank by logit and
+         * exponentiate the survivors only. */
+        /* Ids arrive in ascending order, so a logit equal to the heap
+         * minimum never wins its tie and the cached threshold is exact. */
+        uint32_t i = 0;
+        for (; i < n_vocab && heap_n < heap_cap; i++) {
+            const float v = logits[i];
+            if (!sample_finitef(v)) continue;
+            heap[heap_n] = (sample_candidate){.id = (int)i, .logit = v};
             sample_heap_sift_up(heap, heap_n);
             heap_n++;
-        } else if (sample_candidate_gt(cand, heap[0])) {
-            heap_sum -= heap[0].prob;
-            heap[0] = cand;
-            heap_sum += raw;
+        }
+        float thr = heap_n ? heap[0].logit : DS4_NEG_INF;
+        for (; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!(v > thr) || !sample_finitef(v)) continue;
+            heap[0] = (sample_candidate){.id = (int)i, .logit = v};
             sample_heap_sift_down(heap, heap_n, 0);
+            thr = heap[0].logit;
+        }
+        for (uint32_t i = 0; i < heap_n; i++) {
+            heap[i].prob = expf((heap[i].logit - max_logit) / temperature);
+            heap_sum += heap[i].prob;
+        }
+        full_sum = heap_sum;
+    } else {
+        for (uint32_t i = 0; i < n_vocab; i++) {
+            const float v = logits[i];
+            if (!sample_finitef(v)) continue;
+            const float raw = expf((v - max_logit) / temperature);
+            full_sum += raw;
+            sample_candidate cand = {.id = (int)i, .logit = v, .prob = raw};
+            if (heap_n < heap_cap) {
+                heap[heap_n] = cand;
+                heap_sum += raw;
+                sample_heap_sift_up(heap, heap_n);
+                heap_n++;
+            } else if (sample_candidate_gt(cand, heap[0])) {
+                heap_sum -= heap[0].prob;
+                heap[0] = cand;
+                heap_sum += raw;
+                sample_heap_sift_down(heap, heap_n, 0);
+            }
         }
     }
-    if (full_sum <= 0.0f || !isfinite(full_sum) || heap_n == 0) {
+    if (full_sum <= 0.0f || !sample_finitef(full_sum) || heap_n == 0) {
         probs[sample_argmax(logits, n_vocab)] = 1.0f;
         return true;
     }
@@ -46794,7 +46831,7 @@ static bool sample_build_probabilities(
         cand_n = 0;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float v = logits[i];
-            if (!isfinite(v)) continue;
+            if (!sample_finitef(v)) continue;
             cand[cand_n++] = (sample_candidate){
                 .id = (int)i,
                 .logit = v,
@@ -46815,7 +46852,7 @@ static bool sample_build_probabilities(
         owned = true;
     }
 
-    if (filtered == 0 || filtered_sum <= 0.0f || !isfinite(filtered_sum)) {
+    if (filtered == 0 || filtered_sum <= 0.0f || !sample_finitef(filtered_sum)) {
         probs[cand[0].id] = 1.0f;
     } else {
         const float inv_sum = 1.0f / filtered_sum;
@@ -46835,17 +46872,17 @@ static int sample_probabilities(const float *probs, uint32_t n_vocab,
     float best_p = probs[0];
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
-        if (p > 0.0f && isfinite(p)) sum += p;
+        if (p > 0.0f && sample_finitef(p)) sum += p;
         if (p > best_p) {
             best_p = p;
             best = (int)i;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) return best;
+    if (sum <= 0.0f || !sample_finitef(sum)) return best;
     float r = sample_rng_f32(rng) * sum;
     for (uint32_t i = 0; i < n_vocab; i++) {
         const float p = probs[i];
-        if (p <= 0.0f || !isfinite(p)) continue;
+        if (p <= 0.0f || !sample_finitef(p)) continue;
         r -= p;
         if (r <= 0.0f) return (int)i;
     }
@@ -46870,11 +46907,11 @@ static int sample_residual_probabilities(float *target_probs,
             target_best = (int)i;
         }
         float residual = target_probs[i] - draft_probs[i];
-        if (!(residual > 0.0f) || !isfinite(residual)) residual = 0.0f;
+        if (!(residual > 0.0f) || !sample_finitef(residual)) residual = 0.0f;
         target_probs[i] = residual;
         sum += residual;
     }
-    if (sum <= 0.0f || !isfinite(sum)) return target_best;
+    if (sum <= 0.0f || !sample_finitef(sum)) return target_best;
     return sample_probabilities(target_probs, n_vocab, rng);
 }
 #endif
@@ -46919,7 +46956,7 @@ static bool sample_fast_top_p(
             sample_heap_sift_down(heap, n, 0);
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
+    if (sum <= 0.0f || !sample_finitef(sum)) {
         *token_out = best;
         return true;
     }
@@ -47021,9 +47058,9 @@ static int sample_full_vocab(
          * still take the ordinary expf comparison. */
         float reject_scaled = DS4_NEG_INF;
         bool have_reject_scaled = false;
-        if (min_rel > 0.0f && isfinite(min_rel)) {
+        if (min_rel > 0.0f && sample_finitef(min_rel)) {
             float cutoff = logf(min_rel);
-            for (int i = 0; i < 8 && isfinite(cutoff); i++) {
+            for (int i = 0; i < 8 && sample_finitef(cutoff); i++) {
                 cutoff = nextafterf(cutoff, -FLT_MAX);
                 if (expf(cutoff) < min_rel) {
                     reject_scaled = cutoff;
@@ -47045,7 +47082,7 @@ static int sample_full_vocab(
             int ids[SAMPLE_MIN_P_CAP];
             float kept[SAMPLE_MIN_P_CAP];
             uint32_t n = 0;
-            bool crowded = !isfinite(skip_below);
+            bool crowded = !sample_finitef(skip_below);
             for (uint32_t b0 = 0; b0 < n_vocab && !crowded; b0 += SAMPLE_MIN_P_BLOCK) {
                 const uint32_t b1 = n_vocab - b0 < SAMPLE_MIN_P_BLOCK ? n_vocab : b0 + SAMPLE_MIN_P_BLOCK;
                 float block_max = logits[b0];
@@ -47063,7 +47100,7 @@ static int sample_full_vocab(
                 }
             }
             if (!crowded) {
-                if (sum <= 0.0f || !isfinite(sum)) return best;
+                if (sum <= 0.0f || !sample_finitef(sum)) return best;
                 float r = sample_rng_f32(rng) * sum;
                 for (uint32_t k = 0; k < n; k++) {
                     r -= kept[k];
@@ -47085,7 +47122,7 @@ static int sample_full_vocab(
             prob_scratch[i] = p;
             sum += p;
         }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
+        if (sum <= 0.0f || !sample_finitef(sum)) return best;
         float r = sample_rng_f32(rng) * sum;
         for (uint32_t i = 0; i < n_vocab; i++) {
             const float p = prob_scratch[i];
@@ -47113,7 +47150,7 @@ static int sample_full_vocab(
             prob_scratch[i] = p;
             sum += p;
         }
-        if (sum <= 0.0f || !isfinite(sum)) return best;
+        if (sum <= 0.0f || !sample_finitef(sum)) return best;
 
         const float min_prob = (1.0f / sum) * min_p;
         for (uint32_t i = 0; i < n_vocab; i++) {
@@ -47141,7 +47178,7 @@ static int sample_full_vocab(
             sum += p;
         }
     }
-    if (sum <= 0.0f || !isfinite(sum)) {
+    if (sum <= 0.0f || !sample_finitef(sum)) {
         free(cand);
         return best;
     }
@@ -47226,7 +47263,7 @@ static int sample_top_p_min_p(
         probs[i] = expf((vals[i] - max_logit) / temperature);
         sum += probs[i];
     }
-    if (sum <= 0.0f || !isfinite(sum)) return ids[0];
+    if (sum <= 0.0f || !sample_finitef(sum)) return ids[0];
 
     const float min_prob = (probs[0] / sum) * min_p;
     float filtered_sum = 0.0f;

@@ -46629,12 +46629,9 @@ static DS4_MAYBE_UNUSED void logits_top2(const float *logits, uint32_t n_vocab,
     if (logit1) *logit1 = v1;
 }
 
-/* isfinite() is a libm call per element in this build (finite-math is turned
- * back on for glibc), which dominated vocabulary scans; test the exponent. */
+/* By-value form of f32_is_finite() for the probability builders. */
 static inline bool sample_finitef(float v) {
-    uint32_t u;
-    memcpy(&u, &v, sizeof(u));
-    return (u & 0x7f800000u) != 0x7f800000u;
+    return f32_is_finite(&v);
 }
 
 static uint64_t sample_rng_next(uint64_t *state) {

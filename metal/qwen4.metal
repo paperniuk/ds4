@@ -5929,6 +5929,104 @@ kernel void kernel_qwen4_batch_mm_q8<NTT_>(constant ds4_metal_args_qwen4_dense_m
 QWEN4_BATCH_MM_INSTANCE(1)
 QWEN4_BATCH_MM_INSTANCE(2)
 
+/* 16 weights (quarters q0 and q0 + 1 of 32-wide block b, q0 even) of a
+ * K-quant or IQ row, in logical order: the 16-value dequantizers take
+ * il = 16-weight chunk of the 256-wide super-block. */
+static inline void qwen4_bmm_deq16(device const char *row, uint b, uint q0, uint type, thread float4x4 &w) {
+    const uint sb = b / 8;
+    const short il = (short)((b % 8) * 2 + q0 / 2);
+    switch (type) {
+    case 11: ds4q_dequantize_q3_K((device const block_q3_K *)row + sb, il, w); break;
+    case 12: dequantize_q4_K((device const block_q4_K *)row + sb, il, w); break;
+    case 13: dequantize_q5_K((device const block_q5_K *)row + sb, il, w); break;
+    case 14: dequantize_q6_K((device const block_q6_K *)row + sb, il, w); break;
+    default: qwen4_mm_deq16(row, b, q0, type, w); break;
+    }
+}
+
+/* The Q8 batch above for the mixed-quant dense projections (Q3_K..Q6_K,
+ * IQ4_NL, IQ4_XS and the codebook quants) at up to eight verify rows.  Each
+ * k step stages QWEN4_KQ_BK weights of the simdgroup's 32 rows as halves;
+ * the lanes split a row into 16-weight chunks, so a load reads one row's
+ * consecutive bytes instead of 32 rows' scattered ones.  The weights are
+ * read once for all the rows instead of once per two or three; on M1 Max
+ * eight rows cost about three one-row matvecs, against five or more for the
+ * per-row kernels.  The sums are fp32 over half weights, another rounding
+ * than the matvec's. */
+#define QWEN4_KQ_BK 64      /* k per staging step: four 16-weight chunks of a row */
+#define QWEN4_KQ_NSG 4      /* simdgroups per threadgroup, 32 rows each */
+#define QWEN4_KQ_STRIDE (QWEN4_KQ_BK + 8)
+template <uint TYPE>
+kernel void kernel_qwen4_batch_mm_kq(
+        constant ds4_metal_args_qwen4_dense_mm & args,
+        device const char  *w,
+        device const float *x,          /* [8][in_dim] */
+        device float       *out,        /* [n_split][8][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint BK = QWEN4_KQ_BK, KS = QWEN4_KQ_STRIDE;
+    constexpr uint CPR = BK / 16;       /* 16-weight chunks per row and step */
+    constexpr uint RPI = 32 / CPR;      /* rows staged per pass */
+    const uint row0 = (tgpig.x * QWEN4_KQ_NSG + sgitg) * 32u;
+    if (row0 >= args.out_rows) return;
+    threadgroup half As[QWEN4_KQ_NSG][32 * KS];
+    threadgroup half *A = As[sgitg];
+    simdgroup_float8x8 C[4];
+#pragma unroll
+    for (uint i = 0; i < 4; i++) C[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint lc = tiisg % CPR, lr = tiisg / CPR;
+    const uint nk = args.in_dim / BK;
+    const uint nsplit = args.n_split ? args.n_split : 1u;
+    const uint kb_lo = (uint)(((uint64_t)tgpig.z * nk) / nsplit);
+    const uint kb_hi = (uint)(((uint64_t)(tgpig.z + 1u) * nk) / nsplit);
+    device const char *rows[CPR];
+#pragma unroll
+    for (uint p = 0; p < CPR; p++) rows[p] = w + (uint64_t)(row0 + p * RPI + lr) * args.row_bytes;
+    for (uint kb = kb_lo; kb < kb_hi; kb++) {
+        const uint c = kb * CPR + lc;   /* 16-weight chunk of the row */
+#pragma unroll
+        for (uint p = 0; p < CPR; p++) {
+            float4x4 v;
+            qwen4_bmm_deq16(rows[p], c / 2u, (c & 1u) * 2u, TYPE, v);
+            threadgroup half4 *dst = (threadgroup half4 *)(A + (p * RPI + lr) * KS + lc * 16u);
+            dst[0] = (half4)v[0]; dst[1] = (half4)v[1]; dst[2] = (half4)v[2]; dst[3] = (half4)v[3];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint ks = 0; ks < BK / 8; ks++) {
+            /* out^T = x . w^T: the token tile is a plain row-major load */
+            simdgroup_float8x8 bx;
+            simdgroup_load(bx, x + kb * BK + ks * 8, args.in_dim, 0, false);
+#pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, A + (i * 8) * KS + ks * 8, KS, 0, true);
+                simdgroup_multiply_accumulate(C[i], bx, a, C[i]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float *plane = out + (uint64_t)tgpig.z * args.n_tokens * args.out_rows;
+#pragma unroll
+    for (uint i = 0; i < 4; i++) simdgroup_store(C[i], plane + row0 + i * 8, args.out_rows, 0, false);
+}
+
+#define QWEN4_BATCH_KQ_INSTANCE(T_) \
+template [[host_name("kernel_qwen4_batch_mm_kq_" #T_)]] \
+kernel void kernel_qwen4_batch_mm_kq<T_>(constant ds4_metal_args_qwen4_dense_mm &, device const char *, \
+        device const float *, device float *, uint3, ushort, ushort);
+QWEN4_BATCH_KQ_INSTANCE(11)
+QWEN4_BATCH_KQ_INSTANCE(12)
+QWEN4_BATCH_KQ_INSTANCE(13)
+QWEN4_BATCH_KQ_INSTANCE(14)
+QWEN4_BATCH_KQ_INSTANCE(17)
+QWEN4_BATCH_KQ_INSTANCE(18)
+QWEN4_BATCH_KQ_INSTANCE(20)
+QWEN4_BATCH_KQ_INSTANCE(21)
+QWEN4_BATCH_KQ_INSTANCE(22)
+QWEN4_BATCH_KQ_INSTANCE(23)
+
 struct ds4_metal_args_qwen4_hc_mix_rows {
     uint32_t n_tokens;
     uint32_t n_embd;

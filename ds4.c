@@ -60987,6 +60987,11 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
  * 3 for DFlash2 verifies, whose rows need not match the one-row matvec). */
 static uint32_t g_qwen4_batch_mm_min = 5u;
 
+/* Fewest rows for the mixed-quant batch product (kernel_qwen4_batch_mm_kq,
+ * half weights, so the rows do not match the one-row matvec): 0, off,
+ * outside DFlash2 verifies, which set DS4_QWEN4_DFL_KQ_MIN (default 5). */
+static uint32_t g_qwen4_batch_kq_min = 0u;
+
 /* rows > 0 limits the product to a contiguous leading prefix of w. */
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t rows) {
@@ -61035,6 +61040,18 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
             ds4_gpu_tensor_free(o2);
             ds4_gpu_tensor_free(x2);
         }
+        if (rc) return true;
+    }
+    /* Mixed-quant verify batches of five to eight rows: the matvec kernels
+     * read the weights once per two or three rows, this reads them once
+     * (8 rows: 134 -> 107 ms per IQ3_XXS verify on M1 Max). */
+    if (!legacy && g_qwen4_batch_kq_min && n_tok >= g_qwen4_batch_kq_min && n_tok <= 8u &&
+        tensor_type_is_mixed_quant(w->type) && out_dim <= UINT32_MAX && in_dim <= UINT32_MAX &&
+        (out_dim % 32u) == 0 &&
+        ds4_gpu_tensor_bytes(x) >= 8u * in_dim * sizeof(float) &&
+        ds4_gpu_tensor_bytes(out) >= 8u * out_dim * sizeof(float)) {
+        rc = ds4_gpu_qwen4_batch_mm_kq_tensor(out, x, m->map, m->size, w->abs_offset, w->type,
+                                              (uint32_t)in_dim, (uint32_t)out_dim);
         if (rc) return true;
     }
     switch (w->type) {

@@ -3360,6 +3360,8 @@ static int bench_cold_fn(void *ud) {
     const uint64_t off = c->off0 + (uint64_t)(c->i++ % c->copies) * c->stride;
     if (c->mix) return ds4_gpu_qwen4_hc_gate_mix_tensor(c->y, c->x, c->lo, c->a->base, c->a->size, off, c->type,
                                                         1, 2560, 4, 320);
+    if (getenv("QWEN4_COLD_KQ"))   /* the eight-row mixed-quant batch product */
+        return ds4_gpu_qwen4_batch_mm_kq_tensor(c->y, c->x, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim);
     const char *nt = getenv("QWEN4_COLD_NT");
     return ds4_gpu_matmul_quant_tensor(c->y, c->a->base, c->a->size, off, c->type, c->in_dim, c->out_dim, c->x,
                                        nt && atoi(nt) > 0 ? (uint32_t)atoi(nt) : 1u);
@@ -3389,7 +3391,7 @@ static void bench_cold(arena_t *a) {
     memset(a->base + off0, 0x11, span + (16ull << 20));   /* small finite weights, pages resident */
     cold_ctx c = { .a = a, .off0 = off0 };
     c.x = upload(NULL, 4ull * 3 * 10240);
-    c.y = upload(NULL, 4ull * 3 * 12288);
+    c.y = upload(NULL, 8ull * 49152);   /* eight rows of the widest case (QWEN4_COLD_KQ) */
     c.lo = upload(NULL, 320);
     for (uint32_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++) {
         const uint64_t bytes = (uint64_t)((double)cases[k].in_dim * cases[k].out_dim * cases[k].bpw / 8.0);
@@ -3952,6 +3954,50 @@ static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_
     ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
+/* Mixed-quant batch product at up to eight rows against the CPU dequantizer
+ * and the per-row matvec.  Random block bytes with small f16 scales. */
+static void test_batch_mm_kq(arena_t *a, uint32_t wtype, uint32_t in_dim, uint32_t rows, uint32_t T) {
+    uint64_t row_bytes = 0;
+    require_ok(ds4_quant_row_bytes(wtype, in_dim, &row_bytes), "kq row bytes");
+    const uint32_t blk = wtype == 20u ? 32u : 256u;
+    const uint64_t bb = row_bytes / (in_dim / blk);
+    /* byte offsets of the f16 scales (d, then dmin for Q4_K/Q5_K) */
+    const uint32_t d_at = wtype == 11u ? 108u : wtype == 14u ? 208u : 0u;
+    const bool has_min = wtype == 12u || wtype == 13u;
+    const float scale = wtype == 20u ? 0.0005f : wtype == 23u ? 0.00002f : wtype == 14u ? 0.0005f :
+                        wtype == 11u ? 0.002f : wtype >= 17u ? 0.0002f : 0.002f;
+    const uint64_t off = arena_alloc(a, rows * row_bytes);
+    uint8_t *w = a->base + off;
+    for (uint64_t i = 0; i < rows * row_bytes; i++) w[i] = (uint8_t)(frand() * 128.0f + 128.0f);
+    for (uint64_t b = 0; b < rows * row_bytes / bb; b++) {
+        const uint16_t dh = f32_to_f16(scale * (0.5f + 0.5f * fabsf(frand())));
+        memcpy(w + b * bb + d_at, &dh, 2);
+        if (has_min) { const uint16_t mh = f32_to_f16(scale * 0.5f * fabsf(frand())); memcpy(w + b * bb + 2, &mh, 2); }
+    }
+    float *deq = malloc(in_dim * sizeof(float));
+    float *x = rand_vec((uint64_t)8 * in_dim, 1.0f);
+    double *ref = malloc((uint64_t)T * rows * sizeof(double));
+    for (uint32_t r = 0; r < rows; r++) {
+        require_ok(ds4_dequant_row(wtype, w + r * row_bytes, deq, in_dim), "kq cpu dequant");
+        for (uint32_t t = 0; t < T; t++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) acc += (double)deq[k] * x[(uint64_t)t * in_dim + k];
+            ref[(uint64_t)t * rows + r] = acc;
+        }
+    }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)8 * in_dim);
+    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)8 * rows), *gmv = upload(NULL, (uint64_t)T * rows);
+    require_ok(ds4_gpu_qwen4_batch_mm_kq_tensor(gout, gx, a->base, a->size, off, wtype, in_dim, rows), "batch mm kq");
+    require_ok(ds4_gpu_matmul_quant_tensor(gmv, a->base, a->size, off, wtype, in_dim, rows, gx, T), "batch mm kq matvec");
+    char name[96];
+    snprintf(name, sizeof(name), "batch mm kq type %u %ux%u T=%u", wtype, rows, in_dim, T);
+    /* the weights are staged as half: about 2e-4 of the row's scale */
+    check_tensor(name, gout, ref, (uint64_t)T * rows, 1e-3);
+    snprintf(name, sizeof(name), "matvec type %u %ux%u T=%u", wtype, rows, in_dim, T);
+    check_tensor(name, gmv, ref, (uint64_t)T * rows, 3e-5);
+    free(ref); free(x); free(deq);
+    ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+}
 #endif
 
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
@@ -4198,6 +4244,13 @@ int main(void) {
     test_batch_mm_q8(&arena, 2560, 640, 16);
     test_batch_mm_q8(&arena, 6144, 2560, 16);
     test_batch_mm_q8(&arena, 2560, 128, 8);
+    {
+        static const uint32_t kq_types[] = { 11u, 12u, 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u };
+        for (uint32_t i = 0; i < sizeof(kq_types) / sizeof(kq_types[0]); i++) {
+            test_batch_mm_kq(&arena, kq_types[i], 2560, 640, 8);
+            test_batch_mm_kq(&arena, kq_types[i], 6144, 256, 5);
+        }
+    }
 #endif
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);

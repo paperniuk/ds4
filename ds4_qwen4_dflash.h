@@ -273,7 +273,9 @@ typedef struct {
 static qwen4_dfl_policy g_qwen4_dfl_pol;
 
 static void qwen4_dfl_policy_init(qwen4_dfl_policy *pol) {
-    static const float seed[QWEN4_DFL_ROWS + 1u] = { 0.0f, 31.0f, 42.4f, 61.7f, 75.2f, 90.7f, 106.1f, 121.6f, 137.0f };
+    /* IQ3_XXS verify ms on M1 Max; five to eight rows with the mixed-quant
+     * batch product (kernel_qwen4_batch_mm_kq) */
+    static const float seed[QWEN4_DFL_ROWS + 1u] = { 0.0f, 31.0f, 42.4f, 61.7f, 75.2f, 86.0f, 93.0f, 100.0f, 107.0f };
     memcpy(pol->row_ms, seed, sizeof(seed));
     pol->draft_ms = 7.0f;
     for (uint32_t b = 0; b < 10u; b++) {
@@ -369,10 +371,14 @@ static uint32_t qwen4_dfl_cycle(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
      * slower than the exact rows kernel on M1 Max */
     if (bmm3 < 0) { const char *e = getenv("DS4_QWEN4_DFL_BMM3"); bmm3 = e && e[0] && e[0] != '0'; }
     if (bmm3 && T >= 3u) g_qwen4_batch_mm_min = 3u;
+    static int kq_min = -1;
+    if (kq_min < 0) { const char *e = getenv("DS4_QWEN4_DFL_KQ_MIN"); kq_min = e && e[0] ? atoi(e) : 5; }
+    g_qwen4_batch_kq_min = kq_min > 0 ? (uint32_t)kq_min : 0u;
     ds4_gpu_qwen4_set_dfl_verify(T > 1u);
     const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, T > 1u);
     ds4_gpu_qwen4_set_dfl_verify(false);
     g_qwen4_batch_mm_min = 5u;
+    g_qwen4_batch_kq_min = 0u;
     g->dfl_tape = false;
     if (!ok) { fprintf(stderr, "ds4: DFlash2 verify of %u rows failed\n", T); return 0; }
     t0 = now_sec();

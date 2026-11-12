@@ -84001,7 +84001,7 @@ typedef struct {
     ds4_gpu_tensor *R, *ple_gated, *ple_normed;
     ds4_gpu_tensor *qkv, *ga, *gb, *lin_o;
     ds4_gpu_tensor *qg, *kp, *vp, *iq, *ik, *q, *gate, *iqn, *attn_o;
-    ds4_gpu_tensor *mixed;   /* speculative batch only: the fused GDN front reads it */
+    ds4_gpu_tensor *mixed;   /* the fused GDN front reads each row's input */
 } qwen4_batch_row;
 
 static ds4_gpu_tensor *qwen4_row_view(ds4_gpu_tensor *base, uint32_t row, uint64_t values) {
@@ -84054,11 +84054,12 @@ static bool qwen4_batch_rows_build(qwen4_batch_row *rows, int count,
         rows[i].gate = qwen4_row_view(g->gate, r, q_dim);
         rows[i].iqn = qwen4_row_view(g->iqn, r, iq_dim);
         rows[i].attn_o = qwen4_row_view(g->attn_o, r, q_dim);
+        rows[i].mixed = qwen4_row_view(g->mixed, r, DS4_N_EMBD);
         if (!rows[i].R || !rows[i].ple_gated || !rows[i].ple_normed ||
             !rows[i].qkv || !rows[i].ga || !rows[i].gb || !rows[i].lin_o ||
             !rows[i].qg || !rows[i].kp || !rows[i].vp || !rows[i].iq ||
             !rows[i].ik || !rows[i].q || !rows[i].gate || !rows[i].iqn ||
-            !rows[i].attn_o) {
+            !rows[i].attn_o || !rows[i].mixed) {
             qwen4_batch_rows_free(rows, count);
             return false;
         }
@@ -84174,10 +84175,14 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
                                const ds4_qwen4_gpu_graph *rowg,
                                ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l, uint32_t il, uint32_t T) {
+    /* Where one-token decode takes the fused GDN front (convolution, gate
+     * projections and decay prep in one kernel), every row takes it too, so
+     * a batched row rounds exactly as the same token decoded alone. */
+    const bool front = qwen4_graph_fused(g, 1u);
     if (!qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) ||
         !qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) ||
-        !qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) ||
-        !qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T)) {
+        (!front && (!qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) ||
+                    !qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T)))) {
         return false;
     }
     /* The causal convolution and the delta-net scan are the only steps that
@@ -84190,7 +84195,19 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
         getenv("DS4_QWEN4_NO_BATCH_SCAN") == NULL &&
         qwen4_batch_rows_pooled(items, count, slots);
     const uint64_t hist_floats = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
-    if (pooled) {
+    if (front) {
+        for (int i = 0; i < count; i++) {
+            if (!ds4_gpu_qwen4_gdn_front_tensor(views[i].qkv, rowg[i].layer_lin_hist[il], views[i].mixed,
+                                                views[i].ga, views[i].gb, m->map, m->size,
+                                                l->lin_conv->abs_offset, l->lin_alpha->abs_offset,
+                                                l->lin_beta->abs_offset, l->lin_a->abs_offset,
+                                                l->lin_dt_bias->abs_offset, l->lin_alpha->type, 1u,
+                                                DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                                DS4_N_LIN_CONV, DS4_N_EMBD, NULL, 0u, NULL, 1u)) {
+                return false;
+            }
+        }
+    } else if (pooled) {
         if (ds4_gpu_qwen4_conv_stream_rows_tensor(
                 g->qkv, e->qwen4_lin_hist_pool[il], m->map, m->size, l->lin_conv->abs_offset,
                 slots, (uint32_t)count, DS4_N_LIN_CONV_DIM, DS4_N_LIN_CONV,
@@ -84206,10 +84223,10 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
             }
         }
     }
-    if (!ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size,
-                                       l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
-                                       T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
-                                       DS4_N_LIN_HEAD_DIM)) {
+    if (!front && !ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size,
+                                                 l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                                 T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                                 DS4_N_LIN_HEAD_DIM)) {
         return false;
     }
     /* With every row's state in the pool, one dispatch advances them all; the
@@ -84316,11 +84333,26 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
 static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                   ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t T) {
-    bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
-              qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
-              qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
-              qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
-              qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
+    if (ok && qwen4_graph_fused(g, 1u)) {
+        /* one-token decode projects K, V and the indexer through the fused
+         * multi-projection, whose rows are independent grid rows: one pass
+         * over every batch row rounds each as it would alone */
+        ds4_gpu_tensor *outs[4] = { g->kp, g->vp, g->iq, g->ik };
+        const uint64_t offs[4] = { l->attn_k->abs_offset, l->attn_v->abs_offset,
+                                   l->indexer_q_proj->abs_offset, l->indexer_k_proj->abs_offset };
+        const uint32_t types[4] = { l->attn_k->type, l->attn_v->type,
+                                    l->indexer_q_proj->type, l->indexer_k_proj->type };
+        const uint32_t rows[4] = { (uint32_t)l->attn_k->dim[1], (uint32_t)l->attn_v->dim[1],
+                                   (uint32_t)l->indexer_q_proj->dim[1], (uint32_t)l->indexer_k_proj->dim[1] };
+        ok = ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, 4u, outs, m->map, m->size,
+                                             offs, types, rows) != 0;
+    } else if (ok) {
+        ok = qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
+             qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
+             qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
+             qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    }
     const bool rows_path = getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
                            getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
                            (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);

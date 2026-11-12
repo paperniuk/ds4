@@ -227,6 +227,55 @@ static int test_shape(arena_t *a, const quant_type *q, uint64_t in_dim, uint64_t
     return ok;
 }
 
+/* Batched decode rows (sessions sharing a step, speculative verify rows)
+ * must round exactly as the same token alone: every row of a small-batch
+ * matvec has to match the one-token result bit for bit. */
+static int test_rows_exact(arena_t *a, const quant_type *q, uint64_t in_dim, uint64_t rows) {
+    static const uint64_t n_toks[] = { 2, 3, 4, 8 };
+    const uint64_t max_tok = 8;
+    uint64_t row_bytes = 0;
+    require_ok(ds4_quant_row_bytes(q->type, in_dim, &row_bytes), "row bytes");
+    const uint64_t off = arena_alloc(a, rows * row_bytes);
+    fill_rows(q, a->base + off, rows, in_dim);
+    float *x = malloc(max_tok * in_dim * sizeof(float));
+    float *one = malloc(max_tok * rows * sizeof(float));
+    float *got = malloc(max_tok * rows * sizeof(float));
+    for (uint64_t i = 0; i < max_tok * in_dim; i++) x[i] = frand();
+    for (uint64_t t = 0; t < max_tok; t++) {
+        ds4_gpu_tensor *gx = upload(x + t * in_dim, in_dim);
+        ds4_gpu_tensor *gout = upload(NULL, rows);
+        require_ok(ds4_gpu_matmul_quant_tensor(gout, a->base, a->size, off, q->type, in_dim, rows, gx, 1),
+                   "one-token matvec");
+        require_ok(ds4_gpu_tensor_read(gout, 0, one + t * rows, rows * sizeof(float)), "tensor read");
+        ds4_gpu_tensor_free(gx);
+        ds4_gpu_tensor_free(gout);
+    }
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(n_toks) / sizeof(n_toks[0]); i++) {
+        const uint64_t T = n_toks[i];
+        if (q->type == 30 && T > 3) break;   /* BF16 takes mv_ext past three rows */
+        ds4_gpu_tensor *gx = upload(x, T * in_dim);
+        ds4_gpu_tensor *gout = upload(NULL, T * rows);
+        require_ok(ds4_gpu_matmul_quant_tensor(gout, a->base, a->size, off, q->type, in_dim, rows, gx, T),
+                   "batched matvec");
+        require_ok(ds4_gpu_tensor_read(gout, 0, got, T * rows * sizeof(float)), "tensor read");
+        uint64_t bad = 0;
+        for (uint64_t j = 0; j < T * rows; j++) bad += memcmp(&got[j], &one[j], sizeof(float)) != 0;
+        if (bad) {
+            fprintf(stderr, "  %s %llux%llu T=%llu rows differ from T=1: %llu of %llu\n", q->name,
+                    (unsigned long long)in_dim, (unsigned long long)rows, (unsigned long long)T,
+                    (unsigned long long)bad, (unsigned long long)(T * rows));
+            ok = 0;
+        }
+        ds4_gpu_tensor_free(gx);
+        ds4_gpu_tensor_free(gout);
+    }
+    free(x);
+    free(one);
+    free(got);
+    return ok;
+}
+
 static double now_s(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -392,7 +441,13 @@ int main(void) {
         for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
             if (shapes[s][0] % types[i].block) continue;
             ok &= test_shape(&arena, &types[i], shapes[s][0], shapes[s][1]);
+            ok &= test_rows_exact(&arena, &types[i], shapes[s][0], shapes[s][1]);
         }
+    }
+    /* Q4_K's small-batch matvec is the mixed kernel off M5 */
+    for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
+        if (shapes[s][0] % ref_types[1].block == 0)
+            ok &= test_rows_exact(&arena, &ref_types[1], shapes[s][0], shapes[s][1]);
     }
     ds4_gpu_cleanup();
     printf(ok ? "all quant type checks passed\n" : "quant type checks FAILED\n");

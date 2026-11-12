@@ -1147,15 +1147,26 @@ static inline void ds4q_q45_K_dotn(device const block_t *xb, thread const float4
             const uint w1 = ((q1 >> (4*n)) & 0x0F0F0F0Fu) | (((h1 >> sb) & 0x01010101u) << 4);
             const float2 e0 = ds4q_h2_bits(w0 & 0x00FF00FFu, 1024.h), o0 = ds4q_h2_bits((w0 >> 8) & 0x00FF00FFu, 1024.h);
             const float2 e1 = ds4q_h2_bits(w1 & 0x00FF00FFu, 1024.h), o1 = ds4q_h2_bits((w1 >> 8) & 0x00FF00FFu, 1024.h);
+            /* Explicit fma order: under fast math the compiler grouped
+             * these sums differently for one, two and three tokens, so a
+             * batched decode row did not round as the same token alone
+             * (tests/test_quant_types.c checks every type). */
             FOR_UNROLL (short t = 0; t < NT; t++) {
-                const float dq = dot(e0, yl[t][2*sb].xy) + dot(o0, yl[t][2*sb].zw) +
-                                 dot(e1, yl[t][2*sb + 1].xy) + dot(o1, yl[t][2*sb + 1].zw);
-                s[t] += ds4q_byte_f(sc, sb) * dq;
-                m[t] += ds4q_byte_f(mn, sb) * sumy[t][sb];
+                const float4 ya = yl[t][2*sb], yb2 = yl[t][2*sb + 1];
+                float dq = e0.x * ya.x;
+                dq = fma(e0.y, ya.y, dq);
+                dq = fma(o0.x, ya.z, dq);
+                dq = fma(o0.y, ya.w, dq);
+                dq = fma(e1.x, yb2.x, dq);
+                dq = fma(e1.y, yb2.y, dq);
+                dq = fma(o1.x, yb2.z, dq);
+                dq = fma(o1.y, yb2.w, dq);
+                s[t] = fma(ds4q_byte_f(sc, sb), dq, s[t]);
+                m[t] = fma(ds4q_byte_f(mn, sb), sumy[t][sb], m[t]);
             }
         }
     }
-    FOR_UNROLL (short t = 0; t < NT; t++) acc[t] = (float)xb->d * s[t] - (float)xb->dmin * m[t];
+    FOR_UNROLL (short t = 0; t < NT; t++) acc[t] = fma((float)xb->d, s[t], -((float)xb->dmin * m[t]));
 }
 
 template <short NR0, short NT, typename block_t>

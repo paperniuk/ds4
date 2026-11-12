@@ -3,6 +3,7 @@
 # Apple Silicon Mac.
 #
 #   ./dstar pull       download the model, the MTP block and the vision encoder
+#                      (--dflash: the DFlash2 block drafter too)
 #   ./dstar serve      start the OpenAI/Anthropic compatible server
 #   ./dstar chat       talk to the model in the terminal
 #   ./dstar doctor     check the machine, the files and the memory limit
@@ -34,17 +35,19 @@ MTP_REPO=paperniuk/Qwen3.8-Flash-Next-MTP-block
 MTP_FILE=Qwen3.8-Flash-Next-MTP-block.gguf
 VISION_REPO=ggml-org/Qwen3.8-Flash-Next-GGUF
 VISION_FILE=mmproj-Qwen3.8-Flash-Next-Q8_0.gguf
+DFLASH_REPO=incoai/Qwen3.8-Flash-Next-DFlash2
 
 usage() {
     cat <<EOF
 usage: dstar <command> [options]
 
-  pull [--no-vision] [--quant q2|iq3|iq3s]
+  pull [--no-vision] [--dflash] [--quant q2|iq3|iq3s]
                          download what is missing into $MODELS:
                          one quant (q2 by default, 67 GB; iq3 76 GB; iq3s
                          83 GB), the 1.5 GB MTP block, the 0.6 GB vision
-                         encoder. A second quant reuses the 27 GB n-gram
-                         table of the first
+                         encoder, with --dflash the 1.2 GB DFlash2 drafter.
+                         A second quant reuses the 27 GB n-gram table of
+                         the first
   pull NAME              download another model into ./gguf (see: dstar models)
   models                 list the other models ds4 can run
   serve [options]        start the server on http://$HOST:$PORT/v1
@@ -61,6 +64,10 @@ usage: dstar <command> [options]
       --fast-mtp         accept MTP drafts that match the most likely token
                          instead of sampling them: faster decode, but most
                          tokens are then picked greedily
+      --dflash           draft up to 7 tokens at a time with the DFlash2
+                         block drafter instead of one with MTP: about 20%
+                         faster on code, a little slower on prose and edits,
+                         2.1 GB more memory (experimental; dstar pull --dflash)
       --no-vision        do not load the vision encoder
       --ane              run part of the prompt processing on the Neural
                          Engine: about 30% faster prefill, 0.9 GB more memory
@@ -72,7 +79,7 @@ usage: dstar <command> [options]
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [--quant NAME] [--power N] [NAME or FILE] [-- ARGS]
+  chat [--quant NAME] [--power N] [--dflash] [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
   doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
@@ -118,6 +125,15 @@ locate_files() {
     done
     F_MTP=$(first_of "$MODELS/$MTP_FILE" "$MODELS/mtp/$MTP_FILE")
     F_VISION=$(first_of "$MODELS/$VISION_FILE" "$HERE/gguf/$VISION_FILE")
+    # the drafter is a directory (model.safetensors, config.json); a copy in
+    # the Hugging Face cache serves as well
+    F_DFLASH=$MODELS/DFlash2
+    if [ ! -f "$F_DFLASH/model.safetensors" ]; then
+        local snap
+        for snap in "$HOME"/.cache/huggingface/hub/models--incoai--Qwen3.8-Flash-Next-DFlash2/snapshots/*; do
+            if [ -f "$snap/model.safetensors" ]; then F_DFLASH=$snap; break; fi
+        done
+    fi
 }
 
 # Without --quant or DSTAR_QUANT: the fastest quant that is on disk, so a
@@ -164,7 +180,7 @@ other_models() {
 }
 
 cmd_pull() {
-    local vision=1
+    local vision=1 dflash=0
     case ${1:-} in
         ""|--*) ;;
         *) other_models "$@" ;;
@@ -172,6 +188,7 @@ cmd_pull() {
     while [ $# -gt 0 ]; do
         case $1 in
             --no-vision) vision=0 ;;
+            --dflash) dflash=1 ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             *) die "pull: unknown option $1" ;;
         esac
@@ -183,12 +200,19 @@ cmd_pull() {
     local need_gb=0 free_gb
     [ -f "$F_SHARD1" ] || need_gb=$(( SHARD1_GB + 2 ))
     [ -f "$F_SHARD2" ] || need_gb=$(( need_gb + 29 ))
+    [ "$dflash" = 0 ] || [ -f "$F_DFLASH/model.safetensors" ] || need_gb=$(( need_gb + 2 ))
     free_gb=$(df -g "$MODELS" | awk 'NR == 2 { print $4 }')
     [ "$free_gb" -ge "$need_gb" ] || die "the download needs about $need_gb GB, $MODELS has $free_gb GB free"
     fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD1" "$F_SHARD1"
     fetch "$MODEL_REPO" "${QDIR##*/}/$SHARD2" "$F_SHARD2"
     fetch "$MTP_REPO" "$MTP_FILE" "$F_MTP"
     if [ "$vision" = 1 ]; then fetch "$VISION_REPO" "$VISION_FILE" "$F_VISION"; fi
+    if [ "$dflash" = 1 ]; then
+        fetch "$DFLASH_REPO" config.json "$F_DFLASH/config.json"
+        fetch "$DFLASH_REPO" model.safetensors "$F_DFLASH/model.safetensors"
+        echo "Done. Start the server with: dstar serve --dflash"
+        return
+    fi
     echo "Done. Start the server with: dstar serve"
 }
 
@@ -215,10 +239,12 @@ parse_power() {
 }
 
 # --ane adds the Neural Engine's two sets of surfaces, the second chunk's
-# rows and the state copy.
+# rows and the state copy; --dflash the drafter's weights (0.9 GiB), its
+# context ring, the verify tape and the capture rows (2.1 GB measured).
 ANE_GIB=0
+DFL_GIB=0
 if [ -n "${DS4_QWEN4_KV_F16:-}" ]; then KV_GIB_PER_TOKEN=3.315e-5; else KV_GIB_PER_TOKEN=2.075e-5; fi
-need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" -v k="$KV_GIB_PER_TOKEN" 'BEGIN { printf "%d", (b + a + c * k + 2) * 1024 }'; }
+need_mib() { awk -v c="$1" -v b="$BASE_GIB" -v a="$ANE_GIB" -v d="$DFL_GIB" -v k="$KV_GIB_PER_TOKEN" 'BEGIN { printf "%d", (b + a + d + c * k + 2) * 1024 }'; }
 
 wired_limit() { sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0; }
 
@@ -320,7 +346,7 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 fast_mtp=0 vision=1 dry=0 model="" power="" ane=0
+    local ctx="" mtp=1 fast_mtp=0 vision=1 dry=0 model="" power="" ane=0 dflash=0
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
@@ -330,6 +356,7 @@ cmd_serve() {
             --fast-mtp) fast_mtp=1 ;;
             --no-vision) vision=0 ;;
             --ane) ane=1; ANE_GIB=0.9 ;;
+            --dflash) dflash=1; DFL_GIB=2.1 ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --dry-run) dry=1 ;;
@@ -348,6 +375,10 @@ cmd_serve() {
     pick_quant
     locate_files
     [ -f "$F_SHARD1" ] && [ -f "$F_SHARD2" ] || die "the $QUANT model is not in $QDIR; run: $0 pull --quant $QUANT"
+    if [ "$dflash" = 1 ]; then
+        [ "$mtp" = 1 ] && [ -f "$F_MTP" ] || die "--dflash needs the MTP block (its weights share its memory); run: $0 pull"
+        [ -f "$F_DFLASH/model.safetensors" ] || die "the DFlash2 drafter is not in $MODELS/DFlash2; run: $0 pull --dflash"
+    fi
     [ "$dry" = 1 ] || ensure_binaries
     [ "$RAM_GB" -ge 60 ] || echo "dstar: this Mac has $RAM_GB GB of RAM; the model is tuned for 64 GB and may not fit" >&2
 
@@ -399,6 +430,7 @@ cmd_serve() {
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     export DS4_QWEN4_MOE_TAILS=1
     if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
+    if [ "$dflash" = 1 ]; then export DS4_QWEN_DFLASH=$F_DFLASH; fi
     set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
         --kv-cache-continued-interval-tokens "$kv_every" "$@"
@@ -418,20 +450,21 @@ cmd_serve() {
         echo "cd $HERE && caffeinate -i ./ds4-server -m $F_SHARD1 $*"
         return
     fi
-    echo "dstar: $QUANT, context $ctx, http://$HOST:$PORT/v1" >&2
+    echo "dstar: $QUANT, context $ctx$([ "$dflash" = 1 ] && echo ", DFlash2 drafter"), http://$HOST:$PORT/v1" >&2
     cd "$HERE"   # the Metal shaders load from ./metal
     exec caffeinate -i ./ds4-server -m "$F_SHARD1" "$@"
 }
 
 cmd_chat() {
-    local model="" power=""
+    local model="" power="" dflash=0
     while :; do
         case ${1:-} in
-            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2 ;;
-            --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1 ;;
+            --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
+            --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
+            --dflash) dflash=1 ;;
             *) break ;;
         esac
-        shift 2
+        shift
     done
     case ${1:-} in
         --model) [ $# -ge 2 ] || die "--model needs a file"; model=$(model_path "$2") || exit 1; shift 2 ;;
@@ -463,6 +496,11 @@ cmd_chat() {
         export DS4_QWEN_MTP_GGUF=$F_MTP
         set -- --mtp --mtp-exact-sampling "$@"
     fi
+    if [ "$dflash" = 1 ]; then
+        [ -f "$F_MTP" ] || die "--dflash needs the MTP block (its weights share its memory); run: $0 pull"
+        [ -f "$F_DFLASH/model.safetensors" ] || die "the DFlash2 drafter is not in $MODELS/DFlash2; run: $0 pull --dflash"
+        export DS4_QWEN_DFLASH=$F_DFLASH
+    fi
     cd "$HERE"
     exec ./ds4 -m "$F_SHARD1" --ctx 32768 "$@"
 }
@@ -486,6 +524,8 @@ cmd_doctor() {
     done
     [ -f "$F_MTP" ] && line "MTP block" "ok" || line "MTP block" "missing, decoding will be slower (dstar pull)"
     [ -f "$F_VISION" ] && line "vision encoder" "ok" || line "vision encoder" "missing, images are off (dstar pull)"
+    [ -f "$F_DFLASH/model.safetensors" ] && line "DFlash2 drafter" "ok (dstar serve --dflash)" ||
+        line "DFlash2 drafter" "not downloaded (optional: dstar pull --dflash)"
     limit=$(wired_limit)
     line "wired limit" "$([ "$limit" = 0 ] && echo "system default" || echo "$limit MiB")"
     for c in 32768 131072 262144 400000 524288; do

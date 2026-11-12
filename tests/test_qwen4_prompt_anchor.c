@@ -1,10 +1,11 @@
 /* Model-backed check of the Qwen3.8 prompt anchor.
  *
  * A session prefills a prompt head, saves the anchor, runs on (the rest of
- * the prompt, greedy or MTP decoding, then a diverging transcript), and
- * restores the anchor.  Prefilling the prompt tail from there must give the
- * logits and greedy continuation of a session that prefilled the same head
- * and tail without the detour, byte for byte.
+ * the prompt, greedy or MTP decoding, a rewind that resets the recurrent
+ * state, then a diverging transcript), and restores the anchor.  Prefilling
+ * the prompt tail from there must give the logits and greedy continuation of
+ * a session that prefilled the same head and tail without the detour, byte
+ * for byte.
  *
  * Run with:
  *   DS4_TEST_MODEL=/path/to/qwen38.gguf make test-qwen4-prompt-anchor
@@ -100,6 +101,10 @@ static void check_anchor(ds4_engine *e, const ds4_tokens *p, int anchor, bool mt
     sync_prefix(s, p, p->len);
     run_on(s, e, mtp);
     check(ds4_session_anchor_pos(s) == anchor, "anchor survives decoding");
+    /* A rejected draft with no snapshot at its position resets the recurrent
+     * state; the anchor sits below the rewind and must stay usable. */
+    ds4_session_rewind(s, p->len + 2);
+    check(ds4_session_anchor_pos(s) == anchor, "anchor survives a rewind past it");
 
     check(ds4_session_anchor_restore(s), "anchor restored");
     check(ds4_session_pos(s) == anchor, "session back at the anchor");
@@ -121,6 +126,9 @@ static void check_anchor(ds4_engine *e, const ds4_tokens *p, int anchor, bool mt
     got = logits_copy(s, n_vocab);
     snprintf(what, sizeof(what), "%s: empty tail replays the head", name);
     check(memcmp(got, head_logits, (size_t)n_vocab * sizeof(float)) == 0, what);
+
+    ds4_session_rewind(s, anchor - 1);
+    check(ds4_session_anchor_pos(s) == -1, "a rewind below the anchor drops it");
 
     ds4_session_invalidate(s);
     check(ds4_session_anchor_pos(s) == -1, "invalidate drops the anchor");

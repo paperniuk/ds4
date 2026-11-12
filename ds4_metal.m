@@ -5680,6 +5680,8 @@ static ds4_gpu_mul_mv_ext_args ds4_gpu_make_mv_ext_args(
  * and routed-expert dispatches keep the lane maps and kernel choices of the
  * T <= 2 decode paths, so every committed row stays byte-identical. */
 static bool g_qwen4_verify_rows_exact;
+static bool g_qwen4_dfl_verify;   /* a DFlash2 verify forward is being encoded */
+void ds4_gpu_qwen4_set_dfl_verify(bool on) { g_qwen4_dfl_verify = on; }
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on) {
     g_qwen4_verify_rows_exact = on;
 }
@@ -50895,6 +50897,15 @@ enum {
     QWEN4_K_ATTN_DECODE_ROWS_Q8_NPT8,
     QWEN4_K_ATTN_DECODE_ROWS_Q8_NPT4,
     QWEN4_K_ATTN_MM_Q8,
+    QWEN4_K_DFL_STREAM_MEAN,
+    QWEN4_K_DFL_RMS,
+    QWEN4_K_DFL_CONV,
+    QWEN4_K_DFL_QK,
+    QWEN4_K_DFL_CTX_KV,
+    QWEN4_K_DFL_ATTN,
+    QWEN4_K_DFL_SWIGLU,
+    QWEN4_K_DFL_ATTN_SPLIT,
+    QWEN4_K_DFL_ATTN_MERGE,
     QWEN4_K_COUNT,
 };
 
@@ -51051,6 +51062,15 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_attn_decode_rows_q8_npt8",
     "kernel_qwen4_attn_decode_rows_q8_npt4",
     "kernel_qwen4_attn_mm_q8",
+    "kernel_qwen4_dfl_stream_mean",
+    "kernel_qwen4_dfl_rms",
+    "kernel_qwen4_dfl_conv",
+    "kernel_qwen4_dfl_qk",
+    "kernel_qwen4_dfl_ctx_kv",
+    "kernel_qwen4_dfl_attn",
+    "kernel_qwen4_dfl_swiglu",
+    "kernel_qwen4_dfl_attn_split",
+    "kernel_qwen4_dfl_attn_merge",
 };
 
 /* Compact KV: K/V rows of D int8 plus D/32 half block scales, and half raw
@@ -51452,6 +51472,132 @@ int ds4_gpu_qwen4_hc_combine_tensor(
                           MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
+int ds4_gpu_qwen4_dfl_stream_mean_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *R, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc,
+        uint32_t dst_row, uint32_t dst_stride, uint32_t dst_col) {
+    struct { uint32_t n_tokens, n_embd, n_hc, dst_stride, dst_col, dst_row, pad0, pad1; } args =
+        { n_tokens, n_embd, n_hc, dst_stride, dst_col, dst_row, 0, 0 };
+    qwen4_bind b[2];
+    if (n_tokens == 0 || n_hc == 0 || dst_col + n_embd > dst_stride ||
+        !qwen4_bind_tensor(&b[0], R, (uint64_t)n_tokens * n_embd * n_hc * sizeof(float), "dflash capture streams") ||
+        !qwen4_bind_tensor(&b[1], dst, (uint64_t)(dst_row + n_tokens) * dst_stride * sizeof(float),
+                           "dflash capture rows")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_DFL_STREAM_MEAN, &args, sizeof(args), b, 2,
+                          MTLSizeMake((n_embd + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* DFlash2 draft kernels (metal/qwen4.metal, kernel_qwen4_dfl_*). */
+int ds4_gpu_qwen4_dfl_rms_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+                                 uint64_t w_off, uint32_t rows, uint32_t n, float eps) {
+    struct { uint32_t rows, n; float eps; uint32_t pad0; } args = { rows, n, eps, 0 };
+    qwen4_bind b[3];
+    if (!rows || !qwen4_bind_tensor(&b[0], x, (uint64_t)rows * n * sizeof(float), "dflash rms input") ||
+        !qwen4_bind_weight(&b[1], map, size, w_off, (uint64_t)n * sizeof(float), "dflash rms weight") ||
+        !qwen4_bind_tensor(&b[2], out, (uint64_t)rows * n * sizeof(float), "dflash rms output")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_RMS, &args, sizeof(args), b, 3, MTLSizeMake(rows, 1, 1),
+                          MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_dfl_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *dyn,
+                                  const void *map, uint64_t size, uint64_t base_off, const ds4_gpu_tensor *res,
+                                  uint32_t rows, uint32_t n, uint32_t kind) {
+    struct { uint32_t rows, n, kind, residual; } args = { rows, n, kind, res ? 1u : 0u };
+    qwen4_bind b[5];
+    if (!rows || (n % 16u) ||
+        !qwen4_bind_tensor(&b[0], x, (uint64_t)rows * n * sizeof(float), "dflash conv input") ||
+        !qwen4_bind_tensor(&b[1], dyn, (uint64_t)rows * (n / 4u) * sizeof(float), "dflash conv dynamic") ||
+        !qwen4_bind_weight(&b[2], map, size, base_off, 4ull * n * sizeof(float), "dflash conv base") ||
+        !qwen4_bind_tensor(&b[4], out, (uint64_t)rows * n * sizeof(float), "dflash conv output")) return 0;
+    if (res) { if (!qwen4_bind_tensor(&b[3], res, (uint64_t)rows * n * sizeof(float), "dflash conv residual")) return 0; }
+    else b[3] = b[0];
+    return qwen4_dispatch(QWEN4_K_DFL_CONV, &args, sizeof(args), b, 5, MTLSizeMake((n + 255) / 256, rows, 1),
+                          MTLSizeMake(256, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_dfl_qk_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *bk, ds4_gpu_tensor *bv, const ds4_gpu_tensor *qkv,
+                                const void *map, uint64_t size, uint64_t qn_off, uint64_t kn_off,
+                                uint32_t rows, uint32_t pos0, float theta) {
+    struct { uint32_t rows, pos0; float theta; uint32_t pad0; } args = { rows, pos0, theta, 0 };
+    qwen4_bind b[6];
+    if (!rows || !qwen4_bind_tensor(&b[0], qkv, (uint64_t)rows * 6144u * sizeof(float), "dflash qkv") ||
+        !qwen4_bind_weight(&b[1], map, size, qn_off, 128u * sizeof(float), "dflash q norm") ||
+        !qwen4_bind_weight(&b[2], map, size, kn_off, 128u * sizeof(float), "dflash k norm") ||
+        !qwen4_bind_tensor(&b[3], q, (uint64_t)rows * 4096u * sizeof(float), "dflash q") ||
+        !qwen4_bind_tensor(&b[4], bk, (uint64_t)rows * 1024u * sizeof(float), "dflash block keys") ||
+        !qwen4_bind_tensor(&b[5], bv, (uint64_t)rows * 1024u * sizeof(float), "dflash block values")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_QK, &args, sizeof(args), b, 6, MTLSizeMake(40, rows, 1),
+                          MTLSizeMake(128, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_dfl_ctx_kv_tensor(ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *kv,
+                                    const void *map, uint64_t size, uint64_t kn_off,
+                                    uint32_t rows, uint32_t pos0, float theta) {
+    struct { uint32_t rows, pos0; float theta; uint32_t pad0; } args = { rows, pos0, theta, 0 };
+    qwen4_bind b[4];
+    const uint64_t ring = 8ull * 2048u * 128u * sizeof(float);
+    if (!rows || !qwen4_bind_tensor(&b[0], kv, (uint64_t)rows * 2048u * sizeof(float), "dflash context kv") ||
+        !qwen4_bind_weight(&b[1], map, size, kn_off, 128u * sizeof(float), "dflash k norm") ||
+        !qwen4_bind_tensor(&b[2], ring_k, ring, "dflash ring keys") ||
+        !qwen4_bind_tensor(&b[3], ring_v, ring, "dflash ring values")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_CTX_KV, &args, sizeof(args), b, 4, MTLSizeMake(8, rows, 1),
+                          MTLSizeMake(128, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_dfl_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
+                                  const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
+                                  uint32_t rows, uint32_t n) {
+    struct { uint32_t rows, n, pad0, pad1; } args = { rows, n, 0, 0 };
+    qwen4_bind b[6];
+    const uint64_t ring = 8ull * 2048u * 128u * sizeof(float);
+    if (!rows || rows > 16u ||
+        !qwen4_bind_tensor(&b[0], q, (uint64_t)rows * 4096u * sizeof(float), "dflash attn q") ||
+        !qwen4_bind_tensor(&b[1], ring_k, ring, "dflash attn ring keys") ||
+        !qwen4_bind_tensor(&b[2], ring_v, ring, "dflash attn ring values") ||
+        !qwen4_bind_tensor(&b[3], bk, (uint64_t)rows * 1024u * sizeof(float), "dflash attn block keys") ||
+        !qwen4_bind_tensor(&b[4], bv, (uint64_t)rows * 1024u * sizeof(float), "dflash attn block values") ||
+        !qwen4_bind_tensor(&b[5], out, (uint64_t)rows * 4096u * sizeof(float), "dflash attn output")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_ATTN, &args, sizeof(args), b, 6, MTLSizeMake(16, rows, 1),
+                          MTLSizeMake(256, 1, 1), 0);
+}
+
+/* Key-sliced draft attention: part holds [8][32][32][130] floats. */
+int ds4_gpu_qwen4_dfl_attn_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
+                                        const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
+                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n) {
+    if (!rows || rows > 8u) return 0;
+    const uint32_t nctx = n >= 2047u ? 2047u : n;
+    uint32_t n_split = (nctx + rows + 63u) / 64u;
+    if (n_split < 1u) n_split = 1u;
+    if (n_split > 32u) n_split = 32u;
+    struct { uint32_t rows, n, n_split, pad0; } args = { rows, n, n_split, 0 };
+    const uint64_t ring = 8ull * 2048u * 128u * sizeof(float);
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], q, (uint64_t)rows * 4096u * sizeof(float), "dflash attn q") ||
+        !qwen4_bind_tensor(&b[1], ring_k, ring, "dflash attn ring keys") ||
+        !qwen4_bind_tensor(&b[2], ring_v, ring, "dflash attn ring values") ||
+        !qwen4_bind_tensor(&b[3], bk, (uint64_t)rows * 1024u * sizeof(float), "dflash attn block keys") ||
+        !qwen4_bind_tensor(&b[4], bv, (uint64_t)rows * 1024u * sizeof(float), "dflash attn block values") ||
+        !qwen4_bind_tensor(&b[5], part, 8ull * n_split * 32u * 130u * sizeof(float), "dflash attn partials")) return 0;
+    if (!qwen4_dispatch(QWEN4_K_DFL_ATTN_SPLIT, &args, sizeof(args), b, 6, MTLSizeMake(8, n_split, 1),
+                        MTLSizeMake(256, 1, 1), 0)) return 0;
+    qwen4_bind bm[2] = { b[5] };
+    if (!qwen4_bind_tensor(&bm[1], out, (uint64_t)rows * 4096u * sizeof(float), "dflash attn output")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_ATTN_MERGE, &args, sizeof(args), bm, 2, MTLSizeMake(8, 4u * rows, 1),
+                          MTLSizeMake(128, 1, 1), 0);
+}
+
+int ds4_gpu_qwen4_dfl_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *g, const ds4_gpu_tensor *u, uint32_t n) {
+    struct { uint32_t n, pad0, pad1, pad2; } args = { n, 0, 0, 0 };
+    qwen4_bind b[3];
+    if (!n || !qwen4_bind_tensor(&b[0], g, (uint64_t)n * sizeof(float), "dflash gate") ||
+        !qwen4_bind_tensor(&b[1], u, (uint64_t)n * sizeof(float), "dflash up") ||
+        !qwen4_bind_tensor(&b[2], out, (uint64_t)n * sizeof(float), "dflash swiglu output")) return 0;
+    return qwen4_dispatch(QWEN4_K_DFL_SWIGLU, &args, sizeof(args), b, 3, MTLSizeMake((n + 255) / 256, 1, 1),
+                          MTLSizeMake(256, 1, 1), 0);
+}
+
 /* Diagnostic rollback is read per dispatch, including within one loaded engine. */
 static bool qwen4_prefill_reuse(uint32_t n_tokens) {
     if (n_tokens <= 8u) return false;
@@ -51554,7 +51700,10 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     } else {
         bd[6] = bd[3];
     }
-    const bool decode_r4 = (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact)) &&
+    /* every verify width takes the four-row kernel (same arithmetic); the
+     * generic scan stays for prefill tails of 3..8 rows */
+    const bool decode_r4 = (n_tokens <= 2u || (n_tokens == 3u && g_qwen4_verify_rows_exact) ||
+                            (n_tokens <= 8u && g_qwen4_dfl_verify)) &&
         getenv("DS4_QWEN4_NO_GDN_R4") == NULL;
     if (head_dim == 128u && (n_tokens > 8u || decode_r4)) {
         /* SIMD groups own independent value rows, so changing their grouping

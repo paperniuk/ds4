@@ -3636,6 +3636,31 @@ int ds4_gpu_qwen4_hc_gate_mix_tensor(
         ds4_gpu_tensor *mixed, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *lo,
         const void *model_map, uint64_t model_size, uint64_t up_offset,
         uint32_t weight_type, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc, uint32_t n_rank);
+/* DFlash2 capture: the mean of each row's hc streams (bf16-rounded) into
+ * row dst_row + t, columns [dst_col, dst_col + n_embd) of dst. */
+/* snap_tok value that makes a Qwen snapshot buffer a tape of every row but the last */
+#define QWEN4_SNAP_TAPE 0xFFFFFFFEu
+int ds4_gpu_qwen4_dfl_rms_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *map, uint64_t size,
+                                 uint64_t w_off, uint32_t rows, uint32_t n, float eps);
+int ds4_gpu_qwen4_dfl_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *dyn,
+                                  const void *map, uint64_t size, uint64_t base_off, const ds4_gpu_tensor *res,
+                                  uint32_t rows, uint32_t n, uint32_t kind);
+int ds4_gpu_qwen4_dfl_qk_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *bk, ds4_gpu_tensor *bv, const ds4_gpu_tensor *qkv,
+                                const void *map, uint64_t size, uint64_t qn_off, uint64_t kn_off,
+                                uint32_t rows, uint32_t pos0, float theta);
+int ds4_gpu_qwen4_dfl_ctx_kv_tensor(ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *kv,
+                                    const void *map, uint64_t size, uint64_t kn_off,
+                                    uint32_t rows, uint32_t pos0, float theta);
+int ds4_gpu_qwen4_dfl_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
+                                  const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
+                                  uint32_t rows, uint32_t n);
+int ds4_gpu_qwen4_dfl_attn_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
+                                        const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
+                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n);
+int ds4_gpu_qwen4_dfl_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *g, const ds4_gpu_tensor *u, uint32_t n);
+int ds4_gpu_qwen4_dfl_stream_mean_tensor(
+        ds4_gpu_tensor *dst, const ds4_gpu_tensor *R, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc,
+        uint32_t dst_row, uint32_t dst_stride, uint32_t dst_col);
 int ds4_gpu_qwen4_hc_combine_tensor(
         ds4_gpu_tensor *R, const ds4_gpu_tensor *out, const ds4_gpu_tensor *inj,
         uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc);
@@ -3650,6 +3675,7 @@ int ds4_gpu_qwen4_gdn_prep_tensor(
 /* snap_state/snap2_state (optional) receive the state right after tokens
  * snap_tok/snap2_tok; two points serve the 3-row MTP verifier */
 void ds4_gpu_qwen4_set_verify_rows_exact(bool on);
+void ds4_gpu_qwen4_set_dfl_verify(bool on);
 int ds4_gpu_qwen4_gdn_scan_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,

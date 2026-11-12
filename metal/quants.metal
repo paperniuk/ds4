@@ -11,6 +11,9 @@
 #define QK_K 256
 #endif
 #define QK2_0 64
+/* qwen4.metal follows this file in the library; its kernel tests compile
+ * fragments of it without these quants */
+#define DS4Q_QUANTS 1
 
 struct block_q2_0 {
     half d;

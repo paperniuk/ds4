@@ -102,6 +102,10 @@ done:
 }
 
 int main(void) {
+    /* Specialized and generic staged tiles must agree bit for bit; the M1
+     * codebook register tiles (tested in test_qwen4_kernels) round
+     * differently, so they stay out of this comparison. */
+    if (setenv("DS4_QWEN4_MOE_REG_CB", "0", 1) != 0) return 1;
     format formats[] = {{12,144,256,256,0,0,0}, {16,66,256,256,0,0,0}, {10,84,256,640,0,0,0},
                         {8,34,32,256,0,0,0}, {39,17,32,256,0,0,0}, {2,18,32,256,0,0,0}};
     const uint32_t sizes[] = {8, 9, 16, 17, 24, 31, 32, 33, 48, 63, 64, 65, 95, 96, 97, 127, 128, 129, 257, 8191, 8192, 8193};

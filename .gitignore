@@ -29,6 +29,7 @@
 /tests/test_metal_tp_cancel
 /tests/test_metal_moe_prefill
 /tests/test_metal_ssd_experts
+/tests/test_metal_ssd_reuse
 /tests/test_metal_command_memory
 /tests/test_metal_dense_mpp
 /tests/test_mxfp4_cuda
@@ -84,8 +85,13 @@
 /tests/test_rocm_memory
 /tests/test_qwen4_kernels
 /tests/test_quant_types
+/tests/test_metal_device_policy
+/tests/test_metal_q8_reduction
 /tests/test_qwen4_moe_mm_specialize
 /tests/test_metal_ane_prefill
+/tests/test_qwen4_ssd_experts
+/tests/test_qwen4_memory
+/tests/test_qwen4_generation
 /tests/test_qwen4_vision
 /tests/test_deepseek4_vision_image
 /tests/test_image_decode
@@ -100,6 +106,8 @@
 /tests/test_deepseek41_gguf
 /tests/test_qwen4_ngrams
 /tests/test_qwen4_ngram_state
+/tests/test_qwen4_mtp_prefill
+/tests/test_qwen4_mtp_policy
 /tests/test_qwen4_ple_prefetch
 /tests/test_qwen4_kv_q8
 /tests/test_deepseek41_graph
@@ -121,3 +129,11 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /speed-bench/long_context_probe
 /dist
+/tests/test_metal_qwen4_hc
+/tests/test_metal_qwen4_moe_mid
+
+/tests/test_metal_qwen4_moe_down
+/tests/test_metal_qwen4_mxfp4_stage
+/tests/test_metal_q8_gemv_reference
+/tests/test_metal_qwen4_moe_half
+/tests/test_qwen4_resident_arithmetic

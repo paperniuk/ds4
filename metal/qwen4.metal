@@ -6659,8 +6659,9 @@ kernel void kernel_qwen4_dfl_ctx_kv(
 
 struct ds4_metal_args_qwen4_dfl_attn {
     uint32_t rows;       /* block rows, at positions n .. n + rows - 1 */
-    uint32_t n;          /* context rows committed: positions [0, n) */
-    uint32_t pad0, pad1;
+    uint32_t n;          /* context rows committed: positions [lo, n) */
+    uint32_t lo;         /* first committed position the ring holds */
+    uint32_t pad1;
 };
 
 /* The draft's attention: block row r (position n + r) of query head h sees
@@ -6682,7 +6683,7 @@ kernel void kernel_qwen4_dfl_attn(
     if (r >= args.rows || pair >= QWEN4_DFL_QH / 2u) return;
     const uint h0 = pair * 2u, kh = h0 / 4u;
     const uint qpos = args.n + r;
-    const uint lo = qpos >= QWEN4_DFL_WIN - 1u ? qpos - (QWEN4_DFL_WIN - 1u) : 0u;
+    const uint lo = max(args.lo, qpos >= QWEN4_DFL_WIN - 1u ? qpos - (QWEN4_DFL_WIN - 1u) : 0u);
     const uint nctx = args.n > lo ? args.n - lo : 0u;
     const uint nk = nctx + args.rows;
     threadgroup float qs[2][QWEN4_DFL_HD];
@@ -6766,9 +6767,9 @@ kernel void kernel_qwen4_dfl_swiglu(
 
 struct ds4_metal_args_qwen4_dfl_attn_split {
     uint32_t rows;       /* block rows (<= 8), positions n .. n + rows - 1 */
-    uint32_t n;          /* context positions committed: [0, n) */
+    uint32_t n;          /* context positions committed: [lo, n) */
     uint32_t n_split;    /* key slices */
-    uint32_t pad0;
+    uint32_t lo;         /* first committed position the ring holds */
 };
 
 /* The draft's attention in key slices: one threadgroup of 256 per (KV head,
@@ -6793,13 +6794,13 @@ kernel void kernel_qwen4_dfl_attn_split(
     const uint qi = tid / 8u, sub = tid % 8u, d0 = sub * 16u;
     const uint r = qi / 4u, hh = qi % 4u;
     const bool live = r < args.rows;
-    const uint lo0 = args.n >= QWEN4_DFL_WIN - 1u ? args.n - (QWEN4_DFL_WIN - 1u) : 0u;
+    const uint lo0 = max(min(args.lo, args.n), args.n >= QWEN4_DFL_WIN - 1u ? args.n - (QWEN4_DFL_WIN - 1u) : 0u);
     const uint nctx = args.n - lo0;
     const uint nk = nctx + args.rows;
     const uint per = (nk + args.n_split - 1u) / args.n_split;
     const uint j0 = sl * per, j1 = min(nk, j0 + per);
     const uint qpos = args.n + r;
-    const uint lo_r = qpos >= QWEN4_DFL_WIN - 1u ? qpos - (QWEN4_DFL_WIN - 1u) : 0u;
+    const uint lo_r = max(lo0, qpos >= QWEN4_DFL_WIN - 1u ? qpos - (QWEN4_DFL_WIN - 1u) : 0u);
     float qv[16], acc[16];
     for (uint i = 0; i < 16u; i++) {
         qv[i] = live ? q[((uint64_t)r * QWEN4_DFL_QH + kh * 4u + hh) * QWEN4_DFL_HD + d0 + i] * 0.08838834764831845f : 0.0f;

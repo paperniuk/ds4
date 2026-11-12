@@ -51567,8 +51567,8 @@ int ds4_gpu_qwen4_dfl_ctx_kv_tensor(ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring
 
 int ds4_gpu_qwen4_dfl_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
                                   const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
-                                  uint32_t rows, uint32_t n) {
-    struct { uint32_t rows, n, pad0, pad1; } args = { rows, n, 0, 0 };
+                                  uint32_t rows, uint32_t n, uint32_t lo) {
+    struct { uint32_t rows, n, lo, pad1; } args = { rows, n, lo, 0 };
     qwen4_bind b[6];
     const uint64_t ring = 8ull * 2048u * 128u * sizeof(float);
     if (!rows || rows > 16u ||
@@ -51585,13 +51585,14 @@ int ds4_gpu_qwen4_dfl_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, 
 /* Key-sliced draft attention: part holds [8][32][32][130] floats. */
 int ds4_gpu_qwen4_dfl_attn_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
                                         const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
-                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n) {
+                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n, uint32_t lo) {
     if (!rows || rows > 8u) return 0;
-    const uint32_t nctx = n >= 2047u ? 2047u : n;
+    if (lo > n) lo = n;
+    const uint32_t nctx = n - lo >= 2047u ? 2047u : n - lo;
     uint32_t n_split = (nctx + rows + 63u) / 64u;
     if (n_split < 1u) n_split = 1u;
     if (n_split > 32u) n_split = 32u;
-    struct { uint32_t rows, n, n_split, pad0; } args = { rows, n, n_split, 0 };
+    struct { uint32_t rows, n, n_split, lo; } args = { rows, n, n_split, lo };
     const uint64_t ring = 8ull * 2048u * 128u * sizeof(float);
     qwen4_bind b[6];
     if (!qwen4_bind_tensor(&b[0], q, (uint64_t)rows * 4096u * sizeof(float), "dflash attn q") ||

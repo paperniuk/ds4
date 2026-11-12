@@ -3657,10 +3657,10 @@ int ds4_gpu_qwen4_dfl_ctx_kv_tensor(ds4_gpu_tensor *ring_k, ds4_gpu_tensor *ring
                                     uint32_t rows, uint32_t pos0, float theta);
 int ds4_gpu_qwen4_dfl_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
                                   const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
-                                  uint32_t rows, uint32_t n);
+                                  uint32_t rows, uint32_t n, uint32_t lo);
 int ds4_gpu_qwen4_dfl_attn_split_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *ring_k,
                                         const ds4_gpu_tensor *ring_v, const ds4_gpu_tensor *bk, const ds4_gpu_tensor *bv,
-                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n);
+                                        ds4_gpu_tensor *part, uint32_t rows, uint32_t n, uint32_t lo);
 int ds4_gpu_qwen4_dfl_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *g, const ds4_gpu_tensor *u, uint32_t n);
 int ds4_gpu_qwen4_dfl_stream_mean_tensor(
         ds4_gpu_tensor *dst, const ds4_gpu_tensor *R, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc,

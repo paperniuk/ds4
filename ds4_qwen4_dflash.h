@@ -24,7 +24,10 @@
 
 typedef struct {
     int tok[QWEN4_DFL_DRAFT];          /* proposals for positions n+1.. */
-    float conf[QWEN4_DFL_DRAFT];       /* selector max probability, temp 1 */
+    float conf[QWEN4_DFL_DRAFT];       /* selector max probability at temp 1, or
+                                        * the drawn candidate's q when sampled */
+    float q[QWEN4_DFL_DRAFT][QWEN4_DFL_TOPK]; /* sampled drafts: each row's proposal distribution */
+    uint8_t pick[QWEN4_DFL_DRAFT];     /* the candidate each row proposes */
     int cand[QWEN4_DFL_DRAFT][QWEN4_DFL_TOPK];
     float score[QWEN4_DFL_DRAFT][QWEN4_DFL_TOPK]; /* unary + edge from the chosen predecessor */
     int raw[QWEN4_DFL_DRAFT];          /* each row's argmax, before the selector */
@@ -32,7 +35,10 @@ typedef struct {
 
 typedef struct {
     bool ready;
-    uint32_t ctx_n;                    /* positions [0, ctx_n) are in the ring */
+    uint32_t ctx_n;                    /* positions [lo, ctx_n) are in the ring */
+    uint32_t lo;                       /* the ring starts here after a reset */
+    const void *owner;                 /* the graph whose positions the ring holds */
+    int tok[QWEN4_DFL_WIN];            /* the token at each ring slot */
     ds4_gpu_tensor *ring_k[QWEN4_DFL_LAYERS], *ring_v[QWEN4_DFL_LAYERS];
     ds4_gpu_tensor *h, *xn, *dyn, *c, *qkv, *q, *bk, *bv, *att, *o, *h1;
     ds4_gpu_tensor *gt, *up, *act, *mm, *fh, *logits, *sel;
@@ -128,15 +134,64 @@ static bool qwen4_dfl_commit(const ds4_model *m, const ds4_gpu_tensor *src, uint
     return ok;
 }
 
+/* The ring ends at pos0 before positions pos0.. are written: a rewind keeps
+ * what lies before pos0; a gap, a position before the ring or another graph
+ * starts it over at pos0 (the draft then sees only what is committed from
+ * there on).  The ring only steers the drafts, never the output. */
+static void qwen4_dfl_ring_seek(const void *owner, uint32_t pos0) {
+    qwen4_dfl_runtime *rt = &g_qwen4_dfl_rt;
+    if (rt->owner != owner || pos0 < rt->lo || pos0 > rt->ctx_n) {
+        rt->owner = owner;
+        rt->lo = pos0;
+    }
+    rt->ctx_n = pos0;
+}
+
+/* Commit n capture rows of src as positions pos0.. holding tokens[0..n). */
+static bool qwen4_dfl_ring_put(const ds4_model *m, const void *owner, const ds4_gpu_tensor *src,
+                               uint32_t src_row, uint32_t pos0, uint32_t n, const int *tokens) {
+    qwen4_dfl_runtime *rt = &g_qwen4_dfl_rt;
+    if (!rt->ready || n == 0) return true;
+    qwen4_dfl_ring_seek(owner, pos0);
+    const uint32_t from = n > QWEN4_DFL_WIN ? n - QWEN4_DFL_WIN : 0u;
+    for (uint32_t i = from; i < n; i++) rt->tok[(pos0 + i) % QWEN4_DFL_WIN] = tokens[i];
+    return qwen4_dfl_commit(m, src, src_row, pos0, n);
+}
+
+/* Before a draft at p: keep the ring only if it ends at or past p and holds
+ * the session's own tokens before p. */
+static void qwen4_dfl_ring_sync(const void *owner, const int *tokens, uint32_t p) {
+    qwen4_dfl_runtime *rt = &g_qwen4_dfl_rt;
+    if (rt->owner != owner || p < rt->lo || p > rt->ctx_n) {
+        rt->owner = owner;
+        rt->lo = rt->ctx_n = p;
+        return;
+    }
+    rt->ctx_n = p;
+    const uint32_t from = p - rt->lo > QWEN4_DFL_WIN - 1u ? p - (QWEN4_DFL_WIN - 1u) : rt->lo;
+    for (uint32_t pos = from; pos < p; pos++) {
+        if (rt->tok[pos % QWEN4_DFL_WIN] != tokens[pos]) {
+            rt->lo = p;
+            return;
+        }
+    }
+}
+
+/* Forward hook: the rows a target forward just captured join the ring. */
+static bool qwen4_dfl_ring_forward(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens,
+                                   uint32_t pos0, uint32_t n) {
+    return qwen4_dfl_ring_put(m, g, g->dfl_cap, 0, pos0, n, tokens);
+}
+
 /* DS4_QWEN4_DFL_ATTN_OLD=1: the per (row, head pair) attention kernel. */
 static bool qwen4_dfl_attention(uint32_t l, uint32_t n) {
     qwen4_dfl_runtime *rt = &g_qwen4_dfl_rt;
     static int old = -1;
     if (old < 0) old = getenv("DS4_QWEN4_DFL_ATTN_OLD") != NULL;
     return old ? ds4_gpu_qwen4_dfl_attn_tensor(rt->att, rt->q, rt->ring_k[l], rt->ring_v[l], rt->bk, rt->bv,
-                                               QWEN4_DFL_ROWS, n)
+                                               QWEN4_DFL_ROWS, n, rt->lo)
                : ds4_gpu_qwen4_dfl_attn_split_tensor(rt->att, rt->q, rt->ring_k[l], rt->ring_v[l], rt->bk, rt->bv,
-                                                     rt->part, QWEN4_DFL_ROWS, n);
+                                                     rt->part, QWEN4_DFL_ROWS, n, rt->lo);
 }
 
 static bool qwen4_dfl_layer_pass(const ds4_model *m, const qwen4_dfl_layer *L, uint32_t l, uint32_t n) {
@@ -198,9 +253,10 @@ static void qwen4_dfl_edges(const float *sel, int pred, const int *cand, float *
 }
 
 /* One draft pass from the anchor token at position n (ctx_n == n): the
- * greedy selector walk over positions n+1..n+7. */
+ * selector walk over positions n+1..n+7, greedy, or with rng each row's
+ * candidate drawn from q = softmax(score / temp) over its 16. */
 static bool qwen4_dfl_draft(const ds4_model *m, const ds4_weights *w, int anchor, uint32_t n,
-                            qwen4_dfl_proposal *out) {
+                            float temp, uint64_t *rng, qwen4_dfl_proposal *out) {
     qwen4_dfl_runtime *rt = &g_qwen4_dfl_rt;
     const qwen4_dfl_weights *W = &g_qwen4_dfl;
     const uint32_t R = QWEN4_DFL_ROWS, E = QWEN4_DFL_HIDDEN;
@@ -248,6 +304,21 @@ static bool qwen4_dfl_draft(const ds4_model *m, const ds4_weights *w, int anchor
         float sum = 0.0f;
         for (uint32_t c = 0; c < QWEN4_DFL_TOPK; c++) sum += expf(out->score[i][c] - mx);
         out->conf[i] = 1.0f / sum;
+        if (rng && temp > 0.0f) {
+            /* the selector's own temperature fits best: q at 0.5x or 0.25x
+             * the request's lowered acceptance (72 -> 67 / 63%), at 1.5x
+             * the policy verified fewer drafts; both were slower */
+            float qs = 0.0f;
+            for (uint32_t c = 0; c < QWEN4_DFL_TOPK; c++) {
+                out->q[i][c] = expf((out->score[i][c] - mx) / temp);
+                qs += out->q[i][c];
+            }
+            for (uint32_t c = 0; c < QWEN4_DFL_TOPK; c++) out->q[i][c] /= qs;
+            const int c = sample_probabilities(out->q[i], QWEN4_DFL_TOPK, rng);
+            if (c >= 0 && c < (int)QWEN4_DFL_TOPK) best = (uint32_t)c;
+            out->conf[i] = out->q[i][best];
+        }
+        out->pick[i] = (uint8_t)best;
         out->raw[i] = out->cand[i][0];
         out->tok[i] = out->cand[i][best];
         pred = out->tok[i];
@@ -268,7 +339,13 @@ typedef struct {
     float row_ms[QWEN4_DFL_ROWS + 1u];
     float draft_ms;
     float cal_n[10], cal_ok[10];
+    float win_tok, win_ms;             /* EMAs of a drafted step's tokens and wall milliseconds */
+    float plain_ms;                    /* EMA of a plain step's wall milliseconds */
+    uint32_t skip;                     /* tokens left to decode without a draft */
 } qwen4_dfl_policy;
+
+/* Plain tokens between draft probes while drafting does not pay. */
+#define QWEN4_DFL_SKIP 4u
 
 static qwen4_dfl_policy g_qwen4_dfl_pol;
 
@@ -278,6 +355,10 @@ static void qwen4_dfl_policy_init(qwen4_dfl_policy *pol) {
     static const float seed[QWEN4_DFL_ROWS + 1u] = { 0.0f, 31.0f, 42.4f, 61.7f, 75.2f, 86.0f, 93.0f, 100.0f, 107.0f };
     memcpy(pol->row_ms, seed, sizeof(seed));
     pol->draft_ms = 7.0f;
+    pol->win_tok = 1.2f;
+    pol->win_ms = seed[1] + pol->draft_ms;
+    pol->plain_ms = seed[1];
+    pol->skip = 0;
     for (uint32_t b = 0; b < 10u; b++) {
         pol->cal_n[b] = 10.0f;
         pol->cal_ok[b] = 10.0f * (0.05f + 0.1f * (float)b);
@@ -310,10 +391,29 @@ static uint32_t qwen4_dfl_pick_rows(const qwen4_dfl_proposal *p, uint32_t max_ro
     return best_t;
 }
 
+/* Whether to draft the next token at all: a draft costs about a fifth of a
+ * plain decode step, so where the drafted steps of about the last ten made
+ * fewer tokens per wall millisecond than plain steps do, the next
+ * QWEN4_DFL_SKIP tokens decode plain, then a cycle probes again.  Wall time
+ * runs from one step's start to the next one's, so it includes what the
+ * caller does per step (sampling, streaming), which a drafted step shares
+ * among its tokens.  Opt-in (DS4_QWEN4_DFL_SKIP=1): on M1 Max it cost
+ * greedy code 41 -> 39 tok/s and did not help greedy edits. */
+static bool qwen4_dfl_should_draft(void) {
+    qwen4_dfl_policy *pol = &g_qwen4_dfl_pol;
+    if (!pol->init) qwen4_dfl_policy_init(pol);
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("DS4_QWEN4_DFL_SKIP"); off = !(e && e[0] == '1'); }
+    if (off || pol->skip == 0) return true;
+    pol->skip--;
+    return false;
+}
+
 static void qwen4_dfl_policy_learn(const qwen4_dfl_proposal *p, uint32_t T, uint32_t k, double verify_s,
                                    double draft_s) {
     qwen4_dfl_policy *pol = &g_qwen4_dfl_pol;
     const float a = 0.1f;
+
     /* clamped samples: a first verify of a row count compiles pipelines
      * and allocates the tape, which would otherwise lock that count out */
     const float v = fminf(fmaxf((float)(1e3 * verify_s), 0.5f * pol->row_ms[T]), 1.5f * pol->row_ms[T]);
@@ -328,19 +428,62 @@ static void qwen4_dfl_policy_learn(const qwen4_dfl_proposal *p, uint32_t T, uint
     }
 }
 
+/* The wall time of the previous step, from its start to this one's (gaps
+ * over half a second, between requests, are not steps). */
+static void qwen4_dfl_note_step(bool drafted, uint32_t tokens, double wall_s) {
+    qwen4_dfl_policy *pol = &g_qwen4_dfl_pol;
+    if (!pol->init || tokens == 0 || !(wall_s > 0.0) || wall_s > 0.5) return;
+    const float ms = (float)(1e3 * wall_s);
+    if (!drafted) {
+        pol->plain_ms += 0.1f * (ms / (float)tokens - pol->plain_ms);
+        return;
+    }
+    pol->win_tok += 0.1f * ((float)tokens - pol->win_tok);
+    pol->win_ms += 0.1f * (ms - pol->win_ms);
+    if (pol->win_tok * pol->plain_ms < pol->win_ms) pol->skip = QWEN4_DFL_SKIP;
+}
+
 typedef struct {
-    uint64_t cycles, drafted_rows, accepted, emitted;
+    uint64_t cycles, drafted_rows, accepted, emitted, plain;
     double t_draft, t_verify, t_commit;
     uint64_t rows_hist[QWEN4_DFL_ROWS + 1u];
     double t_rows[QWEN4_DFL_ROWS + 1u];
     uint64_t cal_n[10], cal_ok[10];    /* verified drafts by confidence decile, and accepted */
 } qwen4_dfl_stats;
 
-/* Prefill commit: the capture rows of the forward that just ran from pos0. */
-static bool qwen4_dfl_commit_forward(ds4_qwen4_gpu_graph *g, const ds4_model *m, uint32_t pos0) {
-    if (g->pos <= pos0) return true;
-    return glm_graph_begin_commands_if_needed() &&
-           qwen4_dfl_commit(m, g->dfl_cap, 0, pos0, g->pos - pos0) &&
+/* Verify toks[0..T) from g->pos with all T logit rows; T > 1 runs taped
+ * (the recurrent state after every row is kept for qwen4_dfl_keep), with
+ * the batch products from five rows.  The capture rows wait for
+ * qwen4_dfl_keep instead of joining the ring. */
+static bool qwen4_dfl_verify(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+                             const int *toks, uint32_t T, float *rows) {
+    g->dfl_tape = T > 1u;
+    if (g->dfl_tape && !qwen4_graph_ensure_tape(g)) { g->dfl_tape = false; return false; }
+    static int bmm3 = -1;
+    /* opt-in: at three or four rows the padded batch product measured
+     * slower than the exact rows kernel on M1 Max */
+    if (bmm3 < 0) { const char *e = getenv("DS4_QWEN4_DFL_BMM3"); bmm3 = e && e[0] && e[0] != '0'; }
+    if (bmm3 && T >= 3u) g_qwen4_batch_mm_min = 3u;
+    static int kq_min = -1;
+    if (kq_min < 0) { const char *e = getenv("DS4_QWEN4_DFL_KQ_MIN"); kq_min = e && e[0] ? atoi(e) : 5; }
+    g_qwen4_batch_kq_min = kq_min > 0 ? (uint32_t)kq_min : 0u;
+    g->dfl_defer = true;
+    ds4_gpu_qwen4_set_dfl_verify(T > 1u);
+    const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, true);
+    ds4_gpu_qwen4_set_dfl_verify(false);
+    g->dfl_defer = false;
+    g_qwen4_batch_mm_min = 5u;
+    g_qwen4_batch_kq_min = 0u;
+    g->dfl_tape = false;
+    return ok;
+}
+
+/* After a verify of T rows from p: keep its first `keep` rows (the state
+ * after row keep-1 from the tape) and commit their captures to the ring. */
+static bool qwen4_dfl_keep(ds4_qwen4_gpu_graph *g, const ds4_model *m, uint32_t p, uint32_t keep, uint32_t T,
+                           const int *toks) {
+    if (keep < T && !qwen4_graph_tape_restore(g, p, keep)) return false;
+    return glm_graph_begin_commands_if_needed() && qwen4_dfl_ring_put(m, g, g->dfl_cap, 0, p, keep, toks) &&
            ds4_gpu_end_commands();
 }
 
@@ -354,7 +497,7 @@ static uint32_t qwen4_dfl_cycle(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
     qwen4_dfl_proposal prop;
     double t0 = now_sec();
     const double t_draft0 = t0;
-    if (!qwen4_dfl_draft(m, w, anchor, p, &prop)) {
+    if (!qwen4_dfl_draft(m, w, anchor, p, 0.0f, NULL, &prop)) {
         fprintf(stderr, "ds4: DFlash2 draft failed (ring holds %u positions, anchor at %u)\n", g_qwen4_dfl_rt.ctx_n, p);
         return 0;
     }
@@ -364,23 +507,10 @@ static uint32_t qwen4_dfl_cycle(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
     int toks[QWEN4_DFL_ROWS];
     toks[0] = anchor;
     for (uint32_t i = 1; i < T; i++) toks[i] = prop.tok[i - 1u];
-    g->dfl_tape = T > 1u;
-    if (g->dfl_tape && !qwen4_graph_ensure_tape(g)) { g->dfl_tape = false; return 0; }
-    static int bmm3 = -1;
-    /* opt-in: at three or four rows the padded batch product measured
-     * slower than the exact rows kernel on M1 Max */
-    if (bmm3 < 0) { const char *e = getenv("DS4_QWEN4_DFL_BMM3"); bmm3 = e && e[0] && e[0] != '0'; }
-    if (bmm3 && T >= 3u) g_qwen4_batch_mm_min = 3u;
-    static int kq_min = -1;
-    if (kq_min < 0) { const char *e = getenv("DS4_QWEN4_DFL_KQ_MIN"); kq_min = e && e[0] ? atoi(e) : 5; }
-    g_qwen4_batch_kq_min = kq_min > 0 ? (uint32_t)kq_min : 0u;
-    ds4_gpu_qwen4_set_dfl_verify(T > 1u);
-    const bool ok = qwen4_graph_forward_tokens(g, m, w, toks, T, rows, T > 1u);
-    ds4_gpu_qwen4_set_dfl_verify(false);
-    g_qwen4_batch_mm_min = 5u;
-    g_qwen4_batch_kq_min = 0u;
-    g->dfl_tape = false;
-    if (!ok) { fprintf(stderr, "ds4: DFlash2 verify of %u rows failed\n", T); return 0; }
+    if (!qwen4_dfl_verify(g, m, w, toks, T, rows)) {
+        fprintf(stderr, "ds4: DFlash2 verify of %u rows failed\n", T);
+        return 0;
+    }
     t0 = now_sec();
     st->t_verify += t0 - t1;
     st->t_rows[T] += t0 - t1;
@@ -393,13 +523,8 @@ static uint32_t qwen4_dfl_cycle(ds4_qwen4_gpu_graph *g, const ds4_model *m, cons
         if (i < k) st->cal_ok[b]++;
     }
     const uint32_t keep = k + 1u;
-    if (keep < T && !qwen4_graph_tape_restore(g, p, keep)) {
-        fprintf(stderr, "ds4: DFlash2 tape restore failed\n");
-        return 0;
-    }
-    if (!glm_graph_begin_commands_if_needed() || !qwen4_dfl_commit(m, g->dfl_cap, 0, p, keep) ||
-        !ds4_gpu_end_commands()) {
-        fprintf(stderr, "ds4: DFlash2 commit failed\n");
+    if (!qwen4_dfl_keep(g, m, p, keep, T, toks)) {
+        fprintf(stderr, "ds4: DFlash2 commit of %u rows failed\n", keep);
         return 0;
     }
     const double t2 = now_sec();
@@ -423,6 +548,7 @@ static void qwen4_dfl_report(const qwen4_dfl_stats *st) {
             st->drafted_rows ? 100.0 * (double)st->accepted / (double)st->drafted_rows : 0.0,
             1e3 * st->t_draft / c, 1e3 * st->t_verify / c, 1e3 * st->t_commit / c);
     for (uint32_t t = 1; t <= QWEN4_DFL_ROWS; t++) fprintf(stderr, " %" PRIu64, st->rows_hist[t]);
+    if (st->plain) fprintf(stderr, "; %" PRIu64 " tokens without a draft", st->plain);
     fprintf(stderr, "\nds4: DFlash2 verify ms by rows:");
     for (uint32_t t = 1; t <= QWEN4_DFL_ROWS; t++)
         fprintf(stderr, " %.1f", st->rows_hist[t] ? 1e3 * st->t_rows[t] / (double)st->rows_hist[t] : 0.0);
@@ -511,7 +637,7 @@ static int qwen4_dfl_selftest(const ds4_model *m, const ds4_weights *w, const ch
         rt->t_commit += now_sec() - c0;
         rt->n_commit++;
         qwen4_dfl_proposal p;
-        ok = ok && qwen4_dfl_draft(m, w, tok[n], n, &p);
+        ok = ok && qwen4_dfl_draft(m, w, tok[n], n, 0.0f, NULL, &p);
         if (!ok) break;
         uint32_t a = 0, b = 0;
         while (a < QWEN4_DFL_DRAFT && p.tok[a] == tok[n + 1u + a]) a++;

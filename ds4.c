@@ -47012,6 +47012,29 @@ static int sample_residual_probabilities(float *target_probs,
     if (sum <= 0.0f || !sample_finitef(sum)) return target_best;
     return sample_probabilities(target_probs, n_vocab, rng);
 }
+
+/* One speculative step against a proposal q that is nonzero only on the
+ * n_cand ids cand[] (the DFlash2 selector's candidates), whose cand[pick]
+ * was drawn: keep it with min(1, p/q), otherwise sample the residual
+ * max(0, p - q), which overwrites target_probs.  *kept tells which. */
+static int speculative_sparse_step(float *target_probs, uint32_t n_vocab, const int *cand, const float *q,
+                                   uint32_t n_cand, uint32_t pick, uint64_t *rng, bool *kept) {
+    *kept = false;
+    if (!target_probs || !cand || !q || !rng || pick >= n_cand) return -1;
+    const int d = cand[pick];
+    if (d < 0 || (uint32_t)d >= n_vocab) return -1;
+    const float p = target_probs[d], qd = q[pick];
+    if (qd > 0.0f && sample_finitef(qd) && (p >= qd || sample_rng_f32(rng) * qd <= p)) {
+        *kept = true;
+        return d;
+    }
+    for (uint32_t c = 0; c < n_cand; c++) {
+        if (cand[c] < 0 || (uint32_t)cand[c] >= n_vocab) continue;
+        const float r = target_probs[cand[c]] - q[c];
+        target_probs[cand[c]] = r > 0.0f ? r : 0.0f;
+    }
+    return sample_probabilities(target_probs, n_vocab, rng);
+}
 #endif
 
 static bool sample_fast_top_p(
@@ -47450,6 +47473,22 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
     }
     target_probs[draft_token] = 0.0f;
     return sample_probabilities(target_probs, n_vocab, rng);
+}
+
+/* A draft drawn from q over n_cand candidates, then speculative_sparse_step:
+ * the result follows the target distribution. */
+int ds4_test_speculative_sparse_sample(const float *target_logits, uint32_t n_vocab,
+                                       float temperature, int top_k, float top_p, float min_p,
+                                       const int *cand, const float *q, uint32_t n_cand,
+                                       uint64_t *rng, float *target_probs) {
+    if (!target_logits || !cand || !q || !rng || !target_probs || n_vocab == 0 || n_cand == 0 ||
+        !sample_build_probabilities(target_logits, n_vocab, temperature, top_k, top_p, min_p, target_probs)) {
+        return -1;
+    }
+    const int pick = sample_probabilities(q, n_cand, rng);
+    if (pick < 0) return -1;
+    bool kept = false;
+    return speculative_sparse_step(target_probs, n_vocab, cand, q, n_cand, (uint32_t)pick, rng, &kept);
 }
 
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
@@ -60449,6 +60488,9 @@ typedef struct ds4_qwen4_gpu_graph {
     bool dfl_capture;
     /* DFlash2 verify tape: the recurrent state after each row but the last */
     bool dfl_tape;
+    /* a DFlash2 verify: its captures join the draft's ring only once the
+     * accepted rows are known (qwen4_dfl_keep), not at the forward's end */
+    bool dfl_defer;
     ds4_gpu_tensor *tape_lin_state[DS4_MAX_LAYER], *tape_lin_hist[DS4_MAX_LAYER], *tape_ple_hist;
     int tape_ple_prev[8][DS4_MAX_PLE_NGRAM];
     int32_t tape_mrope_delta[8];
@@ -62157,6 +62199,9 @@ static void qwen4_dfl_dump(ds4_qwen4_gpu_graph *g, const int *tokens, uint32_t p
     free(rows);
 }
 
+static bool qwen4_dfl_ring_forward(ds4_qwen4_gpu_graph *g, const ds4_model *m, const int *tokens,
+                                   uint32_t pos0, uint32_t n);
+
 static bool qwen4_layer_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                             uint32_t il, uint32_t pos0, uint32_t T) {
     qwen4_ane_set_moe_layer((int)il);
@@ -62265,6 +62310,7 @@ static bool qwen4_graph_forward_tokens_once(ds4_qwen4_gpu_graph *g, const ds4_mo
     } else if (ok && logits_out) {
         ok = qwen4_graph_logits_last(g, m, w, T);
     }
+    if (ok && g->dfl_capture && !g->dfl_defer) ok = qwen4_dfl_ring_forward(g, m, tokens, pos0, T);
     const double t2 = timing ? now_sec() : 0.0;
     if (!ds4_gpu_end_commands()) ok = false;
     const double t3 = timing ? now_sec() : 0.0;
@@ -62478,6 +62524,7 @@ static bool qwen4_graph_forward_pair_once(ds4_qwen4_gpu_graph *g, const ds4_mode
     }
     qwen4_pipe_enter(g, &c[1]);
     if (ok && logits_out) ok = qwen4_graph_logits_last(g, m, w, TB);
+    if (ok && g->dfl_capture && !g->dfl_defer) ok = qwen4_dfl_ring_forward(g, m, tokens, pos0, TA + TB);
     if (!ds4_gpu_end_commands()) ok = false;
     if (ok && logits_out) ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     g->R = own[0];
@@ -63088,7 +63135,6 @@ static int generate_qwen4_metal_argmax(
     const double t_prefill0 = now_sec();
     bool ok = true;
     for (int i = 0; i < prompt->len && ok;) {
-        const uint32_t pos_before = g->pos;
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
         const uint32_t chunk2 = qwen4_graph_pair_tail(g, model, weights, (uint32_t)(prompt->len - i), &chunk);
@@ -63100,7 +63146,6 @@ static int generate_qwen4_metal_argmax(
             ok = qwen4_graph_forward_tokens(g, model, weights, prompt->v + i, chunk,
                                             i + (int)chunk == prompt->len ? logits : NULL, false);
         }
-        if (ok && dfl) ok = qwen4_dfl_commit_forward(g, model, pos_before);
         i += (int)chunk;
         if (progress) progress(progress_ud, "prefill_chunk", i, prompt->len);
     }
@@ -64138,6 +64183,24 @@ struct ds4_session {
     float *qwen4_draft_logits;
     float *qwen4_draft_q;
     uint64_t qwen4_q_cycles, qwen4_q_accepted, qwen4_q_nodraft;
+    /* DFlash2 (ds4_qwen4_dflash_session.h): the block drafter runs this
+     * session's speculative decode.  qwen4_dfl_rows holds the last verify's
+     * logit rows, then the logits before it; with the tape and snap0 they
+     * serve rewinds inside that block (qwen4_dfl_pos, _keep, valid while
+     * fwd_seq is _seq).  A rejected sampled draft leaves its residual sample
+     * as the token the next ds4_session_sample returns (qwen4_forced_*). */
+    bool qwen4_dfl, qwen4_dfl_snap0;
+    float *qwen4_dfl_rows;
+    uint32_t qwen4_dfl_pos, qwen4_dfl_keep;
+    uint64_t qwen4_dfl_seq;
+    qwen4_dfl_stats qwen4_dfl_st;
+    double qwen4_dfl_last_start;       /* the previous step, for qwen4_dfl_note_step */
+    uint32_t qwen4_dfl_last_tokens;
+    bool qwen4_dfl_last_drafted;
+    bool qwen4_forced_set;
+    int qwen4_forced, qwen4_forced_len, qwen4_forced_top_k;
+    uint64_t qwen4_forced_seq;
+    float qwen4_forced_temp, qwen4_forced_top_p, qwen4_forced_min_p;
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -64229,6 +64292,11 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
+
+#ifdef DS4_HAS_QWEN4_GPU
+static void qwen4_dfl_session_init(ds4_session *s);
+static void qwen4_dfl_session_report(const ds4_session *s);
+#endif
 
 static bool ds4_session_tp_leader(const ds4_session *s);
 
@@ -66788,6 +66856,8 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
     s->glm_mtp_have = 0;
     s->glm_mtp_have2 = false;
     g->snap_valid = g->snap2_valid = g->snap0_valid = false;
+    g->fwd_seq++; /* the DFlash2 block tape is the old transcript's too */
+    s->qwen4_dfl_keep = 0;
     if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), remaining, err, errlen) != 0) {
         token_vec_free(&new_checkpoint);
         return 1;
@@ -67219,6 +67289,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+#ifdef DS4_HAS_QWEN4_GPU
+    s->qwen4_forced_set = false;
+#endif
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -77429,6 +77502,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen4_graph_ready = true;
+        qwen4_dfl_session_init(s);
         if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -77803,9 +77877,11 @@ void ds4_session_free(ds4_session *s) {
                         s->qwen4_q_cycles ? 100.0 * (double)s->qwen4_q_accepted / (double)s->qwen4_q_cycles : 0.0,
                         s->qwen4_q_nodraft);
             }
+            qwen4_dfl_session_report(s);
             free(s->qwen4_verify_logits);
             free(s->qwen4_draft_logits);
             free(s->qwen4_draft_q);
+            free(s->qwen4_dfl_rows);
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
@@ -78630,6 +78706,8 @@ static void qwen4_spec_note_first_draft(ds4_session *s, bool accepted_first) {
     s->qwen4_depth_cycles++;
     if (accepted_first) s->qwen4_depth_accepted++;
 }
+
+#include "ds4_qwen4_dflash_session.h"
 
 /* One Qwen3.8 MTP cycle: evaluate first_token, or verify [first_token, draft]
  * — plus a second chained draft when the depth policy engages it — in one
@@ -79673,6 +79751,9 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
 #ifndef DS4_NO_GPU
     if (s) s->dspark_rewind_end = 0;
+#endif
+#ifdef DS4_HAS_QWEN4_GPU
+    if (s) s->qwen4_forced_set = false;
 #endif
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
@@ -81169,6 +81250,10 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+#ifdef DS4_HAS_QWEN4_GPU
+    int forced = -1;
+    if (qwen4_dfl_forced_take(s, temperature, top_k, top_p, min_p, &forced)) return forced;
+#endif
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
@@ -89450,6 +89535,10 @@ static int ds4_session_eval_speculative_argmax_impl(
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
 #ifdef DS4_HAS_QWEN4_GPU
+        if (s->qwen4_dfl && s->qwen4_graph_ready) {
+            return ds4_session_qwen4_dfl_cycle(s, first_token, ignore_eos ? -1 : eos_token, 0.0f, 0, 0.0f, 0.0f,
+                                               NULL, false, accepted, accepted_cap, err, errlen);
+        }
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
                                                 accepted, accepted_cap, err, errlen);
@@ -90320,6 +90409,11 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     if (ds4_session_is_qwen4(s)) {
 #ifdef DS4_HAS_QWEN4_GPU
+        if (s->qwen4_dfl && s->qwen4_graph_ready) {
+            return ds4_session_qwen4_dfl_cycle(s, first_token, eos_token, temperature, top_k, top_p, min_p, rng,
+                                               s->engine->dspark_exact_sampling, accepted, accepted_cap,
+                                               err, errlen);
+        }
         if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && s->qwen4_graph_ready) {
             return ds4_session_qwen4_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng,
                                                 s->engine->dspark_exact_sampling,
@@ -90441,6 +90535,9 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+#ifdef DS4_HAS_QWEN4_GPU
+    s->qwen4_forced_set = false;
+#endif
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
@@ -90664,6 +90761,9 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
 
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
+#ifdef DS4_HAS_QWEN4_GPU
+    s->qwen4_forced_set = false;
+#endif
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
     if (ds4_session_rewind_speculative(s, pos)) return;
@@ -90683,7 +90783,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * kept tokens are replayed on the next eval */
         ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
         int logit_row = -1;
-        if (s->qwen4_verify_logits) {
+        s->qwen4_forced_set = false;
+        const float *dfl_logits = qwen4_dfl_rewind(s, (uint32_t)pos);
+        if (dfl_logits) {
+            memcpy(s->logits, dfl_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            logit_row = 4;
+        } else if (s->qwen4_verify_logits) {
             if (g->snap_valid && g->snap_pos == (uint32_t)pos && qwen4_graph_state_copy(g, false))
                 logit_row = 0;
             else if (g->snap2_valid && g->snap2_pos == (uint32_t)pos && qwen4_graph_state_copy2(g, false))
@@ -90692,8 +90797,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
                 logit_row = 3;
         }
         if (logit_row >= 0) {
-            memcpy(s->logits, s->qwen4_verify_logits + (size_t)logit_row * DS4_N_VOCAB,
-                   (size_t)DS4_N_VOCAB * sizeof(float));
+            if (logit_row < 4)
+                memcpy(s->logits, s->qwen4_verify_logits + (size_t)logit_row * DS4_N_VOCAB,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
             g->snap_valid = false;
             g->snap2_valid = false;
             g->snap0_valid = false;

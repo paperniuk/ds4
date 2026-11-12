@@ -323,6 +323,104 @@ cleanup:
     ds4_session_free(live);
 }
 
+/* Replays a session's generated tokens one at a time in `fresh`: for greedy
+ * blocks the replay picks the same tokens, and both end on the same top
+ * token with nearly the same log-probability.  Verify rows of more than one
+ * token round differently from single-token decode, so the tail of the
+ * distribution drifts apart over a few hundred tokens (MTP's 2-3 rows by
+ * up to 0.05 greedy, 0.3 sampled); the top of it does not. */
+static void test_qwen4_dflash_replay_equal(ds4_session *live, ds4_session *fresh, const ds4_tokens *prompt,
+                                           const char *what, bool greedy) {
+    char err[192] = {0};
+    ds4_token_score got[8], want[8];
+    ds4_session_invalidate(fresh);
+    TEST_ASSERT(ds4_session_sync(fresh, prompt, err, sizeof(err)) == 0);
+    const ds4_tokens *hist = ds4_session_tokens(live);
+    int differ = 0;
+    for (int i = prompt->len; i < hist->len; i++) {
+        if (ds4_session_argmax(fresh) != hist->v[i]) differ++;
+        TEST_ASSERT(ds4_session_eval(fresh, hist->v[i], err, sizeof(err)) == 0);
+    }
+    const int generated = hist->len - prompt->len;
+    TEST_ASSERT(ds4_session_pos(fresh) == ds4_session_pos(live));
+    if (greedy) TEST_ASSERT(differ * 100 <= generated);
+    TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
+    TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
+    const float gap = fabsf(got[0].logprob - want[0].logprob);
+    printf("qwen4-dflash: %s: %d tokens, replay picks differ at %d, top token %d/%d, logprob gap %.5f\n",
+           what, generated, greedy ? differ : -1, got[0].id, want[0].id, (double)gap);
+    TEST_ASSERT(got[0].id == want[0].id);
+    TEST_ASSERT(gap < 0.05f);
+}
+
+/* DFlash2 (DS4_QWEN_DFLASH, DS4_QWEN_MTP_GGUF and DS4_TEST_GLM_MTP=1): greedy and sampled
+ * blocks leave the state a plain replay of their tokens reaches, and a
+ * rewind into the last block restores that row from the verify tape. */
+static void test_qwen4_dflash(void) {
+    ds4_engine *engine = test_get_engine(false);
+    const char *dfl = getenv("DS4_QWEN_DFLASH");
+    if (!engine || !ds4_engine_is_qwen4(engine) || !dfl || !dfl[0] || !test_env_bool("DS4_TEST_GLM_MTP")) {
+        puts("qwen4-dflash: Qwen3.8 model with DS4_QWEN_DFLASH and DS4_TEST_GLM_MTP=1 required, skipped");
+        return;
+    }
+    ds4_session *live = NULL, *fresh = NULL;
+    ds4_tokens prompt = {0};
+    char err[192] = {0};
+    int acc[8];
+    ds4_chat_begin(engine, &prompt);
+    ds4_chat_append_message(engine, &prompt, "user",
+                            "Write a Python function that returns the n-th Fibonacci number iteratively, "
+                            "with a docstring, then a loop printing the first ten.");
+    ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
+    TEST_ASSERT(ds4_session_create(&live, engine, 2048) == 0);
+    TEST_ASSERT(ds4_session_create(&fresh, engine, 2048) == 0);
+    if (!live || !fresh) goto cleanup;
+    TEST_ASSERT(ds4_session_sync(live, &prompt, err, sizeof(err)) == 0);
+
+    /* greedy blocks, with one rewind into a block of three or more */
+    bool rewound = false;
+    int longest = 0;
+    for (int step = 0; step < 40; step++) {
+        const int tok = ds4_session_argmax(live);
+        const int start = ds4_session_pos(live);
+        const int n = ds4_session_eval_speculative_argmax(live, tok, 64, -1, acc, 8, err, sizeof(err));
+        TEST_ASSERT(n >= 1);
+        if (n < 1) goto cleanup;
+        if (n > longest) longest = n;
+        if (!rewound && n >= 3) {
+            ds4_session_rewind(live, start + 2);
+            TEST_ASSERT(ds4_session_pos(live) == start + 2);
+            test_qwen4_dflash_replay_equal(live, fresh, &prompt, "greedy rewind into a block", true);
+            rewound = true;
+        }
+    }
+    TEST_ASSERT(rewound);
+    test_qwen4_dflash_replay_equal(live, fresh, &prompt, "greedy blocks", true);
+    printf("qwen4-dflash: longest greedy block %d tokens\n", longest);
+
+    /* sampled blocks; a rejected draft's residual sample comes back from
+     * ds4_session_sample and starts the next block */
+    if (ds4_engine_mtp_exact_sampling(engine)) {
+        uint64_t rng = 0x5eed5eed12345ULL;
+        for (int step = 0; step < 40; step++) {
+            const int tok = ds4_session_sample(live, 1.0f, 20, 0.95f, 0.0f, &rng);
+            TEST_ASSERT(tok >= 0);
+            const int n = ds4_session_eval_speculative(live, tok, 64, -1, 1.0f, 20, 0.95f, 0.0f, &rng,
+                                                       acc, 8, err, sizeof(err));
+            TEST_ASSERT(n >= 1 && acc[0] == tok);
+            if (n < 1) goto cleanup;
+        }
+        test_qwen4_dflash_replay_equal(live, fresh, &prompt, "sampled blocks", false);
+    } else {
+        puts("qwen4-dflash: sampled blocks need DS4_TEST_MTP_EXACT=1, skipped");
+    }
+
+cleanup:
+    ds4_tokens_free(&prompt);
+    ds4_session_free(fresh);
+    ds4_session_free(live);
+}
+
 /* A continued checkpoint must be loadable and immediately sampleable at a
  * completed prefill chunk, including after a resumed prefill or cancellation. */
 typedef struct {
@@ -450,6 +548,8 @@ static void test_qwen_restore_reused_session(void) {
     }
     char *saved_force = test_save_env("DS4_QWEN4_SPEC_FORCE_ACCEPT");
     setenv("DS4_QWEN4_SPEC_FORCE_ACCEPT", "1", 1);
+    const char *dfl_env = getenv("DS4_QWEN_DFLASH"), *dfl_off = getenv("DS4_QWEN4_DFL");
+    const bool dfl = dfl_env && dfl_env[0] && !(dfl_off && dfl_off[0] == '0');
     ds4_session *live = NULL, *reference = NULL;
     ds4_tokens prompt = {0}, other = {0};
     ds4_session_snapshot snapshot = {0};
@@ -463,7 +563,9 @@ static void test_qwen_restore_reused_session(void) {
         int accepted[2];
         int n = ds4_session_eval_speculative_argmax(live, ds4_session_argmax(live),
                                                    2, -1, accepted, 2, err, sizeof(err));
-        TEST_ASSERT(n == (step == 0 ? 1 : 2));
+        /* forced MTP accepts give 1 then 2; DFlash2 blocks keep 1 or 2 */
+        if (dfl) TEST_ASSERT(n >= 1 && n <= 2);
+        else TEST_ASSERT(n == (step == 0 ? 1 : 2));
         if (n < 1) goto cleanup;
     }
     const ds4_tokens *tokens = ds4_session_tokens(live);
@@ -7328,6 +7430,7 @@ static const ds4_test_entry test_entries[] = {
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},
     {"--session-rewind", "session-rewind", "Qwen3.8 rewind by snapshot restore and by replay", test_session_rewind_replay},
     {"--session-rewind-resample", "session-rewind-resample", "exact-sampling tool-boundary resample rewind restores the block-start state", test_session_rewind_resample_boundary},
+    {"--qwen4-dflash", "qwen4-dflash", "DFlash2 greedy and sampled blocks match a plain replay; rewinds into a block", test_qwen4_dflash},
     {"--long-context", "long-context", "long-context story fact-recall regression", test_long_story_fact_recall},
     {"--tool-call-quality", "tool-call-quality", "model tool call and post-result stop regression", test_tool_call_quality},
     {"--think-tool-recovery", "think-tool-recovery", "recover a complete tool call emitted inside unclosed reasoning", test_think_tool_recovery},

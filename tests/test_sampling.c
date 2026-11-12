@@ -276,6 +276,8 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+static void check_sparse_speculative_distribution(void);
+
 static void check_speculative_distribution(void) {
     const float filter_logits[] = {
         logf(0.50f), logf(0.30f), logf(0.15f), logf(0.05f),
@@ -352,6 +354,44 @@ static void check_speculative_distribution(void) {
            (double)counts[0] / trials,
            (double)counts[1] / trials,
            (double)counts[2] / trials);
+    check_sparse_speculative_distribution();
+}
+
+/* DFlash2 drafts from 16 candidates: q is zero elsewhere, and some
+ * candidates fall outside the target's top-k (p = 0).  Accepting with
+ * min(1, p/q) and otherwise sampling max(0, p - q) must give back p. */
+static void check_sparse_speculative_distribution(void) {
+    enum { V = 40, NC = 16 };
+    float logits[V], expected[V], probs[V];
+    for (int i = 0; i < V; i++) logits[i] = 2.0f * sinf(0.7f * (float)i) - 0.05f * (float)i;
+    CHECK(ds4_test_sampling_probabilities(logits, V, 1.0f, 20, 0.95f, 0.0f, expected) != 0,
+          "sparse speculative target probabilities");
+    int cand[NC];
+    float q[NC], qs = 0.0f;
+    for (int c = 0; c < NC; c++) {
+        cand[c] = (c * 7 + 3) % V;
+        q[c] = 0.2f + (float)((c * 5) % 11);
+        qs += q[c];
+    }
+    for (int c = 0; c < NC; c++) q[c] /= qs;
+    uint64_t rng = 0x3c9d1e7a5b2f4086ULL;
+    uint32_t counts[V] = {0};
+    const uint32_t trials = 400000;
+    for (uint32_t i = 0; i < trials; i++) {
+        const int t = ds4_test_speculative_sparse_sample(logits, V, 1.0f, 20, 0.95f, 0.0f,
+                                                         cand, q, NC, &rng, probs);
+        CHECK(t >= 0 && t < V, "sparse speculative token %d", t);
+        if (t >= 0 && t < V) counts[t]++;
+    }
+    float worst = 0.0f;
+    for (int i = 0; i < V; i++) {
+        const float d = fabsf((float)counts[i] / (float)trials - expected[i]);
+        if (d > worst) worst = d;
+        CHECK(d < 0.005f, "sparse speculative token=%d observed=%.6f expected=%.6f",
+              i, (double)counts[i] / trials, (double)expected[i]);
+        if (expected[i] == 0.0f) CHECK(counts[i] == 0, "sparse speculative filtered token %d drawn", i);
+    }
+    printf("sparse speculative distribution: max error %.4f over %d tokens\n", (double)worst, V);
 }
 
 /* Unset request knobs: Qwen3.8 follows its model card (thinking 1.0 / 0.95 /

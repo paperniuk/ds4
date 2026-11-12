@@ -90214,7 +90214,12 @@ void ds4_session_rewind(ds4_session *s, int pos) {
             g->snap0_valid = false;
             if (g->mtp_pos > (uint32_t)pos) g->mtp_pos = (uint32_t)pos;
         } else {
+            /* The anchor is a copy of its own and the rewind keeps its
+             * tokens, so a retry can still restore it instead of
+             * replaying the whole prompt. */
+            const bool keep_anchor = g->anchor_valid && g->anchor_pos <= (uint32_t)pos;
             qwen4_graph_reset(g);
+            g->anchor_valid = keep_anchor;
         }
         /* Qwen eval replays the kept transcript if reset left the graph behind. */
         state_ok = true;

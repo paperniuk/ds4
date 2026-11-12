@@ -384,6 +384,8 @@ static inline int ds4_gpu_device_is_m5_or_m6_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+/* Metal: let experts smaller than the slab size class share its slots. */
+void ds4_gpu_set_streaming_expert_cache_mixed_sizes(int enabled);
 int ds4_gpu_qwen4_conv_stream_rows_tensor(
         ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

@@ -5412,6 +5412,8 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_MXFP4;
 }
 
+static bool tensor_type_is_mixed_quant(uint32_t type);
+
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_Q8_0:    return 34;
@@ -5421,7 +5423,12 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
-    default:                 ds4_die("unsupported routed expert tensor type");
+    default: {
+        /* mixed-precision GGUFs (Qwen3.8 IQ3/Q2_0) stream their experts too */
+        const gguf_type_info *info = tensor_type(type);
+        if (tensor_type_is_mixed_quant(type) && info && info->block_bytes) return info->block_bytes;
+        ds4_die("unsupported routed expert tensor type");
+    }
     }
     return 0;
 }
@@ -5539,6 +5546,20 @@ static bool ds4_streaming_routed_expert_bytes(
         }
     }
     if (best_count == 0) return false;
+    /* Qwen3.8 mixed quants vary the expert size on most layers, so no class
+     * dominates.  Size the slab for the largest expert instead: every layer
+     * then fits a slot and stays cacheable. */
+    if (ds4_model_is_qwen4()) {
+        uint32_t routed = 0;
+        uint64_t max_bytes = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            uint64_t bytes = 0;
+            if (!streaming_layer_routed_expert_bytes(&weights->layer[il], &bytes)) continue;
+            routed++;
+            if (bytes > max_bytes) max_bytes = bytes;
+        }
+        if (best_count * 2u <= routed) best_bytes = max_bytes;
+    }
     *per_expert_bytes_out = best_bytes;
     return true;
 }
@@ -5563,7 +5584,8 @@ static bool ds4_streaming_cacheable_expert_count(
                                                  &per_expert_bytes)) {
             continue;
         }
-        if (per_expert_bytes == slab_bytes) layers++;
+        if (per_expert_bytes == slab_bytes ||
+            (ds4_model_is_qwen4() && per_expert_bytes < slab_bytes)) layers++;
     }
 
     if (layers == 0 ||
@@ -5623,7 +5645,8 @@ static DS4_MAYBE_UNUSED bool weights_streaming_layer_experts_uniform(
     const ds4_layer_weights *l = &w->layer[il];
     if (!streaming_layer_routed_expert_bytes(l, &bytes)) return true;
     if (!ds4_streaming_routed_expert_bytes(w, &base)) return true;
-    return bytes == base;
+    /* Qwen slots take any expert up to the slab size (see above). */
+    return bytes == base || (ds4_model_is_qwen4() && bytes < base);
 }
 
 static uint32_t ds4_streaming_cache_experts_for_byte_budget(
@@ -76584,6 +76607,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
             uint64_t slab_expert_bytes = 0;
             if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
                 ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+                ds4_gpu_set_streaming_expert_cache_mixed_sizes(ds4_model_is_qwen4());
+#endif
                 uint32_t routed = 0, boosted = 0;
                 for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
                     const ds4_layer_weights *l = &e->weights.layer[il];

@@ -847,6 +847,7 @@ static uint64_t g_model_buffer_cache_evictions;
 static int g_model_buffer_cache_over_limit;
 static uint64_t g_stream_expert_cache_bytes;
 static uint64_t g_stream_expert_cache_expert_bytes;
+static int g_stream_expert_cache_mixed_sizes;
 static uint32_t g_stream_expert_cache_entry_count;
 static uint32_t g_stream_expert_cache_budget_override;
 static uint64_t g_stream_expert_cache_hits;
@@ -4851,6 +4852,12 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
      * happens to touch the cache first.
      */
     g_stream_expert_cache_expert_bytes = bytes;
+}
+
+void ds4_gpu_set_streaming_expert_cache_mixed_sizes(int enabled) {
+    /* Qwen3.8 mixed quants: the class is the largest expert, and each slot
+     * holds any expert up to that size at its own gate/up/down offsets. */
+    g_stream_expert_cache_mixed_sizes = enabled != 0;
 }
 
 uint64_t ds4_gpu_recommended_working_set_size(void) {
@@ -13610,7 +13617,9 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         g_stream_expert_cache_expert_bytes = bytes;
         return 1;
     }
-    return bytes == g_stream_expert_cache_expert_bytes;
+    return bytes == g_stream_expert_cache_expert_bytes ||
+           (g_stream_expert_cache_mixed_sizes &&
+            bytes < g_stream_expert_cache_expert_bytes);
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
@@ -14662,6 +14671,10 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     }
 
     uint64_t slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    if (g_stream_expert_cache_mixed_sizes &&
+        slot_bytes < g_stream_expert_cache_expert_bytes) {
+        slot_bytes = g_stream_expert_cache_expert_bytes;
+    }
     if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
     const uint64_t page = (uint64_t)getpagesize();
     if (page != 0) {
@@ -53472,13 +53485,17 @@ int ds4_gpu_qwen4_moe_down_tensor(
     } else {
         b[4] = b[0];
     }
-    if (weight_type == 42u && (ff_dim % 64u) == 0 && getenv("DS4_QWEN4_NO_Q2_0_MOE") == NULL) {
+    /* Resident Q2_0 and IQ4_NL experts take their own kernels; streamed
+     * experts come through the address table the generic row kernel reads. */
+    if (!g_qwen4_stream_weights && weight_type == 42u && (ff_dim % 64u) == 0 &&
+        getenv("DS4_QWEN4_NO_Q2_0_MOE") == NULL) {
         /* Q2_0 experts: sixteen short down rows per SIMD group */
         const uint32_t split = has_shared && shared_type != 42u ? 4u : 1u;
         return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q2_0, &args, sizeof(args), b, 5,
                               MTLSizeMake((out_dim + 63u) / 64u, n_out + split - 1u, n_tokens), MTLSizeMake(128, 1, 1), 0);
     }
-    if (weight_type == DS4_METAL_TENSOR_IQ4_NL && getenv("DS4_QWEN4_NO_GRID_MOE") == NULL) {
+    if (!g_qwen4_stream_weights && weight_type == DS4_METAL_TENSOR_IQ4_NL &&
+        getenv("DS4_QWEN4_NO_GRID_MOE") == NULL) {
         /* IQ4_NL experts: sixteen short down rows per SIMD group */
         const uint32_t split = has_shared && shared_type != DS4_METAL_TENSOR_IQ4_NL ? 4u : 1u;
         return qwen4_dispatch(QWEN4_K_MOE_DOWN_IQ4_NL, &args, sizeof(args), b, 5,
@@ -54477,8 +54494,7 @@ int ds4_gpu_qwen4_moe_stream_tensor(
         table->gate_expert_bytes > table->model_size / table->n_total_expert ||
         table->down_expert_bytes > table->model_size / table->n_total_expert ||
         (mm && ((in_dim % 64u) != 0 || (ff_dim % 64u) != 0 ||
-                (gate_type != 8u && gate_type != 39u && gate_type != 12u && gate_type != 10u && gate_type != 16u && gate_type != 2u) ||
-                (down_type != 8u && down_type != 39u && down_type != 12u && down_type != 10u && down_type != 16u && down_type != 2u)))) return 0;
+                !qwen4_moe_mm_type_ok(gate_type) || !qwen4_moe_mm_type_ok(down_type)))) return 0;
     const uint64_t gate_bytes = table->gate_expert_bytes * table->n_total_expert;
     const uint64_t down_bytes = table->down_expert_bytes * table->n_total_expert;
     if (!qwen4_stream_range(table, table->gate_offset, gate_bytes) ||

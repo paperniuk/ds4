@@ -8,6 +8,9 @@ OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
 other agent. The same launcher also runs **DeepSeek V4 Flash** and the other
 ds4 models, see [Other models](#other-models).
 
+Project page with the download, benchmarks and FAQ:
+**[paperniuk.com/dstar](https://paperniuk.com/dstar/)**.
+
 What it adds to stock ds4:
 
 - **The small ISTA-DASLab GSQ-RCO files.** Their weights take 35 to 51 GiB,

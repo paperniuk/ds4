@@ -1,8 +1,10 @@
 /* Hy4 Flash model layout. The Engram shard has a private descriptor and is
  * never registered with Metal. Its rows are read on demand into prefill scratch. */
+#include "ds4_hy4_rewind.h"
+
 enum {
     HY4_LAYERS = 42, HY4_DIM = 3072, HY4_VOCAB = 120832, HY4_CONTEXT = 1048576,
-    HY4_WINDOW = 512, HY4_KV = 576, HY4_LATENT = 1536, HY4_EXPERTS = 512,
+    HY4_KV = 576, HY4_LATENT = 1536, HY4_EXPERTS = 512,
     HY4_ACTIVE = 16, HY4_ENGRAM_LAYERS = 4, HY4_ENGRAM_HEADS = 16,
     HY4_ENGRAM_DIM = 96, HY4_ENGRAM_ROWS = 660006416,
     HY4_HIST_GROUPS = 511,

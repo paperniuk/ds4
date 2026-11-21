@@ -11717,7 +11717,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  * - anthropic-tool-output: /v1/messages has no server-side response object,
  *   but tool_use_id is a precise continuation handle inside a live local
  *   agent loop.
- * - memory-rewind (GLM only): the prompt is a strict truncation of the
+ * - memory-rewind (GLM): the prompt is a strict truncation of the
  *   checkpoint; the live KV is rewound and the final prompt token
  *   reevaluated.
  * - memory-token: the checkpoint is an exact token prefix of the prompt.
@@ -11730,6 +11730,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
  *   is authoritative, so the checkpoint tokens are kept verbatim and only
  *   the suffix text is tokenized (full-prompt BPE may have merged across
  *   the byte boundary).
+ * - Hy4 memory-rewind: the live rings still hold the rows needed at the
+ *   common token prefix, so sync can replace the diverging tail.
  *
  * Locking: slot_probe_reuse_locked() requires tool_mu held (dispatch holds
  * it while scoring); slot_probe_reuse() is the worker-path wrapper.
@@ -11747,6 +11749,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_HY4_REWIND,
     REUSE_PROMPT_ANCHOR,
 } slot_reuse_kind;
 
@@ -11888,6 +11891,15 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
         return pr;
+    }
+
+    if (token_image_prefix) {
+        const int start = ds4_session_hy4_rewind_start(slot->session, req->prompt.len, common);
+        if (start > 0) {
+            pr.kind = REUSE_HY4_REWIND;
+            pr.reuse_tokens = start;
+            return pr;
+        }
     }
 
     /* The live transcript went past what the client replays (a retried or
@@ -12723,8 +12735,9 @@ static int server_session_sync(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     int live = ds4_session_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
+    int done = common == live ? live :
+        ds4_session_hy4_rewind_start(slot->session, prompt->len, common);
     pthread_mutex_unlock(&s->inference_mu);
-    int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
@@ -13689,14 +13702,13 @@ static void *decode_worker_main(void *arg) {
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
  * token-prefix hit, then a rendered-text prefix hit for the live checkpoint,
- * then disk text-prefix restart snapshots, then a cold prefill.  On text-prefix
- * hits we build a fresh effective prompt from the checkpoint's exact token
+ * then a Hy4 rewind, disk text-prefix restart snapshots, or a cold prefill.
+ * On text-prefix hits we build a fresh effective prompt from the checkpoint's exact token
  * history plus a newly tokenized string suffix; the canonical full-prompt
  * tokens are not sliced because BPE may merge across the byte boundary.  Cold
  * prompt caching is handled before generation: if the stable checkpoint is
  * shorter than the full prompt, we prefill to that boundary, store it, and
- * immediately continue to the real prompt.  The live graph therefore always
- * moves forward. */
+ * immediately continue to the real prompt. */
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -13865,6 +13877,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         live_materialized = true;
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
+        break;
+    case REUSE_HY4_REWIND:
+        /* Sync rechecks the retained rows and replays the canonical tail. */
+        live_materialized = true;
+        cache_source = "memory-rewind";
+        cache_diag.rewind_to = cached;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: Hy4 live kv rewind live=%d prompt=%d common=%d cached=%d",
+                   old_pos, j->req.prompt.len, common, cached);
         break;
     case REUSE_PROMPT_ANCHOR: {
         pthread_mutex_lock(&s->inference_mu);
@@ -14097,7 +14118,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     int prompt_sync_rc = 0;
-    {
+    /* Hy4 has no prompt anchor. A split could request an older rewind than
+     * the one we selected for the complete prompt. */
+    if (!ds4_engine_is_hy4(s->engine)) {
         /* Stop the prefill at the prompt anchor to save the state there.
          * Vision sessions need this most: their recurrent (GDN/PLE) state
          * cannot be truncated in place, so without an anchor every request

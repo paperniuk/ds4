@@ -81094,9 +81094,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (s->hy4_graph) {
-        const bool extend = s->checkpoint_valid && s->checkpoint.len <= prompt->len &&
-            memcmp(s->checkpoint.v, prompt->v, (size_t)s->checkpoint.len * sizeof(int)) == 0;
-        uint32_t pos = extend ? (uint32_t)s->checkpoint.len : 0;
+        const int common = ds4_session_common_prefix(s, prompt);
+        const bool extend = s->checkpoint_valid && common == s->checkpoint.len;
+        uint32_t pos = extend ? (uint32_t)common :
+                       (uint32_t)ds4_session_hy4_rewind_start(s, prompt->len, common);
         if (pos == (uint32_t)prompt->len) return 0;
         if (!extend) hy4_draft_reset(s->hy4_graph->draft);
         s->checkpoint_valid = false;
@@ -82356,10 +82357,9 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
  * DSML in an order that is semantically valid but not byte-for-byte equal to the
  * canonical prompt we will see on the next request.  Rewriting only the token
  * checkpoint is not enough: the backend still contains raw and compressed rows
- * for the old suffix.  Until we have a real frontier snapshot at the
- * rewrite point, any replacement behind the live end reports that a rebuild is
- * needed without mutating the session.  The server may still find an older disk KV
- * checkpoint before falling back to a full replay. */
+ * for the old suffix. Hy4 can replay from a retained prefix. Other replacements
+ * behind the live end report that a rebuild is needed without mutating the
+ * session, so the server can look for an older disk KV checkpoint. */
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen) {
@@ -82392,7 +82392,7 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         }
     }
 
-    if (common == s->checkpoint.len) {
+    if (common == s->checkpoint.len || ds4_session_hy4_rewind_start(s, prompt->len, common)) {
         return ds4_session_sync(s, prompt, err, errlen) == 0 ?
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
     }
@@ -82413,6 +82413,21 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
     return i;
+}
+
+int ds4_session_hy4_rewind_start(const ds4_session *s, int prompt_len, int common) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s && s->checkpoint_valid && s->hy4_graph && common > 0 && prompt_len >= common) {
+        const ds4_hy4_graph *g = s->hy4_graph;
+        return (int)hy4_rewind_start((uint32_t)s->checkpoint.len, (uint32_t)prompt_len,
+                                     (uint32_t)common, g->raw_first, g->pending_first);
+    }
+#else
+    (void)s;
+    (void)prompt_len;
+    (void)common;
+#endif
+    return 0;
 }
 
 int ds4_session_argmax(ds4_session *s) {
@@ -90869,8 +90884,9 @@ static int hy4_session_speculate(ds4_session *s, int first, uint32_t n, int eos,
             break;
         keep++;
     }
-    // Sparse caches ignore future rows. The SWA and pending rings have
-    // enough extra slots to preserve every row needed at the accepted frontier.
+    /* The rings have already accounted for all verified rows, including the
+     * rejected ones. Sparse attention ignores rows past the new frontier. */
+    assert(hy4_cache_can_resume(pos + keep, g->raw_first, g->pending_first));
     s->checkpoint.len = (int)(pos + keep);
     d->pos = pos + keep;
     d->row = keep - 1;

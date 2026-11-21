@@ -1,5 +1,6 @@
 #include "ds4_hy4_metal.h"
 #include "ds4_hy4_ane_schedule.h"
+#include "ds4_hy4_rewind.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,21 +91,28 @@ static int test_ane_schedule(void) {
             return 0;
         }
     }
-    /* Compare snapshot sizing with the actual slots overwritten after wrap
-     * and after writing more than one ring, including a short prefix. */
-    const uint32_t ring = 1023;
-    const uint32_t pos[] = {64, 511, 1022, 2049};
-    const uint32_t rows[] = {512, 600, 1024, 2048};
-    for (unsigned p = 0; p < sizeof(pos) / sizeof(pos[0]); p++) {
-        const uint32_t live = pos[p] < 511 ? pos[p] : 511;
-        for (unsigned r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
-            bool written[1023] = {0};
-            for (uint32_t i = 0; i < rows[r]; i++) written[(pos[p] + i) % ring] = true;
-            const uint32_t saved = hy4_ane_ring_overlap(live, ring, rows[r]);
-            for (uint32_t i = 0; i < live; i++) {
-                if (written[(pos[p] - live + i) % ring] == (i < saved)) continue;
-                fprintf(stderr, "Hy4 ANE snapshot mismatch at pos %u for %u rows\n", pos[p], rows[r]);
-                return 0;
+    /* Compare both snapshot spans with the actual slots overwritten by
+     * wrapped writes or writes covering the whole ring. */
+    const uint32_t rings[] = {1023, 515, hy4_raw_ring_capacity(8192, 512),
+                                       hy4_pending_ring_capacity(8192, 512)};
+    for (unsigned k = 0; k < sizeof(rings) / sizeof(rings[0]); k++) {
+        const uint32_t ring = rings[k];
+        const bool pending = k % 2 != 0;
+        const uint32_t pos[] = {63, 511, ring - 1, 2 * ring + 1};
+        const uint32_t rows[] = {512, 600, 1024, ring + 1};
+        for (unsigned p = 0; p < sizeof(pos) / sizeof(pos[0]); p++) {
+            const uint32_t live = pending ? pos[p] % 4 : pos[p] - hy4_window_start(pos[p]);
+            for (unsigned r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+                bool written[ring];
+                memset(written, 0, sizeof(written));
+                for (uint32_t i = 0; i < rows[r]; i++) written[(pos[p] + i) % ring] = true;
+                const uint32_t saved = hy4_ane_ring_overlap(live, ring, rows[r]);
+                for (uint32_t i = 0; i < live; i++) {
+                    if (written[(pos[p] - live + i) % ring] == (i < saved)) continue;
+                    fprintf(stderr, "Hy4 ANE snapshot mismatch at pos %u for %u rows (ring %u)\n",
+                            pos[p], rows[r], ring);
+                    return 0;
+                }
             }
         }
     }
@@ -112,8 +120,61 @@ static int test_ane_schedule(void) {
     return 1;
 }
 
+static int test_rewind(void) {
+    /* Model a verify batch accepting only its first row. Even with the
+     * largest possible rejected suffix, a budget-sized rewind must work
+     * for every group alignment, including a final-token logits replay. */
+    const uint32_t cap = 512, ctx = 16384;
+    const uint32_t raw_ring = hy4_raw_ring_capacity(ctx, cap);
+    const uint32_t pending_ring = hy4_pending_ring_capacity(ctx, cap);
+    for (uint32_t common = 6000; common < 6004; common++) {
+        const uint32_t live = common + HY4_REWIND;
+        const uint32_t end = live + cap - 1;
+        const uint32_t raw = hy4_ring_after_write(0, live - 1, end, raw_ring);
+        const uint32_t pending = hy4_ring_after_write(0, live - 1, end, pending_ring);
+        if (hy4_rewind_start(live, live + 20, common, raw, pending) != common ||
+            hy4_rewind_start(live, common, common, raw, pending) != common - 1 ||
+            hy4_rewind_start(live, live + 20, common - 1, raw, pending) != 0) {
+            fprintf(stderr, "Hy4 rewind budget or rejected-row accounting failed at %u\n", common);
+            return 0;
+        }
+    }
+
+    const struct { uint32_t live, prompt, common, raw, pending, start; } cases[] = {
+        {8003, 8010, 8001, 7490, 8000, 8001},  /* Oldest required raw row fits. */
+        {8003, 8010, 8001, 7491, 8000, 0},
+        {8003, 8010, 8001, 7490, 8001, 0},     /* Beginning of the open group was lost. */
+        {8003, 8010, 8000, 7489, 8002, 8000},  /* A group boundary needs no pending rows. */
+        {8008, 8010, 8007, 7496, 8008, 0},     /* v1 snapshot at a group boundary. */
+        {8008, 8010, 8007, 7496, 0, 8007},     /* Same window with no pool. */
+        {8003, 8002, 8002, 7491, 8000, 0},     /* v1 snapshot one row short of replay. */
+        {5, 4, 4, 0, 0, 3},
+        {5, 1, 1, 0, 0, 0},
+        {5, 10, 0, 0, 0, 0},
+        {5, 5, 5, 0, 0, 0},                   /* Identical prompt needs no rewind. */
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint32_t start = hy4_rewind_start(cases[i].live, cases[i].prompt, cases[i].common,
+                                                cases[i].raw, cases[i].pending);
+        if (start != cases[i].start) {
+            fprintf(stderr, "Hy4 rewind case %u expected %u, got %u\n", i, cases[i].start, start);
+            return 0;
+        }
+    }
+    if (hy4_raw_ring_capacity(256, 256) != 256 ||
+        hy4_pending_ring_capacity(2500, 512) != 2500 ||
+        hy4_ring_after_write(4000, 8000, 8001, raw_ring) != 4000 ||
+        hy4_ring_after_write(8004, 8000, 8001, pending_ring) != 8000 ||
+        hy4_ring_after_write(4000, 0, cap, raw_ring) != 0) {
+        fputs("Hy4 ring capacity or retained-row tracking failed\n", stderr);
+        return 0;
+    }
+    puts("Hy4 rewind budget, retained ring rows, and snapshot boundaries passed");
+    return 1;
+}
+
 int main(int argc, char **argv) {
-    if (!test_ane_schedule()) return 1;
+    if (!test_ane_schedule() || !test_rewind()) return 1;
     if (argc == 2 && strcmp(argv[1], "--host-only") == 0) return 0;
     if (!ds4_gpu_init()) return 1;
     if (!test_expert_mid_r4()) return 1;

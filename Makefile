@@ -211,7 +211,7 @@ test-metal-moe-prefill: tests/test_metal_moe_prefill
 test-hy4-attention: tests/test_hy4_attention
 	./tests/test_hy4_attention
 
-tests/test_hy4_attention: tests/test_hy4_attention.c ds4_hy4_metal.h ds4_hy4_ane_schedule.h $(CORE_OBJS)
+tests/test_hy4_attention: tests/test_hy4_attention.c ds4_hy4_metal.h ds4_hy4_ane_schedule.h ds4_hy4_rewind.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -fno-fast-math -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
 tests/test_metal_ane_prefill.o: tests/test_metal_ane_prefill.c ds4_gpu.h ds4_quants.h
@@ -1692,7 +1692,7 @@ gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/s
 gguf-tools/quality-testing/score_official_verify: gguf-tools/quality-testing/score_official_verify.o ds4_verify_test_hooks.o $(filter-out ds4.o,$(CORE_OBJS)) rax.o ds4_gpu_args.o
 	$(if $(filter Darwin,$(UNAME_S)),$(CC) $(CFLAGS),$(DS4_LINK)) -o $@ $^ $(if $(filter Darwin,$(UNAME_S)),$(METAL_LDLIBS),$(DS4_LINK_LIBS))
 
-ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_verify_test_hooks.o: ds4_hy4_model.inc ds4_hy4_graph.inc ds4_hy4_ane.inc ds4_hy4_payload.inc ds4_hy4_tokenizer.inc ds4_hy4_metal.h ds4_hy4_chat.h
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_verify_test_hooks.o: ds4_hy4_model.inc ds4_hy4_graph.inc ds4_hy4_ane.inc ds4_hy4_payload.inc ds4_hy4_tokenizer.inc ds4_hy4_metal.h ds4_hy4_chat.h ds4_hy4_rewind.h
 ds4.o: ds4_hy4_ane_schedule.h
 ds4_metal.o: ds4_hy4_metal.h
 ds4_cli.o ds4_cli_cpu.o: ds4_hy4_chat.h

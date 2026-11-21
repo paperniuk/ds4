@@ -1,5 +1,7 @@
 /* Hy4 Flash Metal graph. SwiGLU, weight projections and expert down/reduce
  * use the same DS4 quantized primitives as the Qwen graph. */
+#include <assert.h>
+
 #include "ds4_hy4_metal.h"
 #include "ds4_hy4_ane.inc"
 
@@ -76,10 +78,18 @@ typedef struct {
 #undef HY4_FIELD
     float *engram_staging;
     uint32_t cap, ctx, ring, pending_ring;
+    /* Oldest valid positions, accounting for speculative writes and loads. */
+    uint32_t raw_first, pending_first;
     bool decode_attention;
     hy4_draft_graph *draft;
     hy4_pipe *pipe;
 } ds4_hy4_graph;
+
+static void hy4_cache_note_write(ds4_hy4_graph *g, uint32_t pos, uint32_t end) {
+    g->raw_first = hy4_ring_after_write(g->raw_first, pos, end, g->ring);
+    if (g->scores)
+        g->pending_first = hy4_ring_after_write(g->pending_first, pos, end, g->pending_ring);
+}
 
 static uint32_t hy4_prefill_cap(uint32_t ctx, uint32_t requested) {
     uint32_t cap = requested ? requested : HY4_PREFILL;
@@ -113,14 +123,14 @@ static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested) {
     ds4_context_memory m = {0};
     if (!ctx || ctx > HY4_CONTEXT) return m;
     m.prefill_cap = hy4_prefill_cap(ctx, requested);
-    m.raw_cap = ctx < HY4_WINDOW + m.prefill_cap - 1 ? ctx : HY4_WINDOW + m.prefill_cap - 1;
+    m.raw_cap = hy4_raw_ring_capacity(ctx, m.prefill_cap);
     m.comp_cap = ctx / 4;
     const uint64_t cap = m.prefill_cap;
     m.raw_bytes = (uint64_t)30 * m.raw_cap * HY4_KV * sizeof(uint16_t);
     m.compressed_bytes = (uint64_t)12 * ctx * HY4_KV * sizeof(uint16_t);
     if (ctx > 2048) {
         m.compressed_bytes += (uint64_t)12 * (ctx / 4) * 128 * sizeof(uint16_t);
-        m.compressed_bytes += (uint64_t)12 * (cap + 3) * 256 * sizeof(float);
+        m.compressed_bytes += (uint64_t)12 * hy4_pending_ring_capacity(ctx, m.prefill_cap) * 256 * sizeof(float);
     }
     m.scratch_bytes += hy4_index_score_bytes(ctx, m.prefill_cap);
 #define HY4_PRICE(name, columns, type) m.scratch_bytes += cap * (columns) * sizeof(type);
@@ -207,7 +217,7 @@ static ds4_hy4_graph *hy4_graph_alloc(uint32_t ctx, uint32_t requested, bool dra
     g->ctx = ctx;
     g->cap = plan.prefill_cap;
     g->ring = plan.raw_cap;
-    g->pending_ring = g->cap + 3;
+    g->pending_ring = hy4_pending_ring_capacity(ctx, g->cap);
     for (unsigned i = 0; i < HY4_LAYERS; i++) {
         hy4_cache *c = &g->layer[i];
         const bool sparse = hy4_sparse(i);
@@ -673,6 +683,7 @@ static bool hy4_forward_rows(ds4_hy4_graph *g, const ds4_engine *engine, const i
     const ds4_hy4_model *h = engine->hy4;
     if (!n || n > g->cap || pos > g->ctx || n > g->ctx - pos || output_rows > n ||
         (output_rows > 1 && (!g->draft || output_rows > HY4_DFLY_ROWS))) return false;
+    assert(hy4_cache_can_resume(pos, g->raw_first, g->pending_first));
     if (g->draft) g->draft->pos = 0;
     if (!hy4_stage(g, m, h, history, pos, n) || !ds4_gpu_begin_commands()) return false;
     bool ok = hy4_embed(g, m, h, n);
@@ -690,6 +701,7 @@ static bool hy4_forward_rows(ds4_hy4_graph *g, const ds4_engine *engine, const i
     const bool finished = ds4_gpu_end_commands();
     ok = ok && finished &&
          (!output_rows || ds4_gpu_tensor_read(output, 0, logits, (uint64_t)output_rows * HY4_VOCAB * sizeof(float)));
+    if (ok) hy4_cache_note_write(g, pos, pos + n);
     if (ok && output_rows && g->draft) {
         g->draft->pos = pos + n;
         g->draft->row = output_rows - 1;
@@ -771,13 +783,13 @@ static bool hy4_pipe_copy_ring(ds4_gpu_tensor *backup, uint64_t *offset, ds4_gpu
     return true;
 }
 
-/* Sparse KV and completed index groups are append-only and replay writes
- * them again. Windowed KV may cover part of the prefix after both chunks
- * write, and a partial index group still needs the preceding 1–3 tokens. */
+/* Replay rewrites sparse KV and completed index groups. Save any rows
+ * overwritten by the pair that its replay would read from before pos. */
 static bool hy4_pipe_cache(ds4_hy4_graph *g, uint32_t pos, uint32_t rows, bool save) {
-    const uint32_t live = pos < HY4_WINDOW ? pos : HY4_WINDOW - 1;
+    const uint32_t live = pos - hy4_window_start(pos);
     const uint32_t kv_rows = hy4_ane_ring_overlap(live, g->ring, rows);
-    const uint32_t pending_rows = g->ctx > 2048 ? pos % 4 : 0;
+    const uint32_t open = g->scores ? pos % 4 : 0;
+    const uint32_t pending_rows = hy4_ane_ring_overlap(open, g->pending_ring, rows);
     if (!kv_rows && !pending_rows) return true;
     if (!ds4_gpu_begin_commands()) return false;
     uint64_t offset = 0;
@@ -788,7 +800,7 @@ static bool hy4_pipe_cache(ds4_hy4_graph *g, uint32_t pos, uint32_t rows, bool s
             ok = hy4_pipe_copy_ring(g->pipe->saved_cache, &offset, c->kv, pos - live, kv_rows,
                                     g->ring, HY4_KV * sizeof(uint16_t), save);
         else if (pending_rows)
-            ok = hy4_pipe_copy_ring(g->pipe->saved_cache, &offset, c->pending, pos - pending_rows, pending_rows,
+            ok = hy4_pipe_copy_ring(g->pipe->saved_cache, &offset, c->pending, pos - open, pending_rows,
                                     g->pending_ring, 256 * sizeof(float), save);
     }
     return ds4_gpu_end_commands() && ok;
@@ -839,11 +851,13 @@ static bool hy4_forward_pair_once(ds4_hy4_graph *g, const ds4_engine *e, const i
 static bool hy4_forward_pair(ds4_hy4_graph *g, const ds4_engine *e, const int *history,
                             uint32_t pos, uint32_t na, uint32_t nb, float *logits) {
     ds4_hy4_model *h = e->hy4;
+    assert(hy4_cache_can_resume(pos, g->raw_first, g->pending_first));
     const bool saved = hy4_pipe_alloc(g) && hy4_pipe_cache(g, pos, na + nb, true);
     if (saved) {
         const bool ok = hy4_forward_pair_once(g, e, history, pos, na, nb, logits);
         if (ds4_gpu_ane_settle() && ok) {
             if (logits && !ds4_gpu_tensor_read(g->logits, 0, logits, HY4_VOCAB * sizeof(float))) return false;
+            hy4_cache_note_write(g, pos, pos + na + nb);
             if (logits && g->draft) {
                 g->draft->pos = pos + na + nb;
                 g->draft->row = 0;

@@ -109,6 +109,9 @@ static int hy4_load_payload(ds4_session *s, FILE *fp, uint64_t bytes, char *err,
     }
     token_vec_free(&s->checkpoint);
     s->checkpoint = tokens;
+    /* The version 1 payload only carries the active window and open group. */
+    g->raw_first = pos > HY4_WINDOW ? pos - HY4_WINDOW : 0;
+    g->pending_first = pool ? pos - pos % 4 : 0;
     hy4_draft_reset(g->draft);
     s->checkpoint_valid = true;
     return 0;

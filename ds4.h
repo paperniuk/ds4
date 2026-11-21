@@ -495,6 +495,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Hy4 sync can reuse this many tokens of the given common prefix on rewind.
+ * Returns zero when there is no reusable rewind. */
+int ds4_session_hy4_rewind_start(const ds4_session *s, int prompt_len, int common);
 bool ds4_session_checkpoint_valid(const ds4_session *s);
 /* Test helpers (ds4-test): allocate a session shell holding only the given
  * checkpoint tokens, for server-side routing/probe unit tests.  Not usable

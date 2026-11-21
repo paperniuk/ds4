@@ -2,6 +2,8 @@
  * use the same DS4 quantized primitives as the Qwen graph. */
 #include "ds4_hy4_metal.h"
 
+/* Per-token scratch for the configured Hy4 prefill chunk. Each expert can
+ * appear once per token, so the MoE lists need one entry per token per expert. */
 #define HY4_SCRATCH_ROWS(X) \
     X(token_ids, 1, int32_t) \
     X(engram_valid, 1, int32_t) \
@@ -72,6 +74,10 @@ static uint32_t hy4_prefill_cap(uint32_t ctx, uint32_t requested) {
     return cap < ctx ? cap : ctx;
 }
 
+static uint64_t hy4_index_score_bytes(uint32_t ctx, uint32_t cap) {
+    return ctx > 2048 ? (uint64_t)cap * (ctx / 4) * sizeof(float) : 0;
+}
+
 // The 32-head sparse layers select at most 2048 keys. Each partition
 // carries its 512 value sums, softmax maximum and denominator.
 static uint64_t hy4_attention_partial_bytes(uint32_t ctx) {
@@ -92,8 +98,8 @@ static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested) {
     if (ctx > 2048) {
         m.compressed_bytes += (uint64_t)12 * (ctx / 4) * 128 * sizeof(uint16_t);
         m.compressed_bytes += (uint64_t)12 * (cap + 3) * 256 * sizeof(float);
-        m.scratch_bytes += cap * (ctx / 4) * sizeof(float);
     }
+    m.scratch_bytes += hy4_index_score_bytes(ctx, m.prefill_cap);
 #define HY4_PRICE(name, columns, type) m.scratch_bytes += cap * (columns) * sizeof(type);
     HY4_SCRATCH_ROWS(HY4_PRICE)
 #undef HY4_PRICE
@@ -179,8 +185,9 @@ static ds4_hy4_graph *hy4_graph_alloc(uint32_t ctx, uint32_t requested, bool dra
             if (!c->pool || !c->pending) goto fail;
         }
     }
-    if (ctx > 2048) {
-        g->scores = ds4_gpu_tensor_alloc((uint64_t)g->cap * (ctx / 4) * sizeof(float));
+    const uint64_t score_bytes = hy4_index_score_bytes(ctx, g->cap);
+    if (score_bytes) {
+        g->scores = ds4_gpu_tensor_alloc(score_bytes);
         if (!g->scores) goto fail;
     }
     if (hy4_attention_partial_bytes(ctx)) {
@@ -200,7 +207,7 @@ static ds4_hy4_graph *hy4_graph_alloc(uint32_t ctx, uint32_t requested, bool dra
         g->engram_layer[i] = ds4_gpu_tensor_view(g->engram, i * table_bytes, table_bytes);
         if (!g->engram_layer[i]) goto fail;
     }
-    g->engram_staging = xmalloc(HY4_ENGRAM_LAYERS * table_bytes);
+    g->engram_staging = xmalloc(ds4_gpu_tensor_bytes(g->engram));
     if (draft && !hy4_draft_alloc(g)) goto fail;
     return g;
 fail:
@@ -396,9 +403,12 @@ static bool hy4_engram_stage(ds4_hy4_graph *g, const ds4_model *m, const ds4_hy4
         if (!ds4_gpu_tensor_write(g->engram_layer[i], 0, g->engram_staging + i * stride,
                                   (uint64_t)n * HY4_LATENT * sizeof(float))) return false;
 
-    int32_t valid[HY4_PREFILL_MAX];
+    /* Forward submits GPU commands after staging. engram_valid is a shared
+     * tensor sized for g->cap, and the caller has already bounded n. */
+    int32_t *valid = ds4_gpu_tensor_contents(g->engram_valid);
+    if (!valid) return false;
     for (uint32_t i = 0; i < n; i++) valid[i] = h->token_map[history[pos+i]] != UINT32_MAX;
-    return ds4_gpu_tensor_write(g->engram_valid, 0, valid, n * sizeof(valid[0]));
+    return true;
 }
 
 static bool hy4_engram_apply(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,

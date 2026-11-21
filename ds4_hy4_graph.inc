@@ -271,6 +271,12 @@ fail:
                          sizeof((const ds4_hy4_binding[]){__VA_ARGS__}) / sizeof(ds4_hy4_binding), \
                          (x), (y), (z), (threads))
 
+static bool hy4_verify_enabled(uint32_t n, const char *name) {
+    if (n < 2 || n > 8) return false;
+    const char *enabled = getenv(name);
+    return !enabled || strcmp(enabled, "0") != 0;
+}
+
 static bool hy4_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
                    const ds4_gpu_tensor *in, uint32_t n) {
     if (n == 1 && w->type == DS4_TENSOR_Q6_K && w->dim[1] >= 3072 &&
@@ -286,6 +292,15 @@ static bool hy4_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
         const uint32_t rows = w->dim[1];
         return ds4_gpu_qwen4_multi_gemv_tensor(in, 1, w->dim[0], 1, &out,
                                               m->map, m->size, &w->abs_offset, &w->type, &rows);
+    }
+    if ((w->type == DS4_TENSOR_F32 || w->type == DS4_TENSOR_F16) && w->dim[0] % 4 == 0 &&
+        hy4_verify_enabled(n, "DS4_HY4_VERIFY_F32") && getenv("DS4_HY4_TILED_F32") == NULL) {
+        const ds4_hy4_args a = {.rows = n, .width = w->dim[0], .groups = w->dim[1], .type = w->type,
+                                .row_bytes = w->bytes / w->dim[1]};
+        const bool narrow = a.groups < 64;
+        return ds4_gpu_hy4_dispatch_rows("kernel_hy4_float_mv_rows", &a, m->map, m->size,
+                       (const ds4_hy4_binding[]){HY4_T(in), HY4_W(w), HY4_T(out)}, 3,
+                       narrow ? a.groups : (a.groups + 3) / 4, 1, narrow ? 256 : 128);
     }
     if (w->type == DS4_TENSOR_Q8_0)
         return ds4_gpu_qwen4_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset,
@@ -315,15 +330,20 @@ static bool hy4_head_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tenso
     const uint32_t out_dim = w->dim[1];
     const ds4_hy4_args a = {.rows = n, .width = w->dim[0], .heads = heads, .type = w->type,
                            .row_bytes = w->bytes / (heads * out_dim)};
+    const bool head_shape =
+        (a.width == 192 && out_dim == 512 && a.type == DS4_TENSOR_Q8_0) ||
+        (a.width == 512 && out_dim == 256 && (a.type == DS4_TENSOR_Q8_0 || a.type == DS4_TENSOR_Q6_K));
     const char *head_mv = getenv("DS4_HY4_DECODE_HEAD_MV");
-    if (n == 1 && (!head_mv || strcmp(head_mv, "0") != 0) &&
-        ((a.width == 192 && out_dim == 512 && a.type == DS4_TENSOR_Q8_0) ||
-         (a.width == 512 && out_dim == 256 && (a.type == DS4_TENSOR_Q8_0 || a.type == DS4_TENSOR_Q6_K)))) {
+    if (n == 1 && head_shape && (!head_mv || strcmp(head_mv, "0") != 0)) {
         return HY4_OP("head_mv", a, out_dim / 16, heads, 1, 128, HY4_T(in), HY4_W(w), HY4_T(out));
     }
     if (n > 1) {
         const char *row_mm = getenv("DS4_HY4_ROW_HEAD_MM");
         if (!row_mm || strcmp(row_mm, "1") != 0) {
+            if (head_shape && hy4_verify_enabled(n, "DS4_HY4_VERIFY_HEAD"))
+                return ds4_gpu_hy4_dispatch_rows("kernel_hy4_head_mv_rows", &a, m->map, m->size,
+                             (const ds4_hy4_binding[]){HY4_T(in), HY4_W(w), HY4_T(out)},
+                             3, out_dim / 16, heads, 128);
             if (w->type == DS4_TENSOR_Q8_0)
                 return HY4_OP("head_mm_batch_q8_0", a, out_dim / 32, heads, (n + 31) / 32, 128,
                               HY4_T(in), HY4_W(w), HY4_T(out));
@@ -344,10 +364,15 @@ static bool hy4_norm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *
 static bool hy4_hc(ds4_hy4_graph *g, const ds4_model *m, const hy4_hc_weights *h,
                    const ds4_gpu_tensor *streams, uint32_t n) {
     const ds4_hy4_args a = {.rows = n, .width = h->fn->dim[1], .groups = 16};
-    if (n == 1 && h->fn->type == DS4_TENSOR_F32 && getenv("DS4_HY4_UNFUSED_IHC") == NULL) {
-        return HY4_OP("hc_partial", a, a.groups, n, 1, a.width * 32,
-                      HY4_T(streams), HY4_W(h->fn), HY4_T(g->flat_norm)) &&
-               HY4_OP("hc_finish", a, HY4_DIM / 256, n, 1, 256,
+    const bool verify = hy4_verify_enabled(n, "DS4_HY4_VERIFY_F32");
+    if ((n == 1 || verify) && h->fn->type == DS4_TENSOR_F32 && getenv("DS4_HY4_UNFUSED_IHC") == NULL) {
+        const bool partial = verify ?
+            ds4_gpu_hy4_dispatch_rows("kernel_hy4_hc_partial_rows", &a, m->map, m->size,
+                       (const ds4_hy4_binding[]){HY4_T(streams), HY4_W(h->fn), HY4_T(g->flat_norm)},
+                       3, a.groups, 1, a.width * 32) :
+            HY4_OP("hc_partial", a, a.groups, n, 1, a.width * 32,
+                   HY4_T(streams), HY4_W(h->fn), HY4_T(g->flat_norm));
+        return partial && HY4_OP("hc_finish", a, HY4_DIM / 256, n, 1, 256,
                       HY4_T(streams), HY4_T(g->flat_norm), HY4_W(h->scale), HY4_W(h->base),
                       HY4_T(g->norm), HY4_T(g->post));
     }

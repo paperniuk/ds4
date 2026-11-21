@@ -24,6 +24,15 @@ int ds4_gpu_hy4_dispatch(const char *kernel, const ds4_hy4_args *args,
                          const ds4_hy4_binding *bindings, size_t count,
                          uint32_t x, uint32_t y, uint32_t z, uint32_t threads);
 
+/* Select a specialization for up to eight token rows. */
+int ds4_gpu_hy4_dispatch_rows(const char *kernel, const ds4_hy4_args *args,
+                              const void *map, uint64_t size,
+                              const ds4_hy4_binding *bindings, size_t count,
+                              uint32_t x, uint32_t y, uint32_t threads);
+
+/* End a benchmark batch and return its Metal command buffer time. */
+int ds4_gpu_hy4_end_timed_commands(double *gpu_ms);
+
 int ds4_gpu_hy4_expert_mid(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
                           const void *map, uint64_t size, uint64_t gate, uint64_t up, uint32_t rows);
 

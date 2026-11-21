@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 enum { HEADS = 32, LATENT = 512, KV = 576, CTX = 2112 };
 
@@ -32,6 +34,285 @@ static ds4_gpu_tensor *random_tensor(size_t count, bool half_precision) {
 #define B(t) { (t), 0, ds4_gpu_tensor_bytes(t) }
 #define RUN(name, bindings, x, y) ds4_gpu_hy4_dispatch("kernel_hy4_" name, &a, NULL, 0, \
     bindings, sizeof(bindings) / sizeof(bindings[0]), x, y, 1, 128)
+
+enum { VERIFY_MAX_ROWS = 8, VERIFY_BENCH_ROWS = 3 };
+enum verify_path { VERIFY_NEW, VERIFY_BATCH, VERIFY_SINGLE };
+
+static void *verify_map;
+static size_t verify_map_size;
+
+static void *verify_weights(size_t bytes) {
+    if (verify_map_size >= bytes) return verify_map;
+    const size_t page = getpagesize();
+    const size_t size = (bytes + page - 1) / page * page;
+    void *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (map == MAP_FAILED) return NULL;
+    if (!ds4_gpu_set_model_map_range(map, size, 0, size, bytes)) {
+        munmap(map, size);
+        return NULL;
+    }
+    if (verify_map) munmap(verify_map, verify_map_size);
+    verify_map = map;
+    verify_map_size = size;
+    return map;
+}
+
+static void verify_random_quant(uint8_t *packed, size_t bytes, unsigned block, unsigned scale_hi, uint8_t scale) {
+    for (size_t i = 0; i < bytes; i++) {
+        rng = 1664525u * rng + 1013904223u;
+        packed[i] = rng >> 24;
+    }
+    for (size_t i = 0; i < bytes; i += block) packed[i + scale_hi] = scale;
+}
+
+static int verify_compare(const char *name, uint32_t rows, ds4_gpu_tensor *ref,
+                          ds4_gpu_tensor *out, size_t count, float atol, float rtol) {
+    const float *expected = ds4_gpu_tensor_contents(ref), *actual = ds4_gpu_tensor_contents(out);
+    float max_abs = 0.0f, max_rel = 0.0f;
+    size_t bad = count;
+    for (size_t i = 0; i < count; i++) {
+        const float delta = fabsf(actual[i] - expected[i]);
+        max_abs = fmaxf(max_abs, delta);
+        max_rel = fmaxf(max_rel, delta / fmaxf(fabsf(expected[i]), 1e-7f));
+        if (bad == count && (!isfinite(actual[i]) || !isfinite(expected[i]) ||
+                             delta > atol + rtol * fabsf(expected[i]))) bad = i;
+    }
+    printf("%s n=%u max_abs=%g max_rel=%g\n", name, rows, max_abs, max_rel);
+    if (bad == count) return 1;
+    fprintf(stderr, "%s n=%u element=%zu expected=%g actual=%g\n",
+            name, rows, bad, expected[bad], actual[bad]);
+    return 0;
+}
+
+typedef int (*verify_bench_fn)(void *context, enum verify_path path);
+
+static int verify_bench(const char *name, verify_bench_fn dispatch, void *context) {
+    enum { REPEATS = 12, TRIALS = 3 };
+    double best[2] = {INFINITY, INFINITY};
+    for (int trial = -1; trial < TRIALS; trial++) {
+        for (enum verify_path path = VERIFY_NEW; path <= VERIFY_BATCH; path++) {
+            if (!ds4_gpu_begin_commands()) return 0;
+            const int repeats = trial < 0 ? 1 : REPEATS;
+            int ok = 1;
+            for (int i = 0; i < repeats && ok; i++) ok = dispatch(context, path);
+            double ms = 0.0;
+            if (!ds4_gpu_hy4_end_timed_commands(&ms) || !ok || ms <= 0.0) return 0;
+            if (trial >= 0) best[path] = fmin(best[path], ms / repeats);
+        }
+    }
+    printf("%s n=%d GPU old %.3f ms new %.3f ms (%.2fx)\n",
+           name, VERIFY_BENCH_ROWS, best[VERIFY_BATCH], best[VERIFY_NEW],
+           best[VERIFY_BATCH] / best[VERIFY_NEW]);
+    return 1;
+}
+
+typedef int (*verify_projection_fn)(const ds4_hy4_args *a, const ds4_gpu_tensor *x,
+                                    ds4_gpu_tensor *out, enum verify_path path);
+
+struct verify_projection_bench {
+    ds4_hy4_args args;
+    const ds4_gpu_tensor *in;
+    ds4_gpu_tensor *out;
+    verify_projection_fn dispatch;
+};
+
+static int verify_projection_batch(void *context, enum verify_path path) {
+    const struct verify_projection_bench *b = context;
+    return b->dispatch(&b->args, b->in, b->out, path);
+}
+
+static int verify_projection(const char *name, ds4_hy4_args a, uint32_t in_cols, uint32_t out_cols,
+                             verify_projection_fn dispatch, bool bench) {
+    const uint32_t max_rows = bench ? VERIFY_BENCH_ROWS : VERIFY_MAX_ROWS;
+    const size_t in_stride = in_cols * sizeof(float), out_stride = out_cols * sizeof(float);
+    ds4_gpu_tensor *in = random_tensor(max_rows * in_cols, false);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(max_rows * out_stride);
+    ds4_gpu_tensor *ref = bench ? NULL : ds4_gpu_tensor_alloc(max_rows * out_stride);
+    int ok = out && (bench || ref);
+    if (bench && ok) {
+        a.rows = VERIFY_BENCH_ROWS;
+        struct verify_projection_bench b = {a, in, out, dispatch};
+        ok = verify_bench(name, verify_projection_batch, &b);
+    }
+    for (uint32_t n = 1; !bench && ok && n <= max_rows; n++) {
+        a.rows = 1;
+        for (uint32_t i = 0; ok && i < n; i++) {
+            ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(in, i * in_stride, in_stride);
+            ds4_gpu_tensor *ref_row = ds4_gpu_tensor_view(ref, i * out_stride, out_stride);
+            ok = x_row && ref_row && dispatch(&a, x_row, ref_row, VERIFY_SINGLE);
+            ds4_gpu_tensor_free(x_row);
+            ds4_gpu_tensor_free(ref_row);
+        }
+        a.rows = n;
+        ok = ok && ds4_gpu_tensor_fill_f32(out, NAN, n * out_cols) &&
+             dispatch(&a, in, out, VERIFY_NEW) &&
+             verify_compare(name, n, ref, out, n * out_cols, 1.5e-4f, 5e-5f);
+    }
+    ds4_gpu_tensor_free(in);
+    ds4_gpu_tensor_free(ref);
+    ds4_gpu_tensor_free(out);
+    return ok;
+}
+
+static int verify_head_dispatch(const ds4_hy4_args *a, const ds4_gpu_tensor *in,
+                                ds4_gpu_tensor *out, enum verify_path path) {
+    const uint32_t out_dim = a->width == 192 ? 512 : 256;
+    const ds4_hy4_binding b[] = {B(in), {NULL, 0, (uint64_t)a->heads * out_dim * a->row_bytes}, B(out)};
+    if (path == VERIFY_NEW)
+        return ds4_gpu_hy4_dispatch_rows("kernel_hy4_head_mv_rows", a, verify_map, verify_map_size,
+                                         b, 3, out_dim / 16, a->heads, 128);
+    if (path == VERIFY_SINGLE)
+        return ds4_gpu_hy4_dispatch("kernel_hy4_head_mv", a, verify_map, verify_map_size,
+                                    b, 3, out_dim / 16, a->heads, 1, 128);
+    const char *batch = a->type == 14 ? "kernel_hy4_head_mm_batch_q6_k" : "kernel_hy4_head_mm_batch_q8_0";
+    return ds4_gpu_hy4_dispatch(batch, a, verify_map, verify_map_size,
+                                b, 3, out_dim / 32, a->heads, (a->rows + 31) / 32, 128);
+}
+
+static int test_verify_head(bool bench) {
+    const char *names[] = {"MLA key Q8_0", "MLA value Q8_0", "MLA value Q6_K"};
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const bool key = i == 0, q6 = i == 2;
+        const uint32_t heads = bench ? (q6 ? 32 : 64) : 2;
+        const uint32_t width = key ? 192 : 512;
+        const uint32_t in_dim = key ? 256 : 512, out_dim = key ? 512 : 256;
+        const uint32_t row_bytes = q6 ? width / 256 * 210 : width / 32 * 34;
+        const size_t bytes = (size_t)heads * out_dim * row_bytes;
+        uint8_t *w = verify_weights(bytes);
+        if (!w) return 0;
+        verify_random_quant(w, bytes, q6 ? 210 : 34, q6 ? 209 : 1, 0x08);
+        const ds4_hy4_args a = {.width = width, .heads = heads, .row_bytes = row_bytes, .type = q6 ? 14 : 8};
+        if (!verify_projection(names[i], a, heads * in_dim, heads * out_dim, verify_head_dispatch, bench))
+            return 0;
+    }
+    return 1;
+}
+
+static int verify_float_dispatch(const ds4_hy4_args *a, const ds4_gpu_tensor *in,
+                                 ds4_gpu_tensor *out, enum verify_path path) {
+    const uint64_t offset = 0;
+    if (path == VERIFY_NEW) {
+        const bool narrow = a->groups < 64;
+        const ds4_hy4_binding b[] = {B(in), {NULL, offset, (uint64_t)a->groups * a->row_bytes}, B(out)};
+        return ds4_gpu_hy4_dispatch_rows("kernel_hy4_float_mv_rows", a, verify_map, verify_map_size, b, 3,
+                                         narrow ? a->groups : (a->groups + 3) / 4, 1, narrow ? 256 : 128);
+    }
+    if (path == VERIFY_SINGLE && a->type == 0 && a->groups >= 128)
+        return ds4_gpu_qwen4_multi_gemv_tensor(in, 1, a->width, 1, &out, verify_map, verify_map_size,
+                                               &offset, &a->type, &a->groups);
+    return ds4_gpu_qwen4_dense_mm_tensor(out, in, verify_map, verify_map_size,
+                                         offset, a->type, a->rows, a->width, a->groups);
+}
+
+static void verify_random_float(void *weights, size_t count, bool f16) {
+    for (size_t i = 0; i < count; i++) {
+        rng = 1664525u * rng + 1013904223u;
+        const float value = (int)(rng >> 8) / 268435456.0f - 0.03125f;
+        if (f16) ((__fp16 *)weights)[i] = (__fp16)value;
+        else ((float *)weights)[i] = value;
+    }
+}
+
+static int test_verify_float(bool bench) {
+    const struct { const char *name; uint32_t width, out; bool f16, tail; } shapes[] = {
+        {"F32 router", 3072, 512, false, false},
+        {"F32 index key", 3072, 128, false, false},
+        {"F32 index query", 1024, 2048, false, false},
+        {"F32 index projection", 3072, 16, false, false},
+        {"F32 compressor", 128, 128, false, false},
+        {"F16 output tail", 280, 131, true, true},
+    };
+    for (unsigned i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        if (bench && shapes[i].tail) continue;
+        const uint32_t width = shapes[i].width, out = shapes[i].out;
+        const uint32_t row_bytes = width * (shapes[i].f16 ? sizeof(__fp16) : sizeof(float));
+        void *w = verify_weights((size_t)out * row_bytes);
+        if (!w) return 0;
+        verify_random_float(w, (size_t)out * width, shapes[i].f16);
+        const ds4_hy4_args a = {.width = width, .groups = out, .row_bytes = row_bytes, .type = shapes[i].f16};
+        if (!verify_projection(shapes[i].name, a, width, out, verify_float_dispatch, bench)) return 0;
+    }
+    return 1;
+}
+
+struct verify_hc {
+    ds4_hy4_args args;
+    ds4_gpu_tensor *in, *scratch, *mix, *scale, *base, *out, *post;
+};
+
+static int verify_hc_dispatch(void *context, enum verify_path path) {
+    const struct verify_hc *c = context;
+    const ds4_hy4_args *a = &c->args;
+    const ds4_hy4_binding p[] = {B(c->in), {NULL, 0, a->width * 12288 * sizeof(float)}, B(c->scratch)};
+    const ds4_hy4_binding f[] = {B(c->in), B(c->scratch), B(c->scale), B(c->base), B(c->out), B(c->post)};
+    const ds4_hy4_binding m[] = {B(c->in), B(c->mix), B(c->scale), B(c->base), B(c->out), B(c->post)};
+    if (path == VERIFY_BATCH)
+        return ds4_gpu_rms_norm_plain_rows_tensor(c->scratch, c->in, 12288, a->rows, 1e-5f) &&
+               ds4_gpu_qwen4_dense_mm_tensor(c->mix, c->scratch, verify_map, verify_map_size,
+                                             0, 0, a->rows, 12288, a->width) &&
+               ds4_gpu_hy4_dispatch("kernel_hy4_hc_mix", a, NULL, 0, m, 6, 12, a->rows, 1, 256);
+    const int partial = path == VERIFY_NEW ?
+        ds4_gpu_hy4_dispatch_rows("kernel_hy4_hc_partial_rows", a, verify_map, verify_map_size,
+                                  p, 3, a->groups, 1, a->width * 32) :
+        ds4_gpu_hy4_dispatch("kernel_hy4_hc_partial", a, verify_map, verify_map_size,
+                              p, 3, a->groups, 1, 1, a->width * 32);
+    return partial && ds4_gpu_hy4_dispatch("kernel_hy4_hc_finish", a, NULL, 0, f, 6, 12, a->rows, 1, 256);
+}
+
+static int test_verify_hc(bool bench) {
+    const size_t in_stride = 12288 * sizeof(float), out_stride = 3072 * sizeof(float);
+    const size_t post_stride = 4 * sizeof(float);
+    ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * out_stride);
+    ds4_gpu_tensor *ref_post = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * post_stride);
+    struct verify_hc c = {
+        .args = {.rows = VERIFY_BENCH_ROWS, .groups = 16},
+        .in = random_tensor(VERIFY_MAX_ROWS * 12288, false),
+        .scratch = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * in_stride),
+        .mix = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * 8 * sizeof(float)),
+        .scale = random_tensor(2, false),
+        .base = random_tensor(8, false),
+        .out = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * out_stride),
+        .post = ds4_gpu_tensor_alloc(VERIFY_MAX_ROWS * post_stride),
+    };
+    int ok = ref && ref_post && c.scratch && c.mix && c.out && c.post;
+    for (uint32_t width = 4; ok && width <= 8; width += 4) {
+        const char *name = width == 4 ? "output hyper-connection" : "layer hyper-connection";
+        c.args.width = width;
+        void *w = verify_weights(width * in_stride);
+        if (!w) { ok = 0; break; }
+        verify_random_float(w, width * 12288, false);
+        if (bench) {
+            ok = verify_bench(name, verify_hc_dispatch, &c);
+            continue;
+        }
+        for (uint32_t n = 1; ok && n <= VERIFY_MAX_ROWS; n++) {
+            struct verify_hc single = c;
+            single.args.rows = 1;
+            for (uint32_t i = 0; ok && i < n; i++) {
+                single.in = ds4_gpu_tensor_view(c.in, i * in_stride, in_stride);
+                single.out = ds4_gpu_tensor_view(ref, i * out_stride, out_stride);
+                single.post = ds4_gpu_tensor_view(ref_post, i * post_stride, post_stride);
+                ok = single.in && single.out && single.post && verify_hc_dispatch(&single, VERIFY_SINGLE);
+                ds4_gpu_tensor_free(single.in);
+                ds4_gpu_tensor_free(single.out);
+                ds4_gpu_tensor_free(single.post);
+            }
+            c.args.rows = n;
+            ok = ok && ds4_gpu_tensor_fill_f32(c.out, NAN, n * 3072) &&
+                 ds4_gpu_tensor_fill_f32(c.post, NAN, n * 4) && verify_hc_dispatch(&c, VERIFY_NEW) &&
+                 verify_compare(name, n, ref, c.out, n * 3072, 1e-5f, 1e-5f) &&
+                 (width == 4 || verify_compare("hyper-connection post", n, ref_post, c.post, n * 4, 1e-5f, 1e-5f));
+        }
+    }
+    ds4_gpu_tensor *owned[] = {ref, ref_post, c.in, c.scratch, c.mix, c.scale, c.base, c.out, c.post};
+    for (unsigned i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) ds4_gpu_tensor_free(owned[i]);
+    return ok;
+}
+
+static int test_verify(bool bench) {
+    return test_verify_head(bench) &&
+           test_verify_float(bench) && test_verify_hc(bench);
+}
 
 static int test_expert_mid_r4(void) {
     enum { DIM = 1536, SLOTS = 16, EXPERTS = 3, BLOCK = 66, ROW_BYTES = 6 * BLOCK };
@@ -176,7 +457,18 @@ static int test_rewind(void) {
 int main(int argc, char **argv) {
     if (!test_ane_schedule() || !test_rewind()) return 1;
     if (argc == 2 && strcmp(argv[1], "--host-only") == 0) return 0;
+    const bool bench = argc == 2 && strcmp(argv[1], "--bench-verify") == 0;
+    if (argc > 1 && !bench) {
+        fprintf(stderr, "usage: %s [--host-only | --bench-verify]\n", argv[0]);
+        return 1;
+    }
     if (!ds4_gpu_init()) return 1;
+    const int verify_ok = test_verify(bench);
+    if (bench || !verify_ok) {
+        ds4_gpu_cleanup();
+        if (verify_map) munmap(verify_map, verify_map_size);
+        return verify_ok ? 0 : 1;
+    }
     if (!test_expert_mid_r4()) return 1;
     ds4_gpu_tensor *z = random_tensor(HEADS * LATENT, false);
     ds4_gpu_tensor *q = random_tensor(HEADS * 256, false);
@@ -249,6 +541,7 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor *owned[] = { z, q, cache, sink, indices, partial, ref, out };
     for (unsigned i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) ds4_gpu_tensor_free(owned[i]);
     ds4_gpu_cleanup();
+    if (verify_map) munmap(verify_map, verify_map_size);
     if (ok) puts("Hy4 split attention passed at all nine context positions");
     return ok && head_mm_ok ? 0 : 1;
 }

@@ -12032,7 +12032,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     }
 }
 
-int ds4_gpu_end_commands(void) {
+static int ds4_gpu_end_commands_impl(double *gpu_ms) {
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -12044,7 +12044,13 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
-    return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    const int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
+    if (gpu_ms) *gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+    return ok;
+}
+
+int ds4_gpu_end_commands(void) {
+    return ds4_gpu_end_commands_impl(NULL);
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
@@ -56042,6 +56048,22 @@ int ds4_gpu_hy4_dispatch(const char *kernel, const ds4_hy4_args *args,
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, kernel);
     }
+}
+
+int ds4_gpu_hy4_dispatch_rows(const char *kernel, const ds4_hy4_args *args,
+                              const void *map, uint64_t size,
+                              const ds4_hy4_binding *bindings, size_t count,
+                              uint32_t x, uint32_t y, uint32_t threads) {
+    if (!args->rows || args->rows > 8) return 0;
+    char name[96];
+    const uint32_t tile = args->rows <= 4 ? args->rows : 8;
+    const int len = snprintf(name, sizeof(name), "%s_%u", kernel, tile);
+    if (len < 0 || (size_t)len >= sizeof(name)) return 0;
+    return ds4_gpu_hy4_dispatch(name, args, map, size, bindings, count, x, y, 1, threads);
+}
+
+int ds4_gpu_hy4_end_timed_commands(double *gpu_ms) {
+    return ds4_gpu_end_commands_impl(gpu_ms);
 }
 
 int ds4_gpu_hy4_expert_prefill(ds4_gpu_tensor *mid, ds4_gpu_tensor *down,

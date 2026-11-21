@@ -779,3 +779,184 @@ kernel void hy4_q6_rows(constant hy4_args &a, device const float4 *x,
 typedef decltype(hy4_q6_rows<1>) hy4_q6_rows_t;
 template [[host_name("kernel_hy4_q6_r4")]] kernel hy4_q6_rows_t hy4_q6_rows<4>;
 template [[host_name("kernel_hy4_q6_r8")]] kernel hy4_q6_rows_t hy4_q6_rows<8>;
+
+#define HY4_VERIFY_INSTANCE(NAME, N) \
+    template [[host_name(#NAME "_" #N)]] kernel decltype(NAME<N>) NAME<N>;
+#define HY4_VERIFY_INSTANCES(NAME) \
+    HY4_VERIFY_INSTANCE(NAME, 1) \
+    HY4_VERIFY_INSTANCE(NAME, 2) \
+    HY4_VERIFY_INSTANCE(NAME, 3) \
+    HY4_VERIFY_INSTANCE(NAME, 4) \
+    HY4_VERIFY_INSTANCE(NAME, 8)
+
+// Decode four weights at a time and use them for each token before moving
+// on. Keeping the activation loads here avoids a full block per token in
+// registers. The eight lanes retain the decode Q6_K block mapping.
+template <ushort NT>
+static inline void hy4_q6_dot_rows(device const block_q6_K *b, device const float4 *x,
+                                  uint stride, uint rows, short h, short part,
+                                  thread float (&sums)[NT]) {
+    const short l = 8 * part;
+    device const ushort *qa = (device const ushort *)(b->ql + 64 * h + l);
+    device const ushort *qb = (device const ushort *)(b->ql + 64 * h + 32 + l);
+    device const ushort *qh = (device const ushort *)(b->qh + 32 * h + l);
+    device const ushort *sc = (device const ushort *)b->scales + 4 * h;
+    const uint lo[2] = {ds4q_u32(qa), ds4q_u32(qa + 2)};
+    const uint hi[2] = {ds4q_u32(qb), ds4q_u32(qb + 2)};
+    const uint upper[2] = {ds4q_u32(qh), ds4q_u32(qh + 2)};
+    float partial[NT] = {};
+#pragma unroll
+    for (short k = 0; k < 4; k++) {
+        const float scale = float(char(sc[k] >> (8 * (part / 2))));
+#pragma unroll
+        for (short i = 0; i < 2; i++) {
+            const uint q = k == 0 ? (lo[i] & 0x0F0F0F0Fu) | ((upper[i] & 0x03030303u) << 4) :
+                           k == 1 ? (hi[i] & 0x0F0F0F0Fu) | ((upper[i] & 0x0C0C0C0Cu) << 2) :
+                           k == 2 ? ((lo[i] >> 4) & 0x0F0F0F0Fu) | (upper[i] & 0x30303030u) :
+                                    ((hi[i] >> 4) & 0x0F0F0F0Fu) | ((upper[i] >> 2) & 0x30303030u);
+            const float2 e = ds4q_h2_bits(q & 0x00FF00FFu, 1056.h);
+            const float2 o = ds4q_h2_bits((q >> 8) & 0x00FF00FFu, 1056.h);
+            const float4 w = scale * float4(e.x, o.x, e.y, o.y);
+#pragma unroll
+            for (ushort t = 0; t < NT; t++) {
+                if (NT < 8 || t < rows) partial[t] += dot(w, x[t * stride + 8 * k + i]);
+            }
+        }
+    }
+    const float d = float(b->d);
+#pragma unroll
+    for (ushort t = 0; t < NT; t++) sums[t] += d * partial[t];
+}
+
+
+// Keep the decode head/output mapping and walk the same weights for all tokens.
+template <ushort NT>
+kernel void kernel_hy4_head_mv_rows(constant hy4_args &a, device const float4 *in,
+                                     device const char *weight, device float *out,
+                                     uint2 id [[threadgroup_position_in_grid]],
+                                     ushort lane [[thread_index_in_simdgroup]],
+                                     ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint col = lane % 8;
+    const uint row = id.x * 16 + sg * 4 + lane / 8;
+    const bool key = a.width == 192;
+    const uint out_dim = key ? 512 : 256, head_stride = key ? 64 : 128;
+    const uint token_stride = a.heads * head_stride;
+    device const float4 *x = in + id.y * head_stride;
+    device const char *w = weight + (ulong(id.y) * out_dim + row) * a.row_bytes;
+    float sums[NT] = {};
+    if (a.type == 8) {
+        for (uint block = 0; block < a.width / 32; block++) {
+            device const char *b = w + block * 34;
+            const float4 q = float4(*(device const packed_char4 *)(b + 2 + 4 * col));
+            const float scale = float(*(device const half *)b);
+#pragma unroll
+            for (ushort t = 0; t < NT; t++) {
+                if (NT < 8 || t < a.rows)
+                    sums[t] += scale * dot(q, x[t * token_stride + block * 8 + col]);
+            }
+        }
+    } else {
+        const short h = col / 4, part = col % 4;
+        for (uint block = 0; block < a.width / 256; block++) {
+            device const float4 *src = x + block * 64 + h * 32 + part * 2;
+            hy4_q6_dot_rows((device const block_q6_K *)w + block, src,
+                            token_stride, a.rows, h, part, sums);
+        }
+    }
+#pragma unroll
+    for (ushort t = 0; t < NT; t++) {
+        float sum = sums[t];
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        sum += simd_shuffle_xor(sum, 4);
+        if (col == 0 && (NT < 8 || t < a.rows)) out[(t * a.heads + id.y) * out_dim + row] = sum;
+    }
+}
+HY4_VERIFY_INSTANCES(kernel_hy4_head_mv_rows)
+
+template <typename Weight, ushort NT>
+static inline void hy4_float_dot_rows(device const Weight *w, device const float4 *x,
+                                     uint width, uint rows, uint first, uint step,
+                                     thread float (&sums)[NT]) {
+    for (uint i = first; i < width; i += step) {
+        const float4 v = float4(w[i]);
+#pragma unroll
+        for (ushort t = 0; t < NT; t++) {
+            if (NT < 8 || t < rows) sums[t] += dot(v, x[t * width + i]);
+        }
+    }
+}
+
+// A narrow output needs more SIMD groups across its input dimension.
+// Both layouts write final outputs without a device-memory partial plane.
+template <ushort NT>
+kernel void kernel_hy4_float_mv_rows(constant hy4_args &a, device const float4 *x,
+                                      device const char *weight, device float *out,
+                                      uint group [[threadgroup_position_in_grid]],
+                                      ushort tid [[thread_index_in_threadgroup]],
+                                      ushort sg [[simdgroup_index_in_threadgroup]],
+                                      ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partial[NT][8];
+    const bool narrow = a.groups < 64;
+    const uint row = narrow ? group : group * 4 + sg;
+    if (row >= a.groups) return;
+    const uint width = a.width / 4;
+    const uint first = narrow ? tid : lane, step = narrow ? 256 : 32;
+    device const char *w = weight + ulong(row) * a.row_bytes;
+    float sums[NT] = {};
+    if (a.type == 0) hy4_float_dot_rows((device const float4 *)w, x, width, a.rows, first, step, sums);
+    else hy4_float_dot_rows((device const half4 *)w, x, width, a.rows, first, step, sums);
+#pragma unroll
+    for (ushort t = 0; t < NT; t++) {
+        const float value = simd_sum(sums[t]);
+        if (lane == 0) {
+            if (narrow) partial[t][sg] = value;
+            else if (NT < 8 || t < a.rows) out[t * a.groups + row] = value;
+        }
+    }
+    if (narrow) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < a.rows) {
+            float value = 0.0f;
+#pragma unroll
+            for (ushort i = 0; i < 8; i++) value += partial[tid][i];
+            out[tid * a.groups + row] = value;
+        }
+    }
+}
+HY4_VERIFY_INSTANCES(kernel_hy4_float_mv_rows)
+
+// The iHC projection shares the weights and accumulates each token's RMS
+// denominator alongside the dots. hc_finish consumes the same partial layout.
+template <ushort NT>
+kernel void kernel_hy4_hc_partial_rows(constant hy4_args &a,
+                                        device const float4 *streams, device const float4 *weights,
+                                        device float *partial, uint group [[threadgroup_position_in_grid]],
+                                        ushort lane [[thread_index_in_simdgroup]],
+                                        ushort output [[simdgroup_index_in_threadgroup]]) {
+    const uint block = 3072 / a.groups;
+    float4 dots[NT] = {}, squares[NT] = {};
+    for (uint i = lane; i < block; i += 32) {
+        const uint offset = group * block + i;
+        const float4 w = weights[output * 3072 + offset];
+#pragma unroll
+        for (ushort t = 0; t < NT; t++) {
+            if (NT < 8 || t < a.rows) {
+                const float4 x = streams[t * 3072 + offset];
+                dots[t] = fma(x, w, dots[t]);
+                if (output == 0) squares[t] = fma(x, x, squares[t]);
+            }
+        }
+    }
+#pragma unroll
+    for (ushort t = 0; t < NT; t++) {
+        const float result = simd_sum(dot(dots[t], float4(1)));
+        const float sq = simd_sum(dot(squares[t], float4(1)));
+        if (lane == 0 && (NT < 8 || t < a.rows)) {
+            device float *dst = partial + (t * a.groups + group) * 9;
+            dst[output] = result;
+            if (output == 0) dst[8] = sq;
+        }
+    }
+}
+HY4_VERIFY_INSTANCES(kernel_hy4_hc_partial_rows)

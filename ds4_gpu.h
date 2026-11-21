@@ -3725,13 +3725,17 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
 int ds4_gpu_ane_set_count(int n);
 int ds4_gpu_ane_use_set(int s);
 int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots);
-/* Rows [r0, r0 + rows) of a model weight: `type` rows of row_bytes at
- * `offset` of the mapped model. */
+/* Rows [r0, r0 + rows) of a weight: `type` rows of row_bytes at
+ * `offset` of the mapped model, or of tensor if supplied. */
 typedef struct {
     const void *map;
     uint64_t size, offset, row_bytes;
     uint32_t type, r0;
+    const ds4_gpu_tensor *tensor;
 } ds4_gpu_ane_weight;
+/* Releases programs and unsubmitted measurements after a setup failure,
+ * before any evaluations have been queued. */
+void ds4_gpu_ane_discard_setup(void);
 int ds4_gpu_ane_type_ok(uint32_t type);
 int ds4_gpu_ane_measure(int h, uint32_t slot, const ds4_gpu_ane_weight *w);
 int ds4_gpu_ane_measure_done(void);

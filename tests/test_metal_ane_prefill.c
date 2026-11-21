@@ -1,5 +1,6 @@
 #define _DARWIN_C_SOURCE
 #include "ds4_gpu.h"
+#include "ds4_quants.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,9 +12,10 @@
  * int8 projections staged by the GPU from Q8_0 rows (two layers, a full and
  * a partial row bucket), a split projection joined with GPU columns, the
  * SwiGLU FFN with fp16 weights, two chunks in flight on the two surface
- * sets, and a fault that must surface in settle. */
+ * sets, native Q6_K and tensor-backed fp16 weights, and a fault that must
+ * surface in settle. */
 
-enum { K = 256, N = 512, F = 128, R = 1024, SLOTS = 2, GPU_COLS = 192, Q8_BLOCK = 34 };
+enum { K = 256, N = 512, F = 128, R = 1024, SLOTS = 2, GPU_COLS = 192, Q8_BLOCK = 34, Q6_BLOCK = 210 };
 static uint32_t rng = 7;
 static float random_unit(void) {
     rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
@@ -64,13 +66,23 @@ static int close_enough(const char *what, const float *a, const float *ref, uint
 }
 
 static ds4_gpu_ane_weight weight(const void *map, uint64_t size, uint64_t off, uint32_t cols, uint32_t r0) {
-    return (ds4_gpu_ane_weight){ map, size, off, (uint64_t)cols / 32u * Q8_BLOCK, 8u, r0 };
+    return (ds4_gpu_ane_weight){ map, size, off, (uint64_t)cols / 32u * Q8_BLOCK, 8u, r0, NULL };
+}
+
+static void fill_q6(uint8_t *p, uint32_t rows) {
+    for (uint32_t r = 0; r < rows; r++, p += Q6_BLOCK) {
+        for (uint32_t i = 0; i < 192; i++) p[i] = (uint8_t)lrintf(127.0f * random_unit());
+        for (uint32_t i = 192; i < 208; i++) p[i] = (uint8_t)lrintf(40.0f * random_unit());
+        const _Float16 d = (_Float16)(0.0004f + 0.0002f * (random_unit() + 1.0f));
+        memcpy(p + 208, &d, sizeof d);
+    }
 }
 
 int main(void) {
     const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     const uint64_t proj = (uint64_t)N * K / 32u * Q8_BLOCK, ffn = (uint64_t)F * K / 32u * Q8_BLOCK;
-    const uint64_t bytes = (SLOTS * proj + SLOTS * 3u * ffn + page - 1u) / page * page;
+    const uint64_t q6_offset = SLOTS * proj + SLOTS * 3u * ffn;
+    const uint64_t bytes = (q6_offset + N * Q6_BLOCK + page - 1u) / page * page;
     float *wp = malloc((uint64_t)SLOTS * N * K * sizeof(float));
     float *wf = malloc((uint64_t)SLOTS * 3u * F * K * sizeof(float));
     float *x = malloc((uint64_t)R * K * sizeof(float));
@@ -88,11 +100,12 @@ int main(void) {
         fill_q8(m + base + 2u * ffn, K, F, ws + 2u * (uint64_t)F * K);  /* down [K][F] */
     }
     for (uint64_t i = 0; i < (uint64_t)R * K; i++) x[i] = random_unit();
-    /* nine good evaluations, then a non-finite one */
-    setenv("DS4_ANE_TEST_FAIL", "10:nan", 1);
+    fill_q6(m + q6_offset, N);
+    /* Eleven good evaluations, then a non-finite one. */
+    setenv("DS4_ANE_TEST_FAIL", "12:nan", 1);
 
     int ok = ds4_gpu_init() && ds4_gpu_set_model_map(map, bytes) && ds4_gpu_ane_set_count(2);
-    const int hp = ok ? ds4_gpu_ane_create(K, N, R, SLOTS) : -1;
+    const int hp = ok ? ds4_gpu_ane_create(K, N, R, SLOTS + 2) : -1;
     const int hj = ok ? ds4_gpu_ane_create(K, N - GPU_COLS, R, 1) : -1;
     const int hf = ok ? ds4_gpu_ane_create_ffn(K, F, R, SLOTS) : -1;
     if (hp < 0 || hj < 0 || hf < 0) {
@@ -108,7 +121,21 @@ int main(void) {
         ok = ds4_gpu_ane_measure(hp, s, &w);
     }
     const ds4_gpu_ane_weight wj = weight(map, bytes, 0, K, GPU_COLS);
-    ok = ok && ds4_gpu_ane_measure(hj, 0, &wj) && ds4_gpu_ane_measure_done();
+    ds4_gpu_tensor *half = ds4_gpu_tensor_alloc((uint64_t)N * K * sizeof(_Float16));
+    _Float16 *half_rows = half ? ds4_gpu_tensor_contents(half) : NULL;
+    const ds4_gpu_ane_weight hy4[] = {
+        {.map = map, .size = bytes, .offset = q6_offset, .row_bytes = Q6_BLOCK, .type = 14u},
+        {.row_bytes = K * sizeof(_Float16), .type = 1u, .tensor = half},
+    };
+    ok = ok && half_rows && ds4_gpu_ane_type_ok(14u) && ds4_gpu_ane_type_ok(8u);
+    for (uint32_t r = 0; ok && r < N; r++) {
+        float row[K];
+        ok = ds4_dequant_row(14u, m + q6_offset + r * Q6_BLOCK, row, K);
+        for (uint32_t i = 0; ok && i < K; i++) half_rows[r * K + i] = (_Float16)row[i];
+    }
+    ok = ok && ds4_gpu_ane_measure(hj, 0, &wj) &&
+         ds4_gpu_ane_measure(hp, SLOTS, &hy4[0]) && ds4_gpu_ane_measure(hp, SLOTS + 1, &hy4[1]) &&
+         ds4_gpu_ane_measure_done();
 
     /* projections: both layers through one surface, 1024 and 700 rows */
     const uint32_t rows[2] = { R, 700 };
@@ -195,7 +222,22 @@ int main(void) {
         ds4_gpu_tensor_free(out1);
     }
 
-    /* the tenth evaluation returns non-finite rows: settle reports it */
+    if (ok) {
+        const uint32_t T = 256;
+        for (uint32_t i = 0; i < N * K; i++) wp[i] = (float)half_rows[i];
+        matmul(ref, x, wp, T, K, N);
+        for (uint32_t i = 0; ok && i < 2; i++) {
+            const uint32_t slot = SLOTS + i;
+            ok = ds4_gpu_begin_commands() && ds4_gpu_ane_stage(hp, slot, 0, &hy4[i]) &&
+                 ds4_gpu_ane_pack(hp, xt, T) && ds4_gpu_ane_eval(hp, slot, hp, T) &&
+                 ds4_gpu_ane_unpack(hp, slot, out, T, N, 0, NULL, 0);
+            ok = ds4_gpu_end_commands() && ok && ds4_gpu_ane_settle() &&
+                 ds4_gpu_tensor_read(out, 0, y, (uint64_t)T * N * sizeof(float)) &&
+                 close_enough(i ? "ANE fp16 tensor weight" : "ANE native Hy4 Q6_K weight", y, ref, (uint64_t)T * N);
+        }
+    }
+
+    /* The twelfth evaluation returns non-finite rows, which settle reports. */
     if (ok) {
         const ds4_gpu_ane_weight w = weight(map, bytes, 0, K, 0);
         ok = ds4_gpu_begin_commands() && ds4_gpu_ane_stage(hp, 0, 0, &w) && ds4_gpu_ane_pack(hp, xt, 512) &&
@@ -207,6 +249,7 @@ int main(void) {
         }
         if (ok) printf("PASS non-finite ANE rows stop the Neural Engine\n");
     }
+    ds4_gpu_tensor_free(half);
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(part);
     ds4_gpu_cleanup();
     free(map); free(wp); free(wf); free(x); free(y); free(ref); free(g); free(u);

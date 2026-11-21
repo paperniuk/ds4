@@ -1,7 +1,9 @@
 #include "ds4_hy4_metal.h"
+#include "ds4_hy4_ane_schedule.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 enum { HEADS = 32, LATENT = 512, KV = 576, CTX = 2112 };
 
@@ -73,7 +75,46 @@ static int test_expert_mid_r4(void) {
     return ok;
 }
 
-int main(void) {
+static int test_ane_schedule(void) {
+    const struct { uint32_t remaining, cap, a, b; } cases[] = {
+        {3000, 512, 512, 512}, {900, 512, 512, 388}, {768, 512, 512, 256},
+        {767, 512, 384, 383}, {512, 512, 256, 256}, {511, 512, 511, 0},
+        {1200, 128, 128, 0}, {1200, 1024, 600, 600},
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint32_t a;
+        const uint32_t b = hy4_ane_pair_rows(cases[i].remaining, cases[i].cap, &a);
+        if (a != cases[i].a || b != cases[i].b) {
+            fprintf(stderr, "Hy4 ANE pair for %u rows with cap %u gave %u + %u\n",
+                    cases[i].remaining, cases[i].cap, a, b);
+            return 0;
+        }
+    }
+    /* Compare snapshot sizing with the actual slots overwritten after wrap
+     * and after writing more than one ring, including a short prefix. */
+    const uint32_t ring = 1023;
+    const uint32_t pos[] = {64, 511, 1022, 2049};
+    const uint32_t rows[] = {512, 600, 1024, 2048};
+    for (unsigned p = 0; p < sizeof(pos) / sizeof(pos[0]); p++) {
+        const uint32_t live = pos[p] < 511 ? pos[p] : 511;
+        for (unsigned r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+            bool written[1023] = {0};
+            for (uint32_t i = 0; i < rows[r]; i++) written[(pos[p] + i) % ring] = true;
+            const uint32_t saved = hy4_ane_ring_overlap(live, ring, rows[r]);
+            for (uint32_t i = 0; i < live; i++) {
+                if (written[(pos[p] - live + i) % ring] == (i < saved)) continue;
+                fprintf(stderr, "Hy4 ANE snapshot mismatch at pos %u for %u rows\n", pos[p], rows[r]);
+                return 0;
+            }
+        }
+    }
+    puts("Hy4 ANE chunk pairing and rolling-cache snapshot coverage passed");
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    if (!test_ane_schedule()) return 1;
+    if (argc == 2 && strcmp(argv[1], "--host-only") == 0) return 0;
     if (!ds4_gpu_init()) return 1;
     if (!test_expert_mid_r4()) return 1;
     ds4_gpu_tensor *z = random_tensor(HEADS * LATENT, false);

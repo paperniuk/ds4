@@ -55594,6 +55594,36 @@ int ds4_gpu_ane_use_set(int s) {
     return 1;
 }
 
+void ds4_gpu_ane_discard_setup(void) {
+    if (g_ane.evals) return;
+    @autoreleasepool {
+        g_ane.measure_cb = nil;
+        // Include the partially constructed program after a failed create.
+        for (int h = 0; h <= g_ane.n_prog && h < DS4_ANE_MAX_PROGS; h++) {
+            ds4_ane_prog *p = &g_ane.prog[h];
+            p->model = nil;
+            p->scales = nil;
+            for (uint32_t i = 0; i < 8; i++) {
+                p->proc_id[i] = nil;
+                p->proc_in[i] = p->proc_out[i] = p->proc_names[i] = nil;
+            }
+            for (int s = 0; s < ds4_ane_n_sets(); s++) {
+                ds4_ane_surface *surfaces[] = { &p->x[s], &p->y[s], &p->w[s][0], &p->w[s][1], &p->w[s][2] };
+                p->done_ev[s] = nil;
+                for (size_t i = 0; i < sizeof(surfaces) / sizeof(surfaces[0]); i++) {
+                    ds4_ane_surface *surface = surfaces[i];
+                    surface->buffer = nil;
+                    surface->object = nil;
+                    if (surface->surface) CFRelease(surface->surface);
+                    surface->surface = NULL;
+                }
+            }
+            p->kind = 0;
+        }
+        g_ane.n_prog = g_ane.cur = 0;
+    }
+}
+
 /* A projection K -> N over R token rows with int8 weight rows, whose row
  * scales (n_slots sets of N) the unpack applies. */
 int ds4_gpu_ane_create(uint32_t K, uint32_t N, uint32_t R, uint32_t n_slots) {
@@ -55725,9 +55755,18 @@ static int ds4_ane_encode_stage(id<MTLCommandBuffer> cb, uint32_t mode, const ds
         if (ds4_ane_stage_kinds[i].type == wt->type) name = ds4_ane_stage_kinds[i].kernel;
     id<MTLComputePipelineState> pipeline = name ? ds4_gpu_get_pipeline(name) : nil;
     if (!pipeline || K % 16u || wt->row_bytes > UINT32_MAX) return 0;
+    const uint64_t offset = wt->offset + (uint64_t)wt->r0 * wt->row_bytes;
+    const uint64_t bytes = (uint64_t)rows * wt->row_bytes;
     uint64_t inner = 0;
-    id<MTLBuffer> wb = ds4_gpu_wrap_model_range(wt->map, wt->size, wt->offset + (uint64_t)wt->r0 * wt->row_bytes,
-                                                (uint64_t)rows * wt->row_bytes, &inner);
+    id<MTLBuffer> wb;
+    if (wt->tensor) {
+        const uint64_t size = ds4_gpu_tensor_bytes(wt->tensor);
+        if (offset > size || bytes > size - offset) return 0;
+        inner = ds4_gpu_tensor_offset(wt->tensor) + offset;
+        wb = ds4_gpu_tensor_buffer(wt->tensor);
+    } else {
+        wb = ds4_gpu_wrap_model_range(wt->map, wt->size, offset, bytes, &inner);
+    }
     if (!wb) return 0;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     [enc setComputePipelineState:pipeline];

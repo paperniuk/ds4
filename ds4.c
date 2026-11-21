@@ -61754,7 +61754,7 @@ static uint32_t qwen4_ane_split(const char *name, uint32_t def, uint32_t N) {
 static ds4_gpu_ane_weight qwen4_ane_weight(const ds4_model *m, const ds4_tensor *t, uint32_t r0) {
     uint64_t rb = 0;
     if (!ds4_quant_row_bytes(t->type, (uint32_t)t->dim[0], &rb)) rb = 0;
-    return (ds4_gpu_ane_weight){ m->map, m->size, t->abs_offset, rb, t->type, r0 };
+    return (ds4_gpu_ane_weight){ m->map, m->size, t->abs_offset, rb, t->type, r0, NULL };
 }
 
 static bool qwen4_ane_measure(int h, uint32_t slot, const ds4_model *m, const ds4_tensor *t, uint32_t r0) {
@@ -75976,6 +75976,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     if (e->hy4->draft)
                         fprintf(stderr, "ds4: Hy4 DFly2 enabled for greedy decoding, up to %u proposals\n",
                                 e->hy4->draft->rows - 1);
+                    hy4_ane_open(e->hy4, &e->model, hy4_prefill_cap(HY4_CONTEXT, e->prefill_chunk));
                     *out = e;
                     return 0;
                 }
@@ -78272,6 +78273,7 @@ void ds4_engine_close(ds4_engine *e) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (e->hy4) {
         if (e->hy4->fd >= 0) close(e->hy4->fd);
+        hy4_ane_close(e->hy4);
         hy4_draft_weights_free(e->hy4->draft);
         free(e->hy4);
     }
@@ -81103,14 +81105,18 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            uint32_t rows = (uint32_t)prompt->len - pos;
-            if (rows > s->prefill_cap) rows = s->prefill_cap;
-            float *logits = pos + rows == (uint32_t)prompt->len ? s->logits : NULL;
-            if (!hy4_forward(s->hy4_graph, s->engine, prompt->v, pos, rows, logits)) {
+            const uint32_t remaining = (uint32_t)prompt->len - pos;
+            uint32_t rows = remaining < s->prefill_cap ? remaining : s->prefill_cap;
+            const uint32_t second = s->engine->hy4->ane ?
+                hy4_ane_pair_rows(remaining, s->prefill_cap, &rows) : 0;
+            float *logits = rows + second == remaining ? s->logits : NULL;
+            const bool ok = second ? hy4_forward_pair(s->hy4_graph, s->engine, prompt->v, pos, rows, second, logits) :
+                                     hy4_forward(s->hy4_graph, s->engine, prompt->v, pos, rows, logits);
+            if (!ok) {
                 snprintf(err, errlen, "Hy4 Flash prefill failed at token %u", pos);
                 return 1;
             }
-            pos += rows;
+            pos += rows + second;
             ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
         }
         if (prompt != &s->checkpoint) ds4_tokens_copy(&s->checkpoint, prompt);

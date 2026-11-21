@@ -1,19 +1,24 @@
 /* Hy4 Flash Metal graph. SwiGLU, weight projections and expert down/reduce
  * use the same DS4 quantized primitives as the Qwen graph. */
 #include "ds4_hy4_metal.h"
+#include "ds4_hy4_ane.inc"
 
 /* Per-token scratch for the configured Hy4 prefill chunk. Each expert can
  * appear once per token, so the MoE lists need one entry per token per expert. */
-#define HY4_SCRATCH_ROWS(X) \
+#define HY4_PIPE_ROWS(X) \
     X(token_ids, 1, int32_t) \
     X(engram_valid, 1, int32_t) \
     X(streams, 4 * HY4_DIM, float) \
-    X(flat_norm, 4 * HY4_DIM, float) \
-    X(mix, 8, float) \
     X(post, 4, float) \
     X(norm, HY4_DIM, float) \
     X(branch, HY4_DIM, float) \
     X(shared, HY4_DIM, float) \
+    X(engram, HY4_ENGRAM_LAYERS * HY4_LATENT, float)
+
+#define HY4_SCRATCH_ROWS(X) \
+    HY4_PIPE_ROWS(X) \
+    X(flat_norm, 4 * HY4_DIM, float) \
+    X(mix, 8, float) \
     X(qa, 1024, float) \
     X(q, 64 * 256, float) \
     X(kv, HY4_KV, float) \
@@ -34,8 +39,7 @@
     X(expert_probs, HY4_ACTIVE, float) \
     X(latent, HY4_LATENT, float) \
     X(expert_mid, HY4_ACTIVE * HY4_LATENT, float) \
-    X(expert_down, HY4_ACTIVE * HY4_LATENT, float) \
-    X(engram, HY4_ENGRAM_LAYERS * HY4_LATENT, float)
+    X(expert_down, HY4_ACTIVE * HY4_LATENT, float)
 
 typedef struct {
     ds4_gpu_tensor *kv, *pool, *pending;
@@ -56,17 +60,25 @@ static void hy4_draft_reset(hy4_draft_graph *d) {
     d->single_sec = d->verify_sec_per_token = 0;
 }
 
+#define HY4_FIELD(name, columns, type) ds4_gpu_tensor *name;
+typedef struct {
+    HY4_PIPE_ROWS(HY4_FIELD)
+    ds4_gpu_tensor *engram_layer[HY4_ENGRAM_LAYERS];
+    ds4_gpu_tensor *saved_cache;
+    int set;
+} hy4_pipe;
+
 typedef struct {
     hy4_cache layer[HY4_LAYERS];
     ds4_gpu_tensor *scores, *attention_partials, *logits, *expert_counts;
     ds4_gpu_tensor *engram_layer[HY4_ENGRAM_LAYERS];
-#define HY4_FIELD(name, columns, type) ds4_gpu_tensor *name;
     HY4_SCRATCH_ROWS(HY4_FIELD)
 #undef HY4_FIELD
     float *engram_staging;
     uint32_t cap, ctx, ring, pending_ring;
     bool decode_attention;
     hy4_draft_graph *draft;
+    hy4_pipe *pipe;
 } ds4_hy4_graph;
 
 static uint32_t hy4_prefill_cap(uint32_t ctx, uint32_t requested) {
@@ -120,6 +132,16 @@ static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested) {
     return m;
 }
 
+static void hy4_pipe_free(hy4_pipe *p) {
+    if (!p) return;
+    for (unsigned i = 0; i < HY4_ENGRAM_LAYERS; i++) ds4_gpu_tensor_free(p->engram_layer[i]);
+#define HY4_FREE(name, columns, type) ds4_gpu_tensor_free(p->name);
+    HY4_PIPE_ROWS(HY4_FREE)
+#undef HY4_FREE
+    ds4_gpu_tensor_free(p->saved_cache);
+    free(p);
+}
+
 static void hy4_graph_free(ds4_hy4_graph *g) {
     if (!g) return;
     hy4_draft_graph *d = g->draft;
@@ -150,6 +172,7 @@ static void hy4_graph_free(ds4_hy4_graph *g) {
     HY4_SCRATCH_ROWS(HY4_FREE)
 #undef HY4_FREE
     free(g->engram_staging);
+    hy4_pipe_free(g->pipe);
     free(g);
 }
 
@@ -262,6 +285,18 @@ static bool hy4_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
                                              w->type, n, w->dim[0], w->dim[1]);
     return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset,
                                        w->type, w->dim[0], w->dim[1], in, n);
+}
+
+static bool hy4_project(const ds4_model *m, const hy4_ane_op *ane, hy4_ane_projection id,
+                        ds4_gpu_tensor *out, const ds4_tensor *w, const ds4_gpu_tensor *in, uint32_t n) {
+    return hy4_ane_has(ane, id) ? hy4_ane_join(ane, id, out, n, w->dim[1]) : hy4_mm(m, out, w, in, n);
+}
+
+/* Consume the input now, while its scratch still belongs to this chunk.
+ * For an ANE projection the output stays on the surface until the join. */
+static bool hy4_project_deferred(const ds4_model *m, const hy4_ane_op *ane, hy4_ane_projection id,
+                                  ds4_gpu_tensor *out, const ds4_tensor *w, const ds4_gpu_tensor *in, uint32_t n) {
+    return hy4_ane_has(ane, id) ? hy4_ane_submit(ane, in, n, &id, 1) : hy4_mm(m, out, w, in, n);
 }
 
 /* Prefill MLA head projections. Other weight formats retain the row dot. */
@@ -440,10 +475,10 @@ static bool hy4_engram_apply(ds4_hy4_graph *g, const ds4_model *m, const hy4_lay
 }
 
 static bool hy4_index(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
-                      hy4_cache *c, uint32_t pos, uint32_t n) {
+                      hy4_cache *c, uint32_t pos, uint32_t n, const hy4_ane_op *ane) {
     if (!c->pool) return true;
     ds4_hy4_args a = {.rows = n, .pos = pos, .capacity = g->pending_ring, .theta = 1e7f};
-    if (!hy4_mm(m, g->index_k, l->index_k, g->norm, n) ||
+    if (!hy4_project(m, ane, HY4_ANE_INDEX_K, g->index_k, l->index_k, g->norm, n) ||
         !hy4_norm(m, g->index_k, l->index_norm, g->index_k, n) ||
         !hy4_mm(m, g->pool_v, l->pool_v, g->index_k, n) ||
         !hy4_mm(m, g->pool_gate, l->pool_gate, g->index_k, n) ||
@@ -457,26 +492,44 @@ static bool hy4_index(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weig
     a.groups = (pos + n - 1) / 4;
     a.heads = 16;
     a.width = 128;
-    return hy4_mm(m, g->index_q, l->index_q, g->qa, n) &&
+    return hy4_project(m, ane, HY4_ANE_INDEX_Q, g->index_q, l->index_q, g->qa, n) &&
            HY4_OP("rope", a, 16, n, 1, 32, HY4_T(g->index_q)) &&
-           hy4_mm(m, g->index_w, l->index_w, g->norm, n) &&
+           hy4_project(m, ane, HY4_ANE_INDEX_W, g->index_w, l->index_w, g->norm, n) &&
            HY4_OP("scores", a, a.groups, n, 1, 32, HY4_T(c->pool), HY4_T(g->index_q),
                   HY4_T(g->index_w), HY4_T(g->scores)) &&
            ds4_gpu_indexer_topk_tensor(g->selected, g->scores, a.groups, n, HY4_HIST_GROUPS);
 }
 
+static bool hy4_attention_front(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
+                                uint32_t layer, uint32_t pos, uint32_t n, const hy4_ane_op *ane) {
+    const bool pool = g->layer[layer].pool != NULL;
+    const hy4_ane_projection ids[] = {HY4_ANE_QA, HY4_ANE_KV, HY4_ANE_GATE, HY4_ANE_INDEX_K, HY4_ANE_INDEX_W};
+    return (!l->engram_kv || hy4_engram_apply(g, m, l, layer, n)) &&
+           hy4_hc(g, m, &l->attn_hc, g->streams, n) &&
+           hy4_norm(m, g->norm, l->attn_norm, g->norm, n) &&
+           hy4_ane_submit(ane, g->norm, n, ids, !pool ? 3 : pos + n <= 2048 ? 4 : 5);
+}
+
+static bool hy4_attention_queries(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
+                                  uint32_t pos, uint32_t n, const hy4_ane_op *ane) {
+    const hy4_ane_projection ids[] = {HY4_ANE_QB, HY4_ANE_INDEX_Q};
+    return hy4_project(m, ane, HY4_ANE_QA, g->qa, l->qa, g->norm, n) &&
+           hy4_norm(m, g->qa, l->qa_norm, g->qa, n) &&
+           hy4_ane_submit(ane, g->qa, n, ids, pos + n > 2048 ? 2 : 1);
+}
+
 static bool hy4_attention(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
-                          uint32_t layer, uint32_t pos, uint32_t n) {
+                          uint32_t layer, uint32_t pos, uint32_t n, const hy4_ane_op *ane) {
     const bool sparse = hy4_sparse(layer);
     const uint32_t heads = sparse ? 32 : 64;
     hy4_cache *c = &g->layer[layer];
     ds4_hy4_args a = {.rows = n, .pos = pos, .heads = heads, .width = 256,
                        .capacity = sparse ? g->ctx : g->ring, .theta = sparse ? 1e7f : 1e4f};
-    if (!hy4_mm(m, g->qa, l->qa, g->norm, n) || !hy4_norm(m, g->qa, l->qa_norm, g->qa, n) ||
-        !hy4_mm(m, g->q, l->qb, g->qa, n) || !hy4_mm(m, g->kv, l->kv, g->norm, n) ||
+    if (!hy4_project(m, ane, HY4_ANE_QB, g->q, l->qb, g->qa, n) ||
+        !hy4_project(m, ane, HY4_ANE_KV, g->kv, l->kv, g->norm, n) ||
         !HY4_OP("rope", a, heads, n, 1, 32, HY4_T(g->q)) ||
         !HY4_OP("store", a, n, 1, 1, 32, HY4_T(g->kv), HY4_W(l->kv_norm), HY4_T(c->kv)) ||
-        (sparse && !hy4_index(g, m, l, c, pos, n))) return false;
+        (sparse && !hy4_index(g, m, l, c, pos, n, ane))) return false;
     a.width = 192;
     if (!hy4_head_mm(m, g->absorbed, l->kb, g->q, heads, n))
         return false;
@@ -500,19 +553,26 @@ static bool hy4_attention(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_
     if (!hy4_head_mm(m, g->q, l->vb, g->attended, heads, n))
         return false;
     a.width = heads * 256;
-    return hy4_mm(m, g->gate, l->attn_gate, g->norm, n) &&
+    return hy4_project(m, ane, HY4_ANE_GATE, g->gate, l->attn_gate, g->norm, n) &&
            HY4_OP("gate", a, (n * a.width + 255) / 256, 1, 1, 256, HY4_T(g->q), HY4_T(g->gate)) &&
-           hy4_mm(m, g->branch, l->attn_out, g->q, n) &&
-           hy4_norm(m, g->branch, l->attn_post, g->branch, n);
+           hy4_project_deferred(m, ane, HY4_ANE_ATTN_OUT, g->branch, l->attn_out, g->q, n);
 }
 
-static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l, uint32_t n) {
-    const hy4_ffn_weights *f = &l->ffn;
-    if (!hy4_mm(m, g->gate, f->gate, g->norm, n) || !hy4_mm(m, g->ff_up, f->up, g->norm, n) ||
-        !ds4_gpu_swiglu_tensor(g->ff_mid, g->gate, g->ff_up, f->gate->dim[1] * n, 0, 1) ||
-        !hy4_mm(m, g->shared, f->down, g->ff_mid, n)) return false;
+static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
+                    uint32_t n, const hy4_ane_op *ane) {
+    const hy4_ane_projection ids[] = {HY4_ANE_LATENT_IN, HY4_ANE_SHARED};
+    if ((hy4_ane_has(ane, HY4_ANE_ATTN_OUT) && !hy4_ane_join(ane, HY4_ANE_ATTN_OUT, g->branch, n, HY4_DIM)) ||
+        !hy4_norm(m, g->branch, l->attn_post, g->branch, n) || !hy4_hc_add(g, m, n) ||
+        !hy4_hc(g, m, &l->ffn_hc, g->streams, n) || !hy4_norm(m, g->norm, l->ffn_norm, g->norm, n) ||
+        !hy4_ane_submit(ane, g->norm, n, ids, 2)) return false;
 
-    if (!l->router) return hy4_norm(m, g->branch, l->ffn_post, g->shared, n);
+    const hy4_ffn_weights *f = &l->ffn;
+    if (!hy4_ane_has(ane, HY4_ANE_SHARED) &&
+        (!hy4_mm(m, g->gate, f->gate, g->norm, n) || !hy4_mm(m, g->ff_up, f->up, g->norm, n) ||
+         !ds4_gpu_swiglu_tensor(g->ff_mid, g->gate, g->ff_up, f->gate->dim[1] * n, 0, 1) ||
+         !hy4_mm(m, g->shared, f->down, g->ff_mid, n))) return false;
+
+    if (!l->router) return true;
     const hy4_ffn_weights *e = &l->experts;
     const char *mid_r4 = getenv("DS4_HY4_DECODE_EXPERT_MID_R4");
     const ds4_hy4_args a = {.rows = n, .type = e->gate->type,
@@ -520,7 +580,7 @@ static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weight
     if (!hy4_mm(m, g->router, l->router, g->norm, n) ||
         !HY4_OP("router", a, n, 1, 1, 32, HY4_T(g->router), HY4_W(l->router_bias),
                  HY4_T(g->experts), HY4_T(g->expert_probs)) ||
-        !hy4_mm(m, g->latent, l->latent_in, g->norm, n)) return false;
+        !hy4_project(m, ane, HY4_ANE_LATENT_IN, g->latent, l->latent_in, g->norm, n)) return false;
     const bool scalar = getenv("DS4_HY4_SCALAR_EXPERTS") != NULL;
     const bool tiled = n >= 32 && !scalar;
     const bool codebook = !scalar && getenv("DS4_HY4_GENERIC_DECODE") == NULL;
@@ -556,60 +616,78 @@ static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weight
     return experts_ok &&
            (fused_down || ds4_gpu_qwen4_moe_reduce_tensor(g->latent, g->expert_down, g->expert_probs,
                                            NULL, NULL, NULL, NULL, n, HY4_ACTIVE, HY4_ACTIVE, HY4_LATENT, 0)) &&
-           hy4_mm(m, g->branch, l->latent_out, g->latent, n) &&
-           ds4_gpu_add_tensor(g->branch, g->branch, g->shared, n * HY4_DIM) &&
-           hy4_norm(m, g->branch, l->ffn_post, g->branch, n);
+           hy4_project_deferred(m, ane, HY4_ANE_LATENT_OUT, g->branch, l->latent_out, g->latent, n);
+}
+
+static bool hy4_ffn_finish(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weights *l,
+                           uint32_t n, const hy4_ane_op *ane) {
+    if (l->router &&
+        ((hy4_ane_has(ane, HY4_ANE_SHARED) && !hy4_ane_join(ane, HY4_ANE_SHARED, g->shared, n, HY4_DIM)) ||
+         (hy4_ane_has(ane, HY4_ANE_LATENT_OUT) && !hy4_ane_join(ane, HY4_ANE_LATENT_OUT, g->branch, n, HY4_DIM)) ||
+         !ds4_gpu_add_tensor(g->branch, g->branch, g->shared, n * HY4_DIM))) return false;
+    return hy4_norm(m, g->branch, l->ffn_post, l->router ? g->branch : g->shared, n) && hy4_hc_add(g, m, n);
+}
+
+static bool hy4_stage(ds4_hy4_graph *g, const ds4_model *m, const ds4_hy4_model *h,
+                       const int *history, uint32_t pos, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++)
+        if (history[pos+i] < 0 || history[pos+i] >= HY4_VOCAB) return false;
+    return hy4_engram_stage(g, m, h, history, pos, n) &&
+           ds4_gpu_tensor_write(g->token_ids, 0, history + pos, (uint64_t)n * sizeof(int));
+}
+
+static bool hy4_embed(ds4_hy4_graph *g, const ds4_model *m, const ds4_hy4_model *h, uint32_t n) {
+    const ds4_hy4_args a = {.rows = n};
+    return ds4_gpu_embed_tokens_quant_tensor(g->norm, g->token_ids, m->map, m->size,
+                                              h->embedding->abs_offset, h->embedding->type,
+                                              HY4_VOCAB, n, HY4_DIM) &&
+           HY4_OP("repeat", a, 4 * HY4_DIM / 256, n, 1, 256, HY4_T(g->norm), HY4_T(g->streams));
+}
+
+static bool hy4_draft_capture(ds4_hy4_graph *g, const ds4_hy4_model *h, uint32_t layer,
+                              uint32_t end, uint32_t n, uint32_t output_rows, uint32_t *source) {
+    if (!g->draft || *source >= HY4_DFLY_LAYERS || h->draft->target[*source] != layer) return true;
+    const uint32_t i = (*source)++;
+    const uint64_t stride = HY4_HIST_GROUPS * sizeof(int32_t);
+    return !output_rows || end <= 2048 ||
+           ds4_gpu_tensor_copy(g->draft->indices[i], 0, g->selected,
+                               (n - output_rows) * stride, output_rows * stride);
+}
+
+static bool hy4_logits(ds4_hy4_graph *g, const ds4_model *m, const ds4_hy4_model *h,
+                        uint32_t n, uint32_t output_rows, ds4_gpu_tensor *output) {
+    const uint64_t stride = 4 * HY4_DIM * sizeof(float);
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(g->streams, (n - output_rows) * stride, output_rows * stride);
+    bool ok = last && hy4_hc(g, m, &h->head, last, output_rows) &&
+              hy4_norm(m, g->norm, h->norm, g->norm, output_rows);
+    if (ok && g->draft)
+        ok = ds4_gpu_tensor_copy(g->draft->hidden, 0, g->norm, 0, output_rows * HY4_DIM * sizeof(float));
+    ok = ok && hy4_mm(m, output, h->output, g->norm, output_rows);
+    ds4_gpu_tensor_free(last);
+    return ok;
 }
 
 static bool hy4_forward_rows(ds4_hy4_graph *g, const ds4_engine *engine, const int *history,
                              uint32_t pos, uint32_t n, uint32_t output_rows, float *logits) {
     const ds4_model *m = &engine->model;
     const ds4_hy4_model *h = engine->hy4;
-    const ds4_hy4_args a = {.rows = n};
     if (!n || n > g->cap || pos > g->ctx || n > g->ctx - pos || output_rows > n ||
         (output_rows > 1 && (!g->draft || output_rows > HY4_DFLY_ROWS))) return false;
     if (g->draft) g->draft->pos = 0;
-    for (uint32_t i = 0; i < n; i++)
-        if (history[pos+i] < 0 || history[pos+i] >= HY4_VOCAB) return false;
-    if (!hy4_engram_stage(g, m, h, history, pos, n) ||
-        !ds4_gpu_tensor_write(g->token_ids, 0, history + pos, (uint64_t)n * sizeof(int)) ||
-        !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_embed_tokens_quant_tensor(g->norm, g->token_ids, m->map, m->size,
-                                                  h->embedding->abs_offset, h->embedding->type,
-                                                  HY4_VOCAB, n, HY4_DIM) &&
-              HY4_OP("repeat", a, 4 * HY4_DIM / 256, n, 1, 256, HY4_T(g->norm), HY4_T(g->streams));
+    if (!hy4_stage(g, m, h, history, pos, n) || !ds4_gpu_begin_commands()) return false;
+    bool ok = hy4_embed(g, m, h, n);
     uint32_t source = 0;
     for (uint32_t i = 0; ok && i < HY4_LAYERS; i++) {
         const hy4_layer_weights *l = &h->layer[i];
-        if (l->engram_kv) ok = hy4_engram_apply(g, m, l, i, n);
-        ok = ok && hy4_hc(g, m, &l->attn_hc, g->streams, n) &&
-             hy4_norm(m, g->norm, l->attn_norm, g->norm, n) &&
-             hy4_attention(g, m, l, i, pos, n);
-        if (g->draft && source < HY4_DFLY_LAYERS && h->draft->target[source] == i) {
-            const uint64_t stride = HY4_HIST_GROUPS * sizeof(int32_t);
-            if (ok && output_rows && pos + n > 2048)
-                ok = ds4_gpu_tensor_copy(g->draft->indices[source], 0, g->selected,
-                                          (n - output_rows) * stride, output_rows * stride);
-            source++;
-        }
-        ok = ok && hy4_hc_add(g, m, n) &&
-             hy4_hc(g, m, &l->ffn_hc, g->streams, n) &&
-             hy4_norm(m, g->norm, l->ffn_norm, g->norm, n) &&
-             hy4_ffn(g, m, l, n) && hy4_hc_add(g, m, n);
+        ok = hy4_attention_front(g, m, l, i, pos, n, NULL) &&
+             hy4_attention_queries(g, m, l, pos, n, NULL) &&
+             hy4_attention(g, m, l, i, pos, n, NULL) &&
+             hy4_draft_capture(g, h, i, pos + n, n, output_rows, &source) &&
+             hy4_ffn(g, m, l, n, NULL) && hy4_ffn_finish(g, m, l, n, NULL);
     }
-    ds4_gpu_tensor *last = NULL;
     ds4_gpu_tensor *output = output_rows > 1 ? g->draft->logits : g->logits;
-    if (ok && output_rows) {
-        const uint64_t bytes = 4 * HY4_DIM * sizeof(float);
-        last = ds4_gpu_tensor_view(g->streams, (n - output_rows) * bytes, output_rows * bytes);
-        ok = last && hy4_hc(g, m, &h->head, last, output_rows) &&
-             hy4_norm(m, g->norm, h->norm, g->norm, output_rows);
-        if (ok && g->draft)
-            ok = ds4_gpu_tensor_copy(g->draft->hidden, 0, g->norm, 0, output_rows * HY4_DIM * sizeof(float));
-        ok = ok && hy4_mm(m, output, h->output, g->norm, output_rows);
-    }
+    if (ok && output_rows) ok = hy4_logits(g, m, h, n, output_rows, output);
     const bool finished = ds4_gpu_end_commands();
-    ds4_gpu_tensor_free(last);
     ok = ok && finished &&
          (!output_rows || ds4_gpu_tensor_read(output, 0, logits, (uint64_t)output_rows * HY4_VOCAB * sizeof(float)));
     if (ok && output_rows && g->draft) {
@@ -622,6 +700,165 @@ static bool hy4_forward_rows(ds4_hy4_graph *g, const ds4_engine *engine, const i
 static bool hy4_forward(ds4_hy4_graph *g, const ds4_engine *engine, const int *history,
                         uint32_t pos, uint32_t n, float *logits) {
     return hy4_forward_rows(g, engine, history, pos, n, logits ? 1 : 0, logits);
+}
+
+static bool hy4_pipe_alloc(ds4_hy4_graph *g) {
+    if (g->pipe) return true;
+    hy4_pipe *p = calloc(1, sizeof(*p));
+    if (!p) return false;
+#define HY4_ALLOC(name, columns, type) \
+    p->name = ds4_gpu_tensor_alloc((uint64_t)g->cap * (columns) * sizeof(type)); \
+    if (!p->name) goto fail;
+    HY4_PIPE_ROWS(HY4_ALLOC)
+#undef HY4_ALLOC
+    const uint64_t table_bytes = (uint64_t)g->cap * HY4_LATENT * sizeof(float);
+    for (unsigned i = 0; i < HY4_ENGRAM_LAYERS; i++) {
+        p->engram_layer[i] = ds4_gpu_tensor_view(p->engram, i * table_bytes, table_bytes);
+        if (!p->engram_layer[i]) goto fail;
+    }
+    const uint64_t saved_kv = (uint64_t)(HY4_WINDOW - 1) * HY4_KV * sizeof(uint16_t);
+    const uint64_t saved_pending = 3 * 256 * sizeof(float);
+    uint64_t bytes = 0;
+    for (unsigned i = 0; i < HY4_LAYERS; i++)
+        bytes += hy4_sparse(i) ? (g->layer[i].pending ? saved_pending : 0) : saved_kv;
+    p->saved_cache = ds4_gpu_tensor_alloc(bytes);
+    if (!p->saved_cache) goto fail;
+    for (unsigned i = 0; i < HY4_LAYERS; i++) {
+        hy4_cache *c = &g->layer[i];
+        (void)ds4_gpu_tensor_keep_resident(c->kv);
+        if (c->pool) (void)ds4_gpu_tensor_keep_resident(c->pool);
+        if (c->pending) (void)ds4_gpu_tensor_keep_resident(c->pending);
+    }
+    g->pipe = p;
+    return true;
+fail:
+    hy4_pipe_free(p);
+    return false;
+}
+
+/* The graph owns chunk A's live scratch on entry and exit. Only values
+ * crossing phases are swapped, so both chunks reuse the large work buffers. */
+static bool hy4_pipe_enter(ds4_hy4_graph *g, int set) {
+    hy4_pipe *p = g->pipe;
+    if (!ds4_gpu_ane_use_set(set)) return false;
+    if (p->set == set) return true;
+#define HY4_SWAP(name, columns, type) { ds4_gpu_tensor *t = g->name; g->name = p->name; p->name = t; }
+    HY4_PIPE_ROWS(HY4_SWAP)
+#undef HY4_SWAP
+    for (unsigned i = 0; i < HY4_ENGRAM_LAYERS; i++) {
+        ds4_gpu_tensor *t = g->engram_layer[i];
+        g->engram_layer[i] = p->engram_layer[i];
+        p->engram_layer[i] = t;
+    }
+    p->set = set;
+    return true;
+}
+#undef HY4_PIPE_ROWS
+
+static bool hy4_pipe_copy_ring(ds4_gpu_tensor *backup, uint64_t *offset, ds4_gpu_tensor *cache,
+                               uint32_t start, uint32_t rows, uint32_t ring, uint64_t stride,
+                               bool save) {
+    while (rows) {
+        const uint32_t slot = start % ring, count = rows < ring - slot ? rows : ring - slot;
+        const uint64_t bytes = count * stride, cache_offset = slot * stride;
+        const bool ok = save ? ds4_gpu_tensor_copy(backup, *offset, cache, cache_offset, bytes) :
+                               ds4_gpu_tensor_copy(cache, cache_offset, backup, *offset, bytes);
+        if (!ok) return false;
+        *offset += bytes;
+        start += count;
+        rows -= count;
+    }
+    return true;
+}
+
+/* Sparse KV and completed index groups are append-only and replay writes
+ * them again. Windowed KV may cover part of the prefix after both chunks
+ * write, and a partial index group still needs the preceding 1–3 tokens. */
+static bool hy4_pipe_cache(ds4_hy4_graph *g, uint32_t pos, uint32_t rows, bool save) {
+    const uint32_t live = pos < HY4_WINDOW ? pos : HY4_WINDOW - 1;
+    const uint32_t kv_rows = hy4_ane_ring_overlap(live, g->ring, rows);
+    const uint32_t pending_rows = g->ctx > 2048 ? pos % 4 : 0;
+    if (!kv_rows && !pending_rows) return true;
+    if (!ds4_gpu_begin_commands()) return false;
+    uint64_t offset = 0;
+    bool ok = true;
+    for (unsigned i = 0; ok && i < HY4_LAYERS; i++) {
+        hy4_cache *c = &g->layer[i];
+        if (!hy4_sparse(i))
+            ok = hy4_pipe_copy_ring(g->pipe->saved_cache, &offset, c->kv, pos - live, kv_rows,
+                                    g->ring, HY4_KV * sizeof(uint16_t), save);
+        else if (pending_rows)
+            ok = hy4_pipe_copy_ring(g->pipe->saved_cache, &offset, c->pending, pos - pending_rows, pending_rows,
+                                    g->pending_ring, 256 * sizeof(float), save);
+    }
+    return ds4_gpu_end_commands() && ok;
+}
+
+static bool hy4_forward_pair_once(ds4_hy4_graph *g, const ds4_engine *e, const int *history,
+                                 uint32_t pos, uint32_t na, uint32_t nb, float *logits) {
+    const ds4_model *m = &e->model;
+    const ds4_hy4_model *h = e->hy4;
+    const uint32_t b = pos + na;
+    if (g->draft) g->draft->pos = 0;
+    bool ok = hy4_stage(g, m, h, history, pos, na) &&
+              hy4_pipe_enter(g, 1) && hy4_stage(g, m, h, history, b, nb);
+    if (ok && ds4_gpu_begin_commands()) {
+        ok = hy4_embed(g, m, h, nb) && hy4_pipe_enter(g, 0) && hy4_embed(g, m, h, na);
+        uint32_t source = 0;
+        for (uint32_t i = 0; ok && i < HY4_LAYERS; i++) {
+            const hy4_layer_weights *l = &h->layer[i];
+            const hy4_ane_op *ane = h->ane->layer[i];
+            /* Like the Qwen pairs, A starts this layer while B still has
+             * its previous layer's experts to run. A then writes and reads
+             * this layer's KV before B touches it. */
+            ok = hy4_pipe_enter(g, 0) && hy4_attention_front(g, m, l, i, pos, na, ane);
+            if (ok && i)
+                ok = hy4_pipe_enter(g, 1) && hy4_ffn(g, m, &h->layer[i-1], nb, h->ane->layer[i-1]);
+            ok = ok && hy4_pipe_enter(g, 0) && hy4_attention_queries(g, m, l, pos, na, ane);
+            if (ok && i)
+                ok = hy4_pipe_enter(g, 1) && hy4_ffn_finish(g, m, &h->layer[i-1], nb, h->ane->layer[i-1]);
+            ok = ok && hy4_pipe_enter(g, 1) && hy4_attention_front(g, m, l, i, b, nb, ane) &&
+                 hy4_pipe_enter(g, 0) && hy4_attention(g, m, l, i, pos, na, ane) &&
+                 hy4_pipe_enter(g, 1) && hy4_attention_queries(g, m, l, b, nb, ane) &&
+                 hy4_pipe_enter(g, 0) && hy4_ffn(g, m, l, na, ane) &&
+                 hy4_pipe_enter(g, 1) && hy4_attention(g, m, l, i, b, nb, ane) &&
+                 hy4_draft_capture(g, h, i, b + nb, nb, logits ? 1 : 0, &source) &&
+                 hy4_pipe_enter(g, 0) && hy4_ffn_finish(g, m, l, na, ane);
+        }
+        const uint32_t last = HY4_LAYERS - 1;
+        ok = ok && hy4_pipe_enter(g, 1) && hy4_ffn(g, m, &h->layer[last], nb, h->ane->layer[last]) &&
+             hy4_ffn_finish(g, m, &h->layer[last], nb, h->ane->layer[last]) &&
+             (!logits || hy4_logits(g, m, h, nb, 1, g->logits));
+        ok = ds4_gpu_end_commands() && ok;
+    } else {
+        ok = false;
+    }
+    return hy4_pipe_enter(g, 0) && ok;
+}
+
+static bool hy4_forward_pair(ds4_hy4_graph *g, const ds4_engine *e, const int *history,
+                            uint32_t pos, uint32_t na, uint32_t nb, float *logits) {
+    ds4_hy4_model *h = e->hy4;
+    const bool saved = hy4_pipe_alloc(g) && hy4_pipe_cache(g, pos, na + nb, true);
+    if (saved) {
+        const bool ok = hy4_forward_pair_once(g, e, history, pos, na, nb, logits);
+        if (ds4_gpu_ane_settle() && ok) {
+            if (logits && !ds4_gpu_tensor_read(g->logits, 0, logits, HY4_VOCAB * sizeof(float))) return false;
+            if (logits && g->draft) {
+                g->draft->pos = pos + na + nb;
+                g->draft->row = 0;
+            }
+            return true;
+        }
+    }
+    if (!ds4_gpu_ane_failed())
+        fprintf(stderr, "ds4: Hy4 ANE prefill failed; the GPU runs the prefill alone from now on\n");
+    hy4_ane_close(h);
+    const bool restored = !saved || hy4_pipe_cache(g, pos, na + nb, false);
+    hy4_pipe_free(g->pipe);
+    g->pipe = NULL;
+    return restored && hy4_forward(g, e, history, pos, na, NULL) &&
+           hy4_forward(g, e, history, pos + na, nb, logits);
 }
 
 static bool hy4_draft_embed(ds4_hy4_graph *g, const ds4_engine *e, ds4_gpu_tensor *out,

@@ -54,6 +54,8 @@ usage: dstar <command> [options]
   chat hy4               chat with the cached Hy4 Flash Maya-XS text GGUF
   serve hy4 --dfly2      enable DFly2 for API requests with temperature 0
   chat hy4 --dfly2       enable DFly2 and use greedy decoding
+  serve hy4 --ane        offload Hy4 prompt projections to the Neural Engine
+  chat hy4 --ane         offload Hy4 prompt projections to the Neural Engine
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
       --quant q2|iq3|iq3s
@@ -73,8 +75,7 @@ usage: dstar <command> [options]
                          faster on code, a little slower on prose and edits,
                          2.1 GB more memory (experimental; dstar pull --dflash)
       --no-vision        do not load the vision encoder
-      --ane              run part of the prompt processing on the Neural
-                         Engine: about 30% faster prefill, 0.9 GB more memory
+      --ane              use the Neural Engine for part of prompt processing
       --power N          keep the GPU busy N% of the time, 1..100: a cooler
                          and quieter Mac for a proportionally slower model
       NAME or FILE       serve another model instead: a GGUF path or a word
@@ -83,7 +84,7 @@ usage: dstar <command> [options]
                          from the SSD, the rest goes after --
       --dry-run          print the server command instead of running it
       -- ARGS            pass the remaining arguments to ds4-server
-  chat [--quant NAME] [--power N] [--dflash] [NAME or FILE] [-- ARGS]
+  chat [--quant NAME] [--power N] [--dflash] [--ane] [NAME or FILE] [-- ARGS]
                          interactive chat in the terminal
   doctor [--quant NAME]  check the machine, the files and the memory limit
   opencode               print the OpenCode provider block
@@ -366,6 +367,7 @@ serve_other() {
            fi ;;
     esac
     if [ "$dry" = 1 ]; then
+        if [ "${DS4_ANE:-0}" = 1 ]; then echo "export DS4_ANE=1"; fi
         echo "cd $HERE && caffeinate -i ./ds4-server $*"
         return
     fi
@@ -402,6 +404,7 @@ cmd_serve() {
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     [ -n "$model" ] || model=$(default_model) || exit 1
+    if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
     if [ "$dfly" = 1 ]; then
         local draft
         draft=$(hy4_draft_path "$model") || exit 1
@@ -465,7 +468,6 @@ cmd_serve() {
 
     export DS4_QWEN_NGRAM_GGUF=$F_SHARD2
     export DS4_QWEN4_MOE_TAILS=1
-    if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
     if [ "$dflash" = 1 ]; then export DS4_QWEN_DFLASH=$F_DFLASH; fi
     set -- --ctx "$ctx" --prefill-chunk 2048 --host "$HOST" --port "$PORT" \
         --kv-disk-dir "$kv_dir" --kv-disk-space-mb "$kv_mb" \
@@ -492,12 +494,13 @@ cmd_serve() {
 }
 
 cmd_chat() {
-    local model="" power="" dflash=0 dfly=0
+    local model="" power="" dflash=0 dfly=0 ane=0
     while :; do
         case ${1:-} in
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
             --power) [ $# -ge 2 ] || die "--power needs a value"; power=$(parse_power "$2") || exit 1; shift ;;
             --dflash) dflash=1 ;;
+            --ane) ane=1 ;;
             *) break ;;
         esac
         shift
@@ -507,11 +510,19 @@ cmd_chat() {
         ""|-*) ;;
         *) model=$(model_path "$1") || exit 1; shift ;;
     esac
-    if [ "${1:-}" = --dfly2 ]; then dfly=1; shift; fi
+    while :; do
+        case ${1:-} in
+            --dfly2) dfly=1 ;;
+            --ane) ane=1 ;;
+            *) break ;;
+        esac
+        shift
+    done
     if [ "${1:-}" = -- ]; then shift; fi
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     [ -n "$model" ] || model=$(default_model) || exit 1
+    if [ "$ane" = 1 ]; then export DS4_ANE=1; fi
     if [ "$dfly" = 1 ]; then
         local draft
         draft=$(hy4_draft_path "$model") || exit 1

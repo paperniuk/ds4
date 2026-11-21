@@ -80,6 +80,7 @@ typedef struct {
     int dump_logprobs_top_k;
     int decode_consistency_tokens;
     const char *perplexity_file_path;
+    int perplexity_prefix;
     const char *imatrix_dataset_path;
     const char *imatrix_output_path;
     int imatrix_max_prompts;
@@ -1118,9 +1119,9 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     ds4_tokenize_text(engine, text, &tokens);
     free(text);
 
-    /* Seed the graph with enough real context to stay on the normal Metal
-     * prefill path; scoring starts immediately after this fixed prefix. */
-    const int prefix_len = 32;
+    /* Score only the suffix. A longer prefix also exercises prefill
+     * paths that need multiple chunks, such as Neural Engine offload. */
+    const int prefix_len = cfg->gen.perplexity_prefix;
     if (tokens.len <= prefix_len) {
         fprintf(stderr, "ds4: --perplexity-file needs more than %d tokens\n", prefix_len);
         ds4_tokens_free(&tokens);
@@ -1952,6 +1953,7 @@ static cli_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .dump_logprobs_top_k = 20,
+            .perplexity_prefix = 32,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -2162,6 +2164,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.decode_consistency_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--perplexity-file")) {
             c.gen.perplexity_file_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--perplexity-prefix")) {
+            c.gen.perplexity_prefix = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-dataset")) {
             c.gen.imatrix_dataset_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--imatrix-out")) {

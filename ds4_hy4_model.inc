@@ -53,6 +53,7 @@ typedef struct {
     uint32_t table_type, row_bytes;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     hy4_dfly_weights *draft;
+    struct hy4_ane *ane;
 #endif
 } ds4_hy4_model;
 

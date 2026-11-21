@@ -50,8 +50,11 @@ usage: dstar <command> [options]
                          the first
   pull NAME              download another model into ./gguf (see: dstar models)
   models                 list downloadable models
-  serve hy4              serve the cached Hy4 Flash Maya-XS text GGUF
-  chat hy4               chat with the cached Hy4 Flash Maya-XS text GGUF
+  pull hy4               download Tencent Hy4 Flash (Maya-XS IQ2_XXS, 109 GB:
+                         45 GB model + 64 GB n-gram table read from the SSD)
+                         and its DFly2 drafter into ./gguf; needs 64 GB RAM
+  serve hy4              serve Hy4 Flash (text only)
+  chat hy4               chat with Hy4 Flash
   serve hy4 --dfly2      enable DFly2 for API requests with temperature 0
   chat hy4 --dfly2       enable DFly2 and use greedy decoding
   serve hy4 --ane        offload Hy4 prompt projections to the Neural Engine
@@ -184,10 +187,53 @@ other_models() {
     exec sh ./download_model.sh "$@"
 }
 
+# Hy4 Flash Maya-XS: the text GGUF (two shards, the second is the n-gram
+# table read from the SSD) and its DFly2 drafter, from the Hugging Face
+# cache when it holds them, else from ./gguf where `dstar pull hy4` puts them.
+HY4_REPO=peasantsmith/Hy4-Flash-Maya-GGUF
+HY4_PART=Hy4-Flash-Maya-XS-IQ2_XXS
+HY4_DRAFT=Hy4-Flash-Maya-XS-drafter.dfly2
+
+hy4_model_path() {
+    local hub root revision dir
+    hub=${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}
+    root=$hub/models--${HY4_REPO%%/*}--${HY4_REPO#*/}
+    for dir in "$HERE/gguf/Hy4-Flash-Maya-XS" \
+               "$root/snapshots/$(cat "$root/refs/main" 2>/dev/null)/Maya-XS"; do
+        if [ -r "$dir/$HY4_PART-00001-of-00002.gguf" ] && [ -r "$dir/$HY4_PART-00002-of-00002.gguf" ]; then
+            echo "$(cd "$dir" && pwd)/$HY4_PART-00001-of-00002.gguf"
+            return
+        fi
+    done
+    die "Hy4 Flash Maya-XS is not on disk; download it with: dstar pull hy4"
+}
+
+pull_hy4() {
+    local dir=$HERE/gguf/Hy4-Flash-Maya-XS need_gb=0 free_gb model
+    model=$( (hy4_model_path) 2>/dev/null) || model=""
+    if [ -n "$model" ] && [ "${model%/*}" != "$dir" ]; then
+        # The shards are already in the Hugging Face cache: only the drafter.
+        fetch "$HY4_REPO" "Maya-XS/$HY4_DRAFT" "${XDG_CACHE_HOME:-$HOME/.cache}/dstar/hy4/$HY4_DRAFT"
+        echo "Done. Start the server with: dstar serve hy4"
+        return
+    fi
+    mkdir -p "$dir"
+    [ -f "$dir/$HY4_PART-00001-of-00002.gguf" ] || need_gb=$(( need_gb + 46 ))
+    [ -f "$dir/$HY4_PART-00002-of-00002.gguf" ] || need_gb=$(( need_gb + 64 ))
+    [ -f "$dir/$HY4_DRAFT" ] || need_gb=$(( need_gb + 1 ))
+    free_gb=$(df -g "$dir" | awk 'NR == 2 { print $4 }')
+    [ "$free_gb" -ge "$need_gb" ] || die "the download needs about $need_gb GB, $dir has $free_gb GB free"
+    fetch "$HY4_REPO" "Maya-XS/$HY4_PART-00001-of-00002.gguf" "$dir/$HY4_PART-00001-of-00002.gguf"
+    fetch "$HY4_REPO" "Maya-XS/$HY4_PART-00002-of-00002.gguf" "$dir/$HY4_PART-00002-of-00002.gguf"
+    fetch "$HY4_REPO" "Maya-XS/$HY4_DRAFT" "$dir/$HY4_DRAFT"
+    echo "Done. Start the server with: dstar serve hy4"
+}
+
 cmd_pull() {
     local vision=1 dflash=0
     case ${1:-} in
         ""|--*) ;;
+        hy4|hy4-flash|hy4-maya-xs) pull_hy4; return ;;
         *) other_models "$@" ;;
     esac
     while [ $# -gt 0 ]; do
@@ -289,15 +335,7 @@ model_path() {
     local found n
     case "$1" in
         hy4|hy4-flash|hy4-maya-xs)
-            local hub root revision part
-            hub=${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}
-            root=$hub/models--peasantsmith--Hy4-Flash-Maya-GGUF
-            [ -r "$root/refs/main" ] || die "Maya-XS is missing from the Hugging Face cache"
-            revision=$(cat "$root/refs/main") || return 1
-            part=$root/snapshots/$revision/Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS
-            [ -r "$part-00001-of-00002.gguf" ] && [ -r "$part-00002-of-00002.gguf" ] ||
-                die "both Maya-XS IQ2_XXS GGUF shards are required"
-            echo "$(cd "$(dirname "$part")" && pwd)/$(basename "$part")-00001-of-00002.gguf"
+            hy4_model_path
             return
             ;;
     esac
@@ -314,13 +352,13 @@ model_path() {
 
 hy4_draft_path() {
     case ${1##*/} in
-        Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf) ;;
+        $HY4_PART-00001-of-00002.gguf) ;;
         *) die "--dfly2 requires the Maya-XS IQ2_XXS model" ;;
     esac
-    local filename=Hy4-Flash-Maya-XS-drafter.dfly2
+    local filename=$HY4_DRAFT
     local draft=${1%/*}/$filename
     [ -r "$draft" ] || draft=${XDG_CACHE_HOME:-$HOME/.cache}/dstar/hy4/$filename
-    [ -r "$draft" ] || die "Maya-XS DFly2 is missing; place $filename beside the GGUF or in the dstar cache"
+    [ -r "$draft" ] || die "the DFly2 drafter is missing; run: dstar pull hy4"
     echo "$draft"
 }
 

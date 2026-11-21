@@ -5,15 +5,15 @@ mostly for M1/M2, that runs **Qwen3.8-Flash-Next** on Apple Silicon Macs with
 64 GB of memory or more:
 the **full 262K context**, MTP speculative decoding and vision, as a local
 OpenAI/Anthropic compatible server for OpenCode, Claude Code, Pi or any
-other agent. The same launcher also runs **DeepSeek V4 Flash** and the other
-ds4 models, see [Other models](#other-models).
+other agent. The same launcher also runs **Tencent Hy4 Flash**, **DeepSeek V4
+Flash** and the other ds4 models, see [Other models](#other-models).
 
 Project page with the download, benchmarks and FAQ:
 **[paperniuk.com/dstar](https://paperniuk.com/dstar/)**.
 
 What it adds to stock ds4:
 
-- **The small ISTA-DASLab GSQ-RCO files.** Their weights take 35 to 51 GiB,
+- **The small ISTA-DASLab GSQ-RCO files.** Their weights take 28 to 51 GiB,
   so the model fits a 64 GB Mac with room for the whole context window.
   Stock ds4 does not open these files; its own take 42 and 70 GiB.
 - **One launcher.** `dstar serve` picks the context that fits the memory of
@@ -29,6 +29,10 @@ What it adds to stock ds4:
   the memory, so `dstar serve deepseek` streams it from the SSD: 10.35
   tokens per second on an M1 Max, against 9.4 in stock ds4. See
   [the numbers](#deepseek-v4-flash-on-a-64-gb-mac).
+- **Tencent Hy4 Flash on a 64 GB Mac.** A 220B mixture of experts with 11B
+  active per token: `dstar serve hy4` processes a prompt at 128 to 140
+  tokens per second and decodes at 24 on an M1 Max. See
+  [the numbers](#hy4-flash-on-a-64-gb-mac).
 
 Nearly all of it is the same code on every Apple Silicon chip. What is and
 what is not specific to M1 is listed in [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain).
@@ -92,7 +96,7 @@ at the end of [Which Macs gain](docs/FLASH_NEXT_FORK.md#which-macs-gain) make a 
 
 ## DeepSeek V4 Flash on a 64 GB Mac
 
-The other model measured here, `dstar pull ds4f-q2` and `dstar serve deepseek`.
+Another model measured here, `dstar pull ds4f-q2` and `dstar serve deepseek`.
 The Q2 file is 81 GiB, so on 64 GB ds4 keeps the dense weights and a cache
 of routed experts in memory and reads the rest from the SSD as tokens need
 them. Measured on an M1 Max, 32K context, greedy decoding:
@@ -112,6 +116,39 @@ tokens per second), because every drafted token pulls more experts from the
 disk, so the launcher leaves it off. And a busy performance core slows the
 GPU by up to 45%: run it on a quiet machine. With 32 GB it is not usable,
 3.6 tokens per second in a simulation.
+
+## Hy4 Flash on a 64 GB Mac
+
+Tencent's Hy4 Flash, from peasantsmith's Maya-XS IQ2_XXS GGUF, text only:
+
+```sh
+dstar pull hy4      # 109 GB: the model, the n-gram table, the DFly2 drafter
+dstar serve hy4     # or: dstar chat hy4
+```
+
+The model maps 42.7 GB, so it needs a 64 GB Mac. Its 64 GB n-gram (Engram)
+table stays on the SSD and is read a few rows per token. If the two shards
+are already in your Hugging Face cache, `dstar pull hy4` fetches only the
+0.7 GB drafter. `serve hy4` defaults to a 32K context; `--ctx` takes more.
+
+M1 Max, 32-core GPU, 64 GB:
+
+| | tokens/s |
+|---|---|
+| Prompt, 3K tokens | 128 |
+| Prompt, 3K tokens, `--ane` | 140 |
+| Prompt, 14K tokens | 121 (132 with `--ane`) |
+| Decode | 24 |
+| Decode on code, `--dfly2` | 27 (about 23.5 on prose) |
+
+When this port started, the prompt ran at 49.5 tokens per second and decode
+at 22.1. `--ane` runs part of the prompt projections on the Neural Engine
+while the GPU works on the next chunk, and turns itself off if that makes
+the prompt slower. `--dfly2` drafts two tokens at a time and works with
+greedy decoding only (`chat hy4 --dfly2` sets temperature 0); it pauses
+itself when the drafts keep missing. Greedy output is the same with and
+without it. The server keeps the KV cache between chat turns, so a
+follow-up turn on a 1.4K-token conversation starts in 0.65 s.
 
 ## Requirements
 
@@ -182,11 +219,13 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 ### Other models
 
 ds4 is not a Flash-Next engine, and neither is the launcher. It runs
-DeepSeek V4 and V4.1 Flash, GLM 5.2 and 5.3 and the upstream Qwen3.8 files
+Hy4 Flash, DeepSeek V4 and V4.1 Flash, GLM 5.2 and 5.3 and the upstream Qwen3.8 files
 too:
 
 ```sh
 dstar models                  # names and sizes
+dstar pull hy4                # Tencent Hy4 Flash Maya-XS, see above
+dstar serve hy4
 dstar pull ds4f-q2            # DeepSeek V4 Flash Q2, 81 GiB
 dstar serve deepseek          # or a path to the GGUF
 dstar chat deepseek

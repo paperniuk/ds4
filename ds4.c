@@ -61723,7 +61723,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 #define QWEN4_ANE_ROWS 2048u
 
 static struct {
-    int state;                         /* -1 unread, 0 off, 1 ready, 2 to build */
+    int state;                         /* -1 unread, 0 off, 1 ready, 2 to build, 3 off for one pair */
     uint32_t min_rows;
     int z, qkv, q, out, sh;            /* ANE programs, -1 none; out's slots are layers */
     uint32_t qkv_gpu, q_gpu, out_gpu;  /* the GPU's leading columns of a split */
@@ -61870,6 +61870,12 @@ static void qwen4_ane_off(void) {
     g_qwen4_ane.state = 0;
 }
 
+/* Keeps a ready ANE out of the next chunks (pause) or lets it back in. */
+static void qwen4_ane_pause(bool pause) {
+    if (pause && g_qwen4_ane.state == 1) g_qwen4_ane.state = 3;
+    else if (!pause && g_qwen4_ane.state == 3) g_qwen4_ane.state = 1;
+}
+
 /* Prefill chunks run in pairs, the second one layer behind the first, so
  * the ANE works on one while the GPU runs the other (DS4_ANE_PIPE=0 runs
  * them one at a time). */
@@ -62014,6 +62020,7 @@ static bool qwen4_ane_ready(const ds4_model *m, const ds4_weights *w, uint32_t T
 }
 static bool qwen4_ane_on(uint32_t T) { (void)T; return false; }
 static void qwen4_ane_off(void) {}
+static void qwen4_ane_pause(bool pause) { (void)pause; }
 static bool qwen4_ane_pipe(void) { return false; }
 static void qwen4_ane_use_set(int s) { (void)s; }
 static bool qwen4_ane_kick(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
@@ -63246,10 +63253,89 @@ static uint32_t qwen4_graph_pair_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * them; logits_out receives the last row.  Like a single chunk the pair
  * starts from a copy of the recurrent state and the GPU reruns both chunks
  * alone if an ANE evaluation fails. */
+/* The ANE should make a prefill faster, but on some Macs it ran far slower
+ * than the GPU alone (paperniuk/ds4#3: 35 tok/s instead of about 400), with
+ * no evaluation failing.  So the ANE is checked against the GPU: once two
+ * pairs of a long prefill ran with it, the next pair runs on the GPU alone
+ * and the ANE is turned off for the process if the GPU was faster.  A pair
+ * is timed from its start to the start of the pair that follows it, so the
+ * time includes the GPU finishing it.  After the check, an ANE pair at less
+ * than half the checked rate repeats it.  DS4_ANE_GUARD=0 turns it off. */
+static struct {
+    double start;        /* when the timed pair started */
+    uint32_t pos, rows;  /* where it started and its rows */
+    int kind;            /* 0 none, 1 an ANE pair, 2 the GPU probe */
+    uint32_t ane_pairs;  /* ANE pairs timed since the last reset */
+    double ane_tps;      /* their mean rate */
+    double kept_tps;     /* ANE rate when the last check kept it, 0 unchecked */
+} g_qwen4_ane_guard;
+
+static bool qwen4_ane_guard_enabled(void) {
+    const char *e = getenv("DS4_ANE_GUARD");
+    return !e || strcmp(e, "0") != 0;
+}
+
+/* Records the pair timed before this one, if this one follows it. */
+static void qwen4_ane_guard_record(const ds4_qwen4_gpu_graph *g, double now) {
+    const int kind = g_qwen4_ane_guard.kind;
+    g_qwen4_ane_guard.kind = 0;
+    if (!kind || g->pos != g_qwen4_ane_guard.pos + g_qwen4_ane_guard.rows || now <= g_qwen4_ane_guard.start) {
+        g_qwen4_ane_guard.ane_pairs = 0;
+        return;
+    }
+    const double tps = g_qwen4_ane_guard.rows / (now - g_qwen4_ane_guard.start);
+    if (kind == 1) {
+        const uint32_t n = ++g_qwen4_ane_guard.ane_pairs;
+        g_qwen4_ane_guard.ane_tps += (tps - g_qwen4_ane_guard.ane_tps) / n;
+        if (g_qwen4_ane_guard.kept_tps > 0 && tps < 0.5 * g_qwen4_ane_guard.kept_tps) {
+            g_qwen4_ane_guard.kept_tps = 0;
+            g_qwen4_ane_guard.ane_pairs = 1;
+            g_qwen4_ane_guard.ane_tps = tps;
+        }
+        return;
+    }
+    const double ane = g_qwen4_ane_guard.ane_tps;
+    if (tps > 1.1 * ane) {
+        fprintf(stderr, "ds4: the Neural Engine made the prefill slower (%.0f tok/s with it, %.0f without); "
+                        "the GPU runs it alone from now on\n", ane, tps);
+        qwen4_ane_off();
+    } else {
+        if (g_qwen4_ane_guard.kept_tps == 0)
+            fprintf(stderr, "ds4: Neural Engine prefill check: %.0f tok/s with it, %.0f without\n", ane, tps);
+        g_qwen4_ane_guard.kept_tps = ane;
+    }
+    g_qwen4_ane_guard.ane_pairs = 0;
+    g_qwen4_ane_guard.ane_tps = 0;
+}
+
+static void qwen4_ane_guard_start(const ds4_qwen4_gpu_graph *g, double now, uint32_t rows, int kind) {
+    g_qwen4_ane_guard.start = now;
+    g_qwen4_ane_guard.pos = g->pos;
+    g_qwen4_ane_guard.rows = rows;
+    g_qwen4_ane_guard.kind = kind;
+}
+
 static bool qwen4_graph_forward_pair(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t TA, uint32_t TB, float *logits_out,
                                      const float *ple_rows) {
     const float *ple_b = ple_rows ? ple_rows + (uint64_t)TA * DS4_N_EMBD : NULL;
+    const bool guard = qwen4_ane_guard_enabled();
+    if (guard) {
+        const double now = now_sec();
+        qwen4_ane_guard_record(g, now);
+        /* The first pair after a reset carries setup costs: time from the second. */
+        const bool probe = g_qwen4_ane_guard.kept_tps == 0 && g_qwen4_ane_guard.ane_pairs >= 2 &&
+                           qwen4_graph_pairs(g, m, w, TA);
+        if (probe) {
+            qwen4_ane_guard_start(g, now, TA + TB, 2);
+            qwen4_ane_pause(true);
+            const bool ok = qwen4_graph_forward_tokens_ple(g, m, w, tokens, TA, NULL, false, ple_rows) &&
+                            qwen4_graph_forward_tokens_ple(g, m, w, tokens + TA, TB, logits_out, false, ple_b);
+            qwen4_ane_pause(false);
+            return ok;
+        }
+        if (qwen4_graph_pairs(g, m, w, TA)) qwen4_ane_guard_start(g, now, TA + TB, 1);
+    }
     if (!qwen4_graph_pairs(g, m, w, TA) || !qwen4_pipe_alloc(g) ||
         !qwen4_graph_ensure_state_set(g, g->ane_lin_state, g->ane_lin_hist, &g->ane_ple_hist) ||
         !qwen4_graph_state_copy_ane(g, true)) {

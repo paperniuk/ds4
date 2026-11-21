@@ -55908,7 +55908,9 @@ int ds4_gpu_ane_settle(void) {
 }
 
 /* DS4_ANE_TEST_FAIL=N[:error|:nan|:hang] replaces the Nth evaluation by a
- * failure of that kind, to test the fallback. */
+ * failure of that kind, to test the fallback; N:slow queues the
+ * evaluations from the Nth on one at a time, each DS4_ANE_TEST_SLOW_MS
+ * (default 100) late: an ANE that works, but slowly. */
 static int ds4_ane_test_fault(void) {
     static uint64_t at;
     static int kind = -1;
@@ -55918,9 +55920,10 @@ static int ds4_ane_test_fault(void) {
         if (e && e[0]) {
             at = strtoull(e, NULL, 10);
             const char *k = strchr(e, ':');
-            kind = !k || !strcmp(k, ":error") ? 1 : !strcmp(k, ":nan") ? 2 : 3;
+            kind = !k || !strcmp(k, ":error") ? 1 : !strcmp(k, ":nan") ? 2 : !strcmp(k, ":slow") ? 4 : 3;
         }
     }
+    if (kind == 4) return g_ane.evals + 1 >= at ? kind : 0;
     return kind && g_ane.evals + 1 == at ? kind : 0;
 }
 
@@ -55985,6 +55988,20 @@ int ds4_gpu_ane_eval(int h, uint32_t slot, int xh, uint32_t T) {
                 ds4_ane_finish(done)) {
                 ds4_ane_fail([NSString stringWithFormat:@"was not queued (%@)", err.localizedDescription].UTF8String);
             }
+        } else if (fault == 4) {
+            const char *ms_env = getenv("DS4_ANE_TEST_SLOW_MS");
+            const int64_t ms = ms_env && ms_env[0] ? strtoll(ms_env, NULL, 10) : 100;
+            id model = p->model;
+            static dispatch_queue_t slow;
+            if (!slow) slow = dispatch_queue_create("ds4.ane.test.slow", DISPATCH_QUEUE_SERIAL);
+            dispatch_async(slow, ^{
+                usleep((useconds_t)(ms * 1000));
+                NSError *err = nil;
+                if (![g_ane.client evaluateWithModel:model options:@{} request:req qos:21 error:&err] &&
+                    ds4_ane_finish(done)) {
+                    ds4_ane_fail([NSString stringWithFormat:@"was not queued (%@)", err.localizedDescription].UTF8String);
+                }
+            });
         }
     }
     return 1;

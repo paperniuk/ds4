@@ -63261,80 +63261,85 @@ static uint32_t qwen4_graph_pair_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * is timed from its start to the start of the pair that follows it, so the
  * time includes the GPU finishing it.  After the check, an ANE pair at less
  * than half the checked rate repeats it.  DS4_ANE_GUARD=0 turns it off. */
-static struct {
+typedef struct {
     double start;        /* when the timed pair started */
     uint32_t pos, rows;  /* where it started and its rows */
     int kind;            /* 0 none, 1 an ANE pair, 2 the GPU probe */
     uint32_t ane_pairs;  /* ANE pairs timed since the last reset */
     double ane_tps;      /* their mean rate */
     double kept_tps;     /* ANE rate when the last check kept it, 0 unchecked */
-} g_qwen4_ane_guard;
+} ds4_ane_guard;
 
-static bool qwen4_ane_guard_enabled(void) {
+static inline bool ds4_ane_guard_enabled(void) {
     const char *e = getenv("DS4_ANE_GUARD");
     return !e || strcmp(e, "0") != 0;
 }
 
-/* Records the pair timed before this one, if this one follows it. */
-static void qwen4_ane_guard_record(const ds4_qwen4_gpu_graph *g, double now) {
-    const int kind = g_qwen4_ane_guard.kind;
-    g_qwen4_ane_guard.kind = 0;
-    if (!kind || g->pos != g_qwen4_ane_guard.pos + g_qwen4_ane_guard.rows || now <= g_qwen4_ane_guard.start) {
-        g_qwen4_ane_guard.ane_pairs = 0;
-        return;
+/* Records the pair timed before the one starting at pos, if it follows it;
+ * true when the ANE should be turned off. */
+static inline bool ds4_ane_guard_record(ds4_ane_guard *a, uint32_t pos, double now) {
+    const int kind = a->kind;
+    a->kind = 0;
+    if (!kind || pos != a->pos + a->rows || now <= a->start) {
+        a->ane_pairs = 0;
+        return false;
     }
-    const double tps = g_qwen4_ane_guard.rows / (now - g_qwen4_ane_guard.start);
+    const double tps = a->rows / (now - a->start);
     if (kind == 1) {
-        const uint32_t n = ++g_qwen4_ane_guard.ane_pairs;
-        g_qwen4_ane_guard.ane_tps += (tps - g_qwen4_ane_guard.ane_tps) / n;
-        if (g_qwen4_ane_guard.kept_tps > 0 && tps < 0.5 * g_qwen4_ane_guard.kept_tps) {
-            g_qwen4_ane_guard.kept_tps = 0;
-            g_qwen4_ane_guard.ane_pairs = 1;
-            g_qwen4_ane_guard.ane_tps = tps;
+        const uint32_t n = ++a->ane_pairs;
+        a->ane_tps += (tps - a->ane_tps) / n;
+        if (a->kept_tps > 0 && tps < 0.5 * a->kept_tps) {
+            a->kept_tps = 0;
+            a->ane_pairs = 1;
+            a->ane_tps = tps;
         }
-        return;
+        return false;
     }
-    const double ane = g_qwen4_ane_guard.ane_tps;
+    const double ane = a->ane_tps;
+    a->ane_pairs = 0;
+    a->ane_tps = 0;
     if (tps > 1.1 * ane) {
         fprintf(stderr, "ds4: the Neural Engine made the prefill slower (%.0f tok/s with it, %.0f without); "
                         "the GPU runs it alone from now on\n", ane, tps);
-        qwen4_ane_off();
-    } else {
-        if (g_qwen4_ane_guard.kept_tps == 0)
-            fprintf(stderr, "ds4: Neural Engine prefill check: %.0f tok/s with it, %.0f without\n", ane, tps);
-        g_qwen4_ane_guard.kept_tps = ane;
+        return true;
     }
-    g_qwen4_ane_guard.ane_pairs = 0;
-    g_qwen4_ane_guard.ane_tps = 0;
+    if (a->kept_tps == 0)
+        fprintf(stderr, "ds4: Neural Engine prefill check: %.0f tok/s with it, %.0f without\n", ane, tps);
+    a->kept_tps = ane;
+    return false;
 }
 
-static void qwen4_ane_guard_start(const ds4_qwen4_gpu_graph *g, double now, uint32_t rows, int kind) {
-    g_qwen4_ane_guard.start = now;
-    g_qwen4_ane_guard.pos = g->pos;
-    g_qwen4_ane_guard.rows = rows;
-    g_qwen4_ane_guard.kind = kind;
+/* True if the pair about to start should run on the GPU alone. The first
+ * pair after a reset carries setup costs, so timing starts at the second. */
+static inline bool ds4_ane_guard_probe(const ds4_ane_guard *a) {
+    return a->kept_tps == 0 && a->ane_pairs >= 2;
 }
+
+static inline void ds4_ane_guard_start(ds4_ane_guard *a, uint32_t pos, double now, uint32_t rows, int kind) {
+    a->start = now;
+    a->pos = pos;
+    a->rows = rows;
+    a->kind = kind;
+}
+
+static ds4_ane_guard g_qwen4_ane_guard;
 
 static bool qwen4_graph_forward_pair(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                      const int *tokens, uint32_t TA, uint32_t TB, float *logits_out,
                                      const float *ple_rows) {
     const float *ple_b = ple_rows ? ple_rows + (uint64_t)TA * DS4_N_EMBD : NULL;
-    const bool guard = qwen4_ane_guard_enabled();
-    if (guard) {
+    if (ds4_ane_guard_enabled()) {
         const double now = now_sec();
-        qwen4_ane_guard_record(g, now);
-        /* The first pair after a reset carries setup costs: time from the second. */
-        const bool probe = g_qwen4_ane_guard.kept_tps == 0 && g_qwen4_ane_guard.ane_pairs >= 2 &&
-                           qwen4_graph_pairs(g, m, w, TA);
-        if (probe) {
-            qwen4_ane_guard_start(g, now, TA + TB, 2);
+        if (ds4_ane_guard_record(&g_qwen4_ane_guard, g->pos, now)) qwen4_ane_off();
+        if (qwen4_graph_pairs(g, m, w, TA) && ds4_ane_guard_probe(&g_qwen4_ane_guard)) {
+            ds4_ane_guard_start(&g_qwen4_ane_guard, g->pos, now, TA + TB, 2);
             qwen4_ane_pause(true);
             const bool ok = qwen4_graph_forward_tokens_ple(g, m, w, tokens, TA, NULL, false, ple_rows) &&
                             qwen4_graph_forward_tokens_ple(g, m, w, tokens + TA, TB, logits_out, false, ple_b);
             qwen4_ane_pause(false);
             return ok;
         }
-        if (qwen4_graph_pairs(g, m, w, TA)) qwen4_ane_guard_start(g, now, TA + TB, 1);
+        if (qwen4_graph_pairs(g, m, w, TA)) ds4_ane_guard_start(&g_qwen4_ane_guard, g->pos, now, TA + TB, 1);
     }
     if (!qwen4_graph_pairs(g, m, w, TA) || !qwen4_pipe_alloc(g) ||
         !qwen4_graph_ensure_state_set(g, g->ane_lin_state, g->ane_lin_hist, &g->ane_ple_hist) ||

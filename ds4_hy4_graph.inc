@@ -873,10 +873,29 @@ static bool hy4_forward_pair_once(ds4_hy4_graph *g, const ds4_engine *e, const i
     return hy4_pipe_enter(g, 0) && ok;
 }
 
+static ds4_ane_guard g_hy4_ane_guard;
+
 static bool hy4_forward_pair(ds4_hy4_graph *g, const ds4_engine *e, const int *history,
                             uint32_t pos, uint32_t na, uint32_t nb, float *logits) {
     ds4_hy4_model *h = e->hy4;
     assert(hy4_cache_can_resume(pos, g->raw_first, g->pending_first));
+    /* The same check as the Qwen pairs (ds4_ane_guard). */
+    if (ds4_ane_guard_enabled()) {
+        const double now = now_sec();
+        const bool off = ds4_ane_guard_record(&g_hy4_ane_guard, pos, now);
+        if (off) hy4_ane_close(h);
+        if (off || ds4_ane_guard_probe(&g_hy4_ane_guard)) {
+            if (off) {
+                hy4_pipe_free(g->pipe);
+                g->pipe = NULL;
+            } else {
+                ds4_ane_guard_start(&g_hy4_ane_guard, pos, now, na + nb, 2);
+            }
+            return hy4_forward(g, e, history, pos, na, NULL) &&
+                   hy4_forward(g, e, history, pos + na, nb, logits);
+        }
+        ds4_ane_guard_start(&g_hy4_ane_guard, pos, now, na + nb, 1);
+    }
     const bool saved = hy4_pipe_alloc(g) && hy4_pipe_cache(g, pos, na + nb, true);
     if (saved) {
         const bool ok = hy4_forward_pair_once(g, e, history, pos, na, nb, logits);

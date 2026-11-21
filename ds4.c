@@ -42,6 +42,10 @@
 #include <unistd.h>
 
 #include "ds4.h"
+#include "ds4_hy4_chat.h"
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include <stdatomic.h>
+#endif
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_image.h"
@@ -528,6 +532,7 @@ typedef enum {
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
     DS4_MODEL_FAMILY_DEEPSEEK41 = 2,
     DS4_MODEL_FAMILY_QWEN4_EXP = 3,
+    DS4_MODEL_FAMILY_HY4 = 4,
 } ds4_model_family;
 
 typedef enum {
@@ -538,6 +543,7 @@ typedef enum {
     DS4_VARIANT_FLASH41 = 4,
     DS4_VARIANT_QWEN4_EXP = 5,
     DS4_VARIANT_QWEN4_MINI = 6,
+    DS4_VARIANT_HY4 = 7,
 } ds4_variant;
 
 typedef struct {
@@ -2434,6 +2440,8 @@ typedef struct {
     uint32_t block_bytes;
 } gguf_type_info;
 
+enum { DS4_TENSOR_F8_E4M3 = 43 };
+
 static const gguf_type_info gguf_types[] = {
     [0]  = {"f32",      1,   4},
     [1]  = {"f16",      1,   2},
@@ -2466,6 +2474,7 @@ static const gguf_type_info gguf_types[] = {
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
     [42] = {"q2_0",    64,  18},
+    [DS4_TENSOR_F8_E4M3] = {"f8_e4m3", 1, 1},
 };
 
 enum {
@@ -3060,7 +3069,9 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     model_attach_qwen_mtp_sidecar(m);
     model_qwen_hc_q8_in_place(m, metal_mapping);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    ds4_str arch = {0};
+    const bool hy4 = model_get_string(m, "general.architecture", &arch) && ds4_streq(arch, "hy_v4_flash");
+    if (!metal_mapping && prefetch_cpu && !hy4) model_prefetch_cpu_mapping(m);
 }
 
 static void print_size(uint64_t bytes) {
@@ -3333,6 +3344,26 @@ static void model_summary(const ds4_model *m) {
         model_get_u32(m, "deepseek41.num_experts_per_tok", &n_expert_used);
     }
 
+    uint32_t hy4_swa_heads = 0;
+    if (ds4_streq(arch, "hy_v4_flash")) {
+        model_get_u32(m, "hy_v4_flash.block_count", &layers);
+        model_get_u64_compat(m, "hy_v4_flash.context_length", &ctx_train);
+        model_get_u32(m, "hy_v4_flash.attention.head_count_kv", &n_head_kv);
+        model_get_u32(m, "hy_v4_flash.attention.key_length_mla", &head_dim);
+        const char *head_keys[] = {"hy_v4_flash.attention.head_count"};
+        uint32_t heads[3], count = 0;
+        if (model_get_u32_array_any(m, head_keys, 1, heads, 3, &count) && count == 3) {
+            n_head = heads[0];
+            hy4_swa_heads = heads[2];
+        }
+        model_get_u32(m, "hy_v4_flash.attention.sliding_window", &n_swa);
+        model_get_u32(m, "hy_v4_flash.attention.indexer.head_count", &indexer_heads);
+        model_get_u32(m, "hy_v4_flash.attention.indexer.key_length", &indexer_head_dim);
+        model_get_u32(m, "hy_v4_flash.attention.indexer.top_k", &indexer_top_k);
+        model_get_u32(m, "hy_v4_flash.expert_count", &n_expert);
+        model_get_u32(m, "hy_v4_flash.expert_used_count", &n_expert_used);
+    }
+
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
@@ -3348,7 +3379,10 @@ static void model_summary(const ds4_model *m) {
         m->version, m->n_kv, m->n_tensors);
     if (layers) printf("layers: %u\n", layers);
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
-    if (n_head || n_head_kv || head_dim || n_swa) {
+    if (hy4_swa_heads) {
+        printf("attention: sparse_heads=%u swa_heads=%u kv_heads=%u head_dim=%u swa=%u\n",
+               n_head, hy4_swa_heads, n_head_kv, head_dim, n_swa);
+    } else if (n_head || n_head_kv || head_dim || n_swa) {
         printf("attention: heads=%u kv_heads=%u head_dim=%u swa=%u\n",
                n_head, n_head_kv, head_dim, n_swa);
     }
@@ -7610,6 +7644,8 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
+#include "ds4_hy4_model.inc"
+
 static void config_validate_model(const ds4_model *m) {
     g_ds4_flash_vision_exp = false;
     ds4_str arch = {0};
@@ -7628,6 +7664,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "qwen4exp")) {
             config_validate_qwen4_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "hy_v4_flash")) {
+            hy4_validate_config(m);
             return;
         }
     }
@@ -41046,6 +41086,9 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap(
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 static ds4_context_memory ds41_graph_memory(uint32_t ctx);
 #endif
+#if defined(__APPLE__)
+static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested);
+#endif
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
@@ -41054,6 +41097,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+#if defined(__APPLE__)
+    if (backend == DS4_BACKEND_METAL && ds4_model_is_hy4())
+        return hy4_context_memory(ctx, prefill_chunk);
+#endif
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4())
         return qwen4_graph_memory_estimate(ctx, prefill_chunk, qwen4_kv_q8_wanted(backend));
 
@@ -45037,6 +45084,9 @@ struct ds4_engine {
     ds4_model vision_model;
     ds4_vocab vocab;
     ds4_weights weights;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    ds4_hy4_model *hy4;
+#endif
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
@@ -46010,7 +46060,13 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, t
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
+#include "ds4_hy4_tokenizer.inc"
+
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
+    if (ds4_model_is_hy4()) {
+        bpe_tokenize_text_hy4(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
@@ -46141,6 +46197,28 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_start_id = -1;
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
+
+    if (ds4_model_is_hy4()) {
+        if (vocab->n_vocab != HY4_VOCAB) ds4_die("invalid Hy4 Flash vocabulary size");
+        vocab->bos_id = -1;
+        vocab->eos_id = vocab_lookup(vocab, HY4_CHAT_END);
+        vocab->endoftext_id = vocab_lookup_optional(vocab, HY4_CHAT_EOT);
+        vocab->im_start_id = vocab_lookup(vocab, HY4_CHAT_START);
+        vocab->im_end_id = vocab->eos_id;
+        vocab->think_start_id = vocab_lookup(vocab, HY4_THINK_OPEN);
+        vocab->think_end_id = vocab_lookup(vocab, HY4_THINK_CLOSE);
+        vocab->tool_call_start_id = vocab_lookup(vocab, HY4_TOOL_OPEN);
+        vocab->tool_call_end_id = vocab_lookup(vocab, HY4_TOOL_CLOSE);
+        vocab->tool_response_start_id = vocab_lookup(vocab, HY4_RESULT_OPEN);
+        vocab->tool_response_end_id = vocab_lookup(vocab, HY4_RESULT_CLOSE);
+        vocab->arg_key_start_id = vocab_lookup(vocab, HY4_KEY_OPEN);
+        vocab->arg_key_end_id = vocab_lookup(vocab, HY4_KEY_CLOSE);
+        vocab->arg_value_start_id = vocab_lookup(vocab, HY4_VALUE_OPEN);
+        vocab->arg_value_end_id = vocab_lookup(vocab, HY4_VALUE_CLOSE);
+        vocab->system_id = vocab->user_id = vocab->assistant_id = vocab->observation_id = -1;
+        vocab->sop_id = vocab->dsml_id = -1;
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         /* ChatML without BOS; <|endoftext|> is the document separator and a
@@ -46322,12 +46400,52 @@ static void qwen4_chat_system(const ds4_vocab *vocab, const char *system, ds4_th
     qwen4_chat_close(vocab, out);
 }
 
+const char *ds4_hy4_reasoning_effort(ds4_think_mode mode) {
+    if (mode == DS4_THINK_MAX) return "max";
+    return ds4_think_mode_enabled(mode) ? "high" : "no_think";
+}
+
+static void hy4_chat_open(const ds4_vocab *vocab, const char *role, token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    token_vec_push(out, vocab_lookup(vocab, HY4_CHAT_MIDDLE));
+}
+
+static void hy4_chat_effort(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    token_vec_push(out, vocab_lookup(vocab, "<｜reasoning_mode:opensource｜>"));
+    char text[32];
+    snprintf(text, sizeof(text), "reasoning_effort:%s", ds4_hy4_reasoning_effort(mode));
+    bpe_tokenize_text(vocab, text, out);
+}
+
+static void hy4_chat_assistant(const ds4_vocab *vocab, ds4_think_mode mode, token_vec *out) {
+    hy4_chat_open(vocab, "assistant", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (!ds4_think_mode_enabled(mode)) token_vec_push(out, vocab->think_end_id);
+}
+
+static void hy4_chat_system(const ds4_vocab *vocab, const char *system,
+                            ds4_think_mode mode, token_vec *out) {
+    hy4_chat_open(vocab, "system", out);
+    if (system) bpe_tokenize_text(vocab, system, out);
+    hy4_chat_effort(vocab, mode, out);
+    token_vec_push(out, vocab->im_end_id);
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (ds4_model_is_hy4()) {
+        hy4_chat_system(vocab, system, think_mode, out);
+        hy4_chat_open(vocab, "user", out);
+        bpe_tokenize_text(vocab, prompt, out);
+        token_vec_push(out, vocab->im_end_id);
+        hy4_chat_assistant(vocab, think_mode, out);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
             vocab->think_start_id < 0 || vocab->think_end_id < 0) {
@@ -46379,6 +46497,25 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    if (ds4_model_is_hy4()) {
+        static const char *const names[] = {
+            HY4_CHAT_START, HY4_CHAT_MIDDLE, HY4_CHAT_END, HY4_CHAT_EOT,
+            "<｜reasoning_mode:opensource｜>", HY4_THINK_OPEN, HY4_THINK_CLOSE,
+            HY4_TOOLS_OPEN, HY4_TOOLS_CLOSE, HY4_TOOL_OPEN, HY4_TOOL_CLOSE,
+            HY4_KEY_OPEN, HY4_KEY_CLOSE, HY4_VALUE_OPEN, HY4_VALUE_CLOSE,
+            HY4_RESULT_OPEN, HY4_RESULT_CLOSE,
+        };
+        if (*p != '<') return false;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            const size_t n = strlen(names[i]);
+            if (strncmp(p, names[i], n) == 0) {
+                *token = vocab_lookup(vocab, names[i]);
+                *len = n;
+                return true;
+            }
+        }
+        return false;
+    }
     struct special {
         const char *text;
         int token;
@@ -46477,6 +46614,16 @@ void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_m
     chat_push_think_prefix(&e->vocab, mode, tokens);
 }
 
+void ds4_chat_append_system_prefix(ds4_engine *e, ds4_tokens *tokens,
+                                   const char *system, ds4_think_mode mode) {
+    if (ds4_model_is_hy4()) {
+        hy4_chat_system(&e->vocab, system, mode, tokens);
+        return;
+    }
+    ds4_chat_append_think_prefix(e, tokens, mode);
+    if (system && *system) ds4_chat_append_message(e, tokens, "system", system);
+}
+
 static void ds41_chat_system_marker(const ds4_vocab *vocab, ds4_tokens *tokens) {
     /* Initial system text may be built in pieces after the effort prefix.
      * Later system messages must introduce their own role token. */
@@ -46524,6 +46671,18 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
     ds4_vocab *vocab = &e->vocab;
     if (!role) role = "user";
     if (!content) content = "";
+
+    if (ds4_model_is_hy4()) {
+        hy4_chat_open(vocab, role, tokens);
+        if (!strcmp(role, "assistant")) {
+            token_vec_push(tokens, vocab->think_start_id);
+            token_vec_push(tokens, vocab->think_end_id);
+        }
+        bpe_tokenize_text(vocab, content, tokens);
+        if (!strcmp(role, "system")) hy4_chat_effort(vocab, DS4_THINK_HIGH, tokens);
+        token_vec_push(tokens, vocab->im_end_id);
+        return;
+    }
 
     if (ds4_model_is_qwen4()) {
         if (!strcmp(role, "tool") || !strcmp(role, "function")) {
@@ -46591,6 +46750,10 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
 }
 
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode) {
+    if (ds4_model_is_hy4()) {
+        hy4_chat_assistant(&e->vocab, think_mode, tokens);
+        return;
+    }
     if (ds4_model_is_qwen4()) {
         qwen4_chat_assistant_prefix(&e->vocab, think_mode, tokens);
         return;
@@ -46690,9 +46853,19 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
         return out;
     }
 
+    if (ds4_model_is_hy4()) {
+        const char *control = token == vocab->think_start_id ? "<think>" :
+                              token == vocab->think_end_id ? "</think>" : NULL;
+        if (control) {
+            if (len) *len = strlen(control);
+            return ds4_strdup(control);
+        }
+    }
     ds4_str s = vocab->token[token];
     char *out = xmalloc((size_t)s.len + 1);
-    if (vocab_token_is_literal_special(s)) {
+    const bool hy4_special = ds4_model_is_hy4() && token >= 120000 &&
+                             s.len && s.ptr[0] == '<' && s.ptr[s.len - 1] == '>';
+    if (hy4_special || vocab_token_is_literal_special(s)) {
         memcpy(out, s.ptr, (size_t)s.len);
         out[s.len] = '\0';
         if (len) *len = (size_t)s.len;
@@ -64055,6 +64228,10 @@ static int generate_metal_graph_raw_swa(
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include "ds4_hy4_graph.inc"
+#endif
+
 #ifdef DS4_NO_GPU
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
@@ -64801,6 +64978,9 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+#if defined(__APPLE__)
+    ds4_hy4_graph *hy4_graph;
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     uint64_t qwen4_reserved_graph_bytes;
@@ -66816,6 +66996,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
 
 int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) return 0;
+    if (ds4_model_is_hy4()) return 2;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         if (!gate) continue;
@@ -66826,7 +67007,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
 }
 
 bool ds4_engine_has_output_head(ds4_engine *e) {
-    return e && weights_have_output_head(&e->weights);
+    return e && (ds4_model_is_hy4() || weights_have_output_head(&e->weights));
 }
 
 #ifndef DS4_NO_GPU
@@ -66848,6 +67029,9 @@ bool ds4_engine_mtp_exact_sampling(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e && e->hy4 && e->hy4->draft) return (int)e->hy4->draft->rows;
+#endif
     if (e && ds4_model_is_qwen4()) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;
     }
@@ -67168,7 +67352,15 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool tail);
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#include "ds4_hy4_payload.inc"
+#endif
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s && s->hy4_graph) return s->checkpoint_valid && s->checkpoint.len > 0 ?
+        hy4_payload_bytes((uint32_t)s->checkpoint.len, s->hy4_graph->scores != NULL) : 0;
+#endif
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -67611,6 +67803,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->hy4_graph) return hy4_save_payload(s, fp, err, errlen);
+#endif
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -67962,6 +68157,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->hy4_graph) return hy4_load_payload(s, fp, payload_bytes, err, errlen);
+#endif
 #ifdef DS4_HAS_QWEN4_GPU
     s->qwen4_forced_set = false;
 #endif
@@ -68970,6 +69168,10 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int max_prompts,
                                int max_tokens,
                                int min_expert_samples) {
+    if (ds4_model_is_hy4()) {
+        fprintf(stderr, "ds4: imatrix profiling is unavailable for Hy4 Flash\n");
+        return 1;
+    }
 #ifdef DS4_NO_GPU
     (void)e;
     (void)dataset_path;
@@ -69339,7 +69541,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
+    if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s) || ds4_model_is_hy4()) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
     }
@@ -69823,7 +70025,7 @@ int ds4_engine_generate_argmax(
                     ds4_backend_name(e->backend));
             return 1;
         }
-        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        if (e->multi_tier || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 || ds4_model_is_hy4()) {
             ds4_session *s = NULL;
             char err[256] = {0};
             const double t_prefill0 = now_sec();
@@ -71615,8 +71817,9 @@ static int glm_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt) {
 #endif
 
 static bool engine_legacy_graph_test_supported(ds4_engine *e) {
-    if (!ds4_engine_is_deepseek41(e)) return true;
-    fprintf(stderr, "ds4: legacy graph diagnostics do not implement DeepSeek V4.1; use session logits instead\n");
+    if (!ds4_engine_is_deepseek41(e) && !ds4_engine_is_hy4(e)) return true;
+    fprintf(stderr, "ds4: legacy graph diagnostics do not implement %s; use session logits instead\n",
+            ds4_engine_model_name(e));
     return false;
 }
 
@@ -75738,6 +75941,56 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    if (ds4_model_is_hy4()) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        if (e->backend == DS4_BACKEND_METAL && !load_slice && !e->ssd_streaming &&
+            opt->tp.role == DS4_TP_NONE && !e->cuda_tensor_parallel &&
+            opt->distributed.role == DS4_DISTRIBUTED_NONE && (!gpu_cfg || gpu_cfg->n_gpus <= 1) &&
+            !(opt->vision_path && opt->vision_path[0]) &&
+            !opt->dspark && !e->directional_steering_file && !opt->first_token_test &&
+            e->power_percent == 100) {
+            e->hy4 = xcalloc(1, sizeof(*e->hy4));
+            e->hy4->fd = -1;
+            hy4_bind_model(e->hy4, &e->model);
+            if (hy4_open_engram(e->hy4, &e->model, opt->model_path)) {
+                vocab_load(&e->vocab, &e->model);
+                e->model_path = ds4_strdup(opt->model_path);
+                e->prefill_chunk = opt->prefill_chunk;
+                if (ds4_gpu_init() &&
+                    ds4_gpu_set_model_map_range(e->model.map, e->model.size, e->model.tensor_data_pos,
+                                                e->model.size - e->model.tensor_data_pos,
+                                                e->model.max_tensor_bytes)) {
+                    e->metal_ready = true;
+                    (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+                    if (opt->mtp_path && opt->mtp_path[0] &&
+                        !hy4_open_draft(e->hy4, &e->mtp_model, opt->mtp_path, opt->mtp_draft_tokens)) {
+                        fprintf(stderr, "ds4: incompatible Maya-XS DFly2 drafter\n");
+                        ds4_engine_close(e);
+                        *out = NULL;
+                        return 1;
+                    }
+                    if (e->hy4->draft)
+                        fprintf(stderr, "ds4: Hy4 DFly2 enabled for greedy decoding, up to %u proposals\n",
+                                e->hy4->draft->rows - 1);
+                    *out = e;
+                    return 0;
+                }
+                fprintf(stderr, "ds4: unable to prepare the Hy4 Flash Metal weights\n");
+            }
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
+        fprintf(stderr, "ds4: Hy4 Flash requires the single-device Metal text graph\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     /* V4.1's model views are read-only to the GPU: untracked by default */
     if (e->backend == DS4_BACKEND_METAL)
@@ -77133,6 +77386,10 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
     return ds4_model_is_glm53();
 }
 
+bool ds4_engine_is_hy4(ds4_engine *e) {
+    return e && ds4_model_is_hy4();
+}
+
 bool ds4_engine_is_qwen4(ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4();
@@ -78012,6 +78269,13 @@ void ds4_engine_close(ds4_engine *e) {
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds41_narrow_free();
 #endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e->hy4) {
+        if (e->hy4->fd >= 0) close(e->hy4->fd);
+        hy4_draft_weights_free(e->hy4->draft);
+        free(e->hy4);
+    }
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -78180,6 +78444,22 @@ static int ds4_session_tp_register(ds4_session *s) {
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (e->hy4) {
+        if (!e->metal_ready) return 1;
+        ds4_hy4_graph *g = hy4_graph_alloc((uint32_t)ctx_size, e->prefill_chunk, e->hy4->draft != NULL);
+        if (!g) return 1;
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->hy4_graph = g;
+        s->ctx_size = ctx_size;
+        s->prefill_cap = g->cap;
+        s->logits = xmalloc((size_t)HY4_VOCAB * sizeof(float));
+        s->sample_probs = xmalloc((size_t)HY4_VOCAB * sizeof(float));
+        *out = s;
+        return 0;
+    }
+#endif
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
             fprintf(stderr, "ds4: GLM sessions currently require a graph backend\n");
@@ -78702,6 +78982,11 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
+#if defined(__APPLE__)
+        if (s->hy4_graph) {
+            hy4_graph_free(s->hy4_graph);
+        } else
+#endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
@@ -80805,6 +81090,34 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         snprintf(err, errlen, "interrupted");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->hy4_graph) {
+        const bool extend = s->checkpoint_valid && s->checkpoint.len <= prompt->len &&
+            memcmp(s->checkpoint.v, prompt->v, (size_t)s->checkpoint.len * sizeof(int)) == 0;
+        uint32_t pos = extend ? (uint32_t)s->checkpoint.len : 0;
+        if (pos == (uint32_t)prompt->len) return 0;
+        if (!extend) hy4_draft_reset(s->hy4_graph->draft);
+        s->checkpoint_valid = false;
+        while (pos < (uint32_t)prompt->len) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t rows = (uint32_t)prompt->len - pos;
+            if (rows > s->prefill_cap) rows = s->prefill_cap;
+            float *logits = pos + rows == (uint32_t)prompt->len ? s->logits : NULL;
+            if (!hy4_forward(s->hy4_graph, s->engine, prompt->v, pos, rows, logits)) {
+                snprintf(err, errlen, "Hy4 Flash prefill failed at token %u", pos);
+                return 1;
+            }
+            pos += rows;
+            ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
+        }
+        if (prompt != &s->checkpoint) ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+        return 0;
+    }
+#endif
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
         return ds4_dist_session_sync(s->distributed,
@@ -82239,6 +82552,7 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
  * on the M5 Max pair -- the whole first-run TP deficit vs single
  * node, which pays the same cost before its timing window starts). */
 void ds4_session_gpu_warmup(ds4_session *s) {
+    if (s && ds4_model_is_hy4()) return;
 #ifndef DS4_NO_GPU
     if (!s || ds4_session_is_cpu(s)) return;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return;
@@ -83099,6 +83413,21 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (!s) return 1;
 #ifndef DS4_NO_GPU
     s->dspark_rewind_end = 0;
+#endif
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->hy4_graph) {
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        if (pos >= (uint32_t)s->ctx_size || token < 0 || token >= HY4_VOCAB) {
+            snprintf(err, errlen, "invalid Hy4 Flash token or context is full");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        if (hy4_forward(s->hy4_graph, s->engine, s->checkpoint.v, pos, 1, s->logits)) return 0;
+        s->checkpoint.len--;
+        s->checkpoint_valid = false;
+        snprintf(err, errlen, "Hy4 Flash decode failed at token %u", pos);
+        return 1;
+    }
 #endif
     if (s->distributed) {
         if (!s->checkpoint_valid) {
@@ -90476,6 +90805,84 @@ fail:
 }
 #endif
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static int hy4_session_speculate(ds4_session *s, int first, uint32_t n, int eos,
+                                bool ignore_eos, ds4_think_mode mode,
+                                int *accepted, char *err, size_t errlen) {
+    if (!accepted) return 0;
+    ds4_hy4_graph *g = s->hy4_graph;
+    hy4_draft_graph *d = g->draft;
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    if (d && d->pos == pos && pos < g->ctx) {
+        const uint32_t limit = s->engine->hy4->draft->rows;
+        if (n > limit) n = limit;
+        if (n > g->cap) n = g->cap;
+        if (n > g->ctx - pos) n = g->ctx - pos;
+    } else n = 1;
+    if (n < 2 || (d && (d->pause || d->single_sec == 0)) ||
+        first < 0 || first >= HY4_VOCAB ||
+        (!ignore_eos && (first == eos || ds4_token_is_stop_for_think_mode(s->engine, first, mode)))) {
+        const double start = d ? now_sec() : 0;
+        if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
+        if (d && n > 1) {
+            const double elapsed = now_sec() - start;
+            d->single_sec = d->single_sec > 0 ? 0.8 * d->single_sec + 0.2 * elapsed : elapsed;
+            if (d->pause && --d->pause == 0) {
+                d->probes = 0;
+                d->verify_sec_per_token = 0;
+            }
+        }
+        accepted[0] = first;
+        return 1;
+    }
+
+    const double start = now_sec();
+    int proposals[HY4_DFLY_ROWS] = {first};
+    if (!hy4_draft_propose(g, s->engine, pos, proposals, n)) {
+        /* The draft only touched future KV rows. Recompute the next row
+         * through the normal evaluator before retrying the draft path. */
+        d->pos = 0;
+        d->pause = 64;
+        if (ds4_session_eval(s, first, err, errlen) != 0) return -1;
+        accepted[0] = first;
+        return 1;
+    }
+    const double drafted = now_sec();
+    for (uint32_t i = 0; i < n; i++) token_vec_push(&s->checkpoint, proposals[i]);
+    if (!hy4_forward_rows(g, s->engine, s->checkpoint.v, pos, n, n, d->target_logits)) {
+        s->checkpoint.len = (int)pos;
+        s->checkpoint_valid = false;
+        snprintf(err, errlen, "Hy4 DFly2 verification failed at token %u", pos);
+        return -1;
+    }
+    uint32_t keep = 1;
+    while (keep < n) {
+        const int next = sample_argmax(d->target_logits + (keep - 1) * HY4_VOCAB, HY4_VOCAB);
+        if (next != proposals[keep] ||
+            (!ignore_eos && (next == eos || ds4_token_is_stop_for_think_mode(s->engine, next, mode))))
+            break;
+        keep++;
+    }
+    // Sparse caches ignore future rows. The SWA and pending rings have
+    // enough extra slots to preserve every row needed at the accepted frontier.
+    s->checkpoint.len = (int)(pos + keep);
+    d->pos = pos + keep;
+    d->row = keep - 1;
+    memcpy(s->logits, d->target_logits + (keep - 1) * HY4_VOCAB, HY4_VOCAB * sizeof(float));
+    memcpy(accepted, proposals, keep * sizeof(*accepted));
+    const double finished = now_sec();
+    const double sec_per_token = (finished - start) / keep;
+    d->verify_sec_per_token = d->probes ? 0.7 * d->verify_sec_per_token + 0.3 * sec_per_token : sec_per_token;
+    /* Low agreement can cost more than running these tokens individually.
+     * Sample a new window after a cooldown so the same session can recover. */
+    if (++d->probes >= 4 && d->verify_sec_per_token > 1.03 * d->single_sec) d->pause = 64;
+    if (getenv("DS4_HY4_DFLY_TRACE"))
+        fprintf(stderr, "ds4: Hy4 DFly2 pos=%u accepted=%u/%u draft=%.2fms verify=%.2fms pause=%u\n",
+                pos, keep, n, 1000 * (drafted - start), 1000 * (finished - drafted), d->pause);
+    return (int)keep;
+}
+#endif
+
 static int ds4_session_eval_speculative_argmax_impl(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         bool ignore_eos, ds4_think_mode think_mode,
@@ -90487,12 +90894,17 @@ static int ds4_session_eval_speculative_argmax_impl(
         return -1;
     }
     if (accepted_cap > max_tokens) accepted_cap = max_tokens;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (s->hy4_graph)
+        return hy4_session_speculate(s, first_token, (uint32_t)accepted_cap, eos_token, ignore_eos,
+                                      think_mode, accepted, err, errlen);
+#endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s))
         return ds41_session_speculate(s, first_token, accepted_cap, eos_token, ignore_eos,
             think_mode, 0, 0, 1, 0, NULL, accepted, err, errlen);
 #endif
-    if (s->distributed) {
+    if (s->distributed || ds4_model_is_hy4()) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
@@ -91378,7 +91790,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
         return ds41_session_speculate(s, first_token, accepted_cap, eos_token, false,
             DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng, accepted, err, errlen);
 #endif
-    if (s->distributed || ds4_session_is_cpu(s)) {
+    if (s->distributed || ds4_session_is_cpu(s) || ds4_model_is_hy4()) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;

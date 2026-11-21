@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_hy4_chat.h"
 #include "ds4_tool_text.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
@@ -680,6 +681,7 @@ typedef enum {
     SERVER_MODEL_SYNTAX_GLM,
     SERVER_MODEL_SYNTAX_DEEPSEEK41,
     SERVER_MODEL_SYNTAX_QWEN,
+    SERVER_MODEL_SYNTAX_HY4,
 } server_model_syntax;
 
 #define DS41_TOOL_CALLS_START "<｜DSML｜ calls>"
@@ -1234,6 +1236,7 @@ static bool model_alias_enables_thinking(const char *model) {
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
+    if (ds4_engine_is_hy4(engine)) return SERVER_MODEL_SYNTAX_HY4;
     if (ds4_engine_is_qwen4(engine)) return SERVER_MODEL_SYNTAX_QWEN;
     return ds4_engine_is_glm_dsa(engine) ?
            SERVER_MODEL_SYNTAX_GLM : ds4_engine_is_deepseek41(engine) ?
@@ -1241,6 +1244,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_hy4(engine)) return "hy4-flash";
     if (ds4_engine_is_deepseek41(engine)) return "deepseek-v4.1-flash";
     if (ds4_engine_is_qwen4(engine)) return "qwen3.8-flash-next";
     if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
@@ -1251,7 +1255,9 @@ static const char *server_model_id_from_engine(ds4_engine *engine) {
 
 static bool server_model_alias_known(const char *id) {
     return id &&
-           (!strcmp(id, "deepseek-v4-flash") ||
+           (!strcmp(id, "hy4-flash") ||
+            !strcmp(id, "tencent/hy4-flash") ||
+            !strcmp(id, "deepseek-v4-flash") ||
             !strcmp(id, "deepseek-v4.1-flash") ||
             !strcmp(id, "qwen3.8-flash-next") ||
             !strcmp(id, "qwen3.8-flash-next-chat") ||
@@ -3659,11 +3665,15 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs,
     return buf_take(&out);
 }
 
+#include "ds4_hy4_server.inc"
+
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
                                                 ds4_think_mode think_mode) {
+    if (syntax == SERVER_MODEL_SYNTAX_HY4)
+        return render_hy4_chat_prompt(msgs, tool_schemas, think_mode);
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return render_glm_chat_prompt_text(msgs, tool_schemas,
                                            tool_orders, think_mode);
@@ -5923,6 +5933,7 @@ static void json_escape_fragment_n(buf *b, const char *s, size_t n) {
 static const char *find_any_tool_start(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
+        strstr(s, HY4_TOOLS_OPEN),
         strstr(s, DS41_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START),
         strstr(s, DS4_TOOL_CALLS_START_SHORT),
@@ -5938,6 +5949,7 @@ static const char *find_any_tool_start(const char *s) {
 static const char *find_any_tool_end(const char *s) {
     const char *best = NULL;
     const char *candidates[] = {
+        strstr(s, HY4_TOOLS_CLOSE),
         strstr(s, DS41_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END),
         strstr(s, DS4_TOOL_CALLS_END_SHORT),
@@ -6752,12 +6764,67 @@ static bool parse_qwen_generated_message_ex(const char *text,
     return true;
 }
 
+/* The Hy4 envelope contains the same function-name and key/value grammar
+ * as GLM. Translate structural markers only within the envelope; retain
+ * exact sampled bytes for the transcript. */
+static bool parse_hy4_generated_message(const char *text, bool thinking,
+                                         char **content, char **reasoning, tool_calls *calls) {
+    const char *body = text;
+    if (thinking) {
+        const char *close = find_tool_structural_text(text, "</think>", true);
+        if (!close) {
+            ds4_local_unterminated_reasoning(text, content, reasoning);
+            return true;
+        }
+        body = close + sizeof("</think>") - 1;
+    }
+    const char *begin = strstr(body, HY4_TOOLS_OPEN);
+    if (!begin) {
+        split_reasoning_content(text, strlen(text), content, reasoning);
+        return true;
+    }
+    const char *p = begin + sizeof(HY4_TOOLS_OPEN) - 1;
+    const char *end = strstr(p, HY4_TOOLS_CLOSE);
+    if (!end || *skip_ascii_ws(end + sizeof(HY4_TOOLS_CLOSE) - 1)) return false;
+    static const struct { const char *native, *common; } tags[] = {
+        {HY4_TOOL_OPEN, "<tool_call>"}, {HY4_TOOL_CLOSE, "</tool_call>"},
+        {HY4_KEY_OPEN, "<arg_key>"}, {HY4_KEY_CLOSE, "</arg_key>"},
+        {HY4_VALUE_OPEN, "<arg_value>"}, {HY4_VALUE_CLOSE, "</arg_value>"},
+    };
+    buf normalized = {0};
+    buf_append(&normalized, text, (size_t)(begin - text));
+    while (p < end) {
+        bool matched = false;
+        for (size_t i = 0; i < sizeof(tags) / sizeof(tags[0]); i++) {
+            const size_t n = strlen(tags[i].native);
+            if ((size_t)(end-p) >= n && memcmp(p, tags[i].native, n) == 0) {
+                buf_puts(&normalized, tags[i].common);
+                p += n;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) buf_putc(&normalized, *p++);
+    }
+    const bool ok = parse_glm_generated_message_ex(normalized.ptr, thinking, content, reasoning, calls)
+                    && calls->len > 0;
+    buf_free(&normalized);
+    if (ok) {
+        free(calls->raw_tool_text);
+        calls->raw_tool_text = xstrndup(begin, (size_t)(end - begin) + sizeof(HY4_TOOLS_CLOSE) - 1);
+    }
+    return ok;
+}
+
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
                                                   bool require_thinking_closed,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
+    if (syntax == SERVER_MODEL_SYNTAX_HY4)
+        return parse_hy4_generated_message(text ? text : "", require_thinking_closed,
+                                            content_out, reasoning_out, calls);
     if (syntax == SERVER_MODEL_SYNTAX_GLM) {
         return parse_glm_generated_message_ex(text, require_thinking_closed,
                                               content_out, reasoning_out,
@@ -7465,6 +7532,11 @@ static const dsml_syntax dsml_syntaxes[] = {
     },
 };
 
+static const dsml_syntax hy4_tool_syntax = {
+    HY4_TOOLS_OPEN, HY4_TOOLS_CLOSE, HY4_TOOL_OPEN, HY4_TOOL_CLOSE,
+    HY4_VALUE_OPEN, HY4_VALUE_CLOSE,
+};
+
 static const dsml_syntax glm_tool_syntax = {
     "<tool_call>", "</tool_call>",
     "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
@@ -7682,10 +7754,10 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
             size_t pos = 0;
             const dsml_syntax *syn = NULL;
             bool found;
-            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
-                dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
-                syn = dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ?
-                    &qwen_tool_syntax : &glm_tool_syntax;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) syn = &glm_tool_syntax;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN) syn = &qwen_tool_syntax;
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_HY4) syn = &hy4_tool_syntax;
+            if (syn) {
                 const char *start = find_lit_bounded(raw + dt->pos,
                     raw_len - dt->pos, syn->tool_calls_start);
                 found = start != NULL;
@@ -7696,7 +7768,7 @@ static void dsml_decode_tracker_update(dsml_decode_tracker *dt,
                 found = dsml_find_tool_start_from(raw, raw_len, dt->pos, &pos, &syn);
             }
             if (!found) {
-                size_t hold = dsml_max_tool_start_len();
+                size_t hold = syn ? strlen(syn->tool_calls_start) : dsml_max_tool_start_len();
                 dt->pos = raw_len > hold ? raw_len - hold : 0;
                 dt->decode = DSML_DECODE_OUTSIDE;
                 return;
@@ -7799,6 +7871,7 @@ structural:
                 size_t tag_after = (size_t)(tag_end - raw) + 1;
                 bool string_value = dt->model_syntax == SERVER_MODEL_SYNTAX_GLM ||
                     dt->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+                    dt->model_syntax == SERVER_MODEL_SYNTAX_HY4 ||
                     dsml_attr_is_string_true(raw, raw_len, tag_start, tag_after);
                 dt->pos = tag_after;
                 if (string_value) {
@@ -7823,8 +7896,8 @@ structural:
                 return;
             }
 
-            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
-                /* GLM puts function and argument names between tags. */
+            if (dt->model_syntax == SERVER_MODEL_SYNTAX_GLM || dt->model_syntax == SERVER_MODEL_SYNTAX_HY4) {
+                /* These grammars put function and argument names between tags. */
                 dt->pos++;
                 continue;
             }
@@ -12549,6 +12622,16 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     if (r && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         return build_invalid_qwen_tool_error_suffix(r, thinking, detail);
     }
+    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_HY4) {
+        buf out = {0};
+        if (thinking && thinking->inside) buf_puts(&out, HY4_THINK_CLOSE);
+        buf_puts(&out, HY4_CHAT_END HY4_CHAT_START "tool" HY4_CHAT_MIDDLE HY4_RESULT_OPEN);
+        append_glm_tag_body_text(&out, detail ? detail : "Invalid tool call. Retry using the tool call format.",
+                                 HY4_RESULT_CLOSE);
+        buf_puts(&out, HY4_RESULT_CLOSE HY4_CHAT_END HY4_CHAT_START "assistant" HY4_CHAT_MIDDLE HY4_THINK_OPEN);
+        if (!ds4_think_mode_enabled(r->think_mode)) buf_puts(&out, HY4_THINK_CLOSE);
+        return buf_take(&out);
+    }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
@@ -13069,6 +13152,16 @@ static char *build_thinking_visible_text(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->model_syntax == SERVER_MODEL_SYNTAX_HY4) {
+        const size_t tag = sizeof(HY4_THINK_OPEN) - 1;
+        if (pt_len < tag || strcmp(r->prompt_text + pt_len - tag, HY4_THINK_OPEN)) return NULL;
+        buf visible = {0};
+        buf_append(&visible, r->prompt_text, pt_len);
+        buf_puts(&visible, HY4_THINK_CLOSE);
+        buf_puts(&visible, content ? content : "");
+        buf_puts(&visible, HY4_CHAT_END);
+        return buf_take(&visible);
+    }
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
         /* the next request renders this turn as an empty think block plus the
          * trimmed content, closed by <|im_end|> */
@@ -14262,6 +14355,7 @@ decode_again:
         const int block_start = ds4_session_pos(slot->session);
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+            (!ds4_engine_is_hy4(s->engine) || temperature == 0.0f) &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             if (j->req.ignore_eos) {
@@ -15425,7 +15519,7 @@ static bool send_model(server *s, int fd, const char *id) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    if (ds4_engine_is_deepseek41(s->engine)) {
+    if (ds4_engine_is_deepseek41(s->engine) || ds4_engine_is_hy4(s->engine)) {
         append_model_json(&b, s, server_model_id_from_engine(s->engine));
     } else if (ds4_engine_is_qwen4(s->engine)) {
         append_model_json(&b, s, "qwen3.8-flash-next");
@@ -20948,6 +21042,30 @@ static void test_glm_decode_tracker_boundaries(void) {
     }
 }
 
+static void test_hy4_decode_tracker_boundaries(void) {
+    const char *parts[] = {
+        "A literal <tool_calls> tag in prose. ",
+        HY4_TOOLS_OPEN HY4_TOOL_OPEN "get_weather" HY4_KEY_OPEN "city" HY4_KEY_CLOSE,
+        HY4_VALUE_OPEN "Taipei",
+        HY4_VALUE_CLOSE HY4_TOOL_CLOSE,
+        HY4_TOOLS_CLOSE,
+    };
+    dsml_decode_state expected[] = {DSML_DECODE_OUTSIDE, DSML_DECODE_STRUCTURAL,
+        DSML_DECODE_STRING_BODY, DSML_DECODE_STRUCTURAL, DSML_DECODE_OUTSIDE};
+    dsml_decode_tracker tracker;
+    dsml_decode_tracker_init(&tracker);
+    tracker.model_syntax = SERVER_MODEL_SYNTAX_HY4;
+    buf raw = {0};
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        for (const char *p = parts[i]; *p; p++) {
+            buf_putc(&raw, *p);
+            dsml_decode_tracker_update(&tracker, raw.ptr, raw.len);
+        }
+        TEST_ASSERT(tracker.decode == expected[i]);
+    }
+    buf_free(&raw);
+}
+
 static void test_tool_control_text_inside_arguments(void) {
     const char *body = "literal </tool_call> " DS4_TOOL_CALLS_END " </think> <think>";
     for (int glm = 0; glm <= 1; glm++) {
@@ -23469,6 +23587,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_decode_tracker_split_parameter_close();
     test_glm_decode_tracker_boundaries();
+    test_hy4_decode_tracker_boundaries();
     test_tool_control_text_inside_arguments();
     test_tool_body_escape_round_trip();
     test_tool_memory_max_ids_prunes_oldest();

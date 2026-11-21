@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_hy4_chat.h"
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_tp.h"
@@ -371,6 +372,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
 
 static bool is_rendered_chat_prompt(const char *prompt) {
     static const char *prefixes[] = {
+        HY4_CHAT_START,
         "<｜begin▁of▁sentence｜>",
         "<｜User｜>",
         "[gMASK]",
@@ -517,9 +519,7 @@ static void build_chat_prompt(ds4_engine *engine,
                               ds4_tokens *out) {
     const ds4_think_mode think_mode = cli_effective_think_mode(gen);
     ds4_chat_begin(engine, out);
-    ds4_chat_append_think_prefix(engine, out, think_mode);
-    if (gen->system && gen->system[0])
-        ds4_chat_append_message(engine, out, "system", gen->system);
+    ds4_chat_append_system_prefix(engine, out, gen->system, think_mode);
     ds4_prompt_prefix_append(engine, out, &gen->prefix);
     ds4_chat_append_message(engine, out, "user", gen->prompt ? gen->prompt : "");
     ds4_chat_append_assistant_prefix(engine, out, think_mode);
@@ -1345,7 +1345,7 @@ typedef struct {
     int ctx_size;
     int think_prefix_pos;
     int think_prefix_tokens;
-    bool initial_system_text;
+    const char *initial_system_text;
 } repl_chat;
 
 static void repl_chat_free(repl_chat *chat);
@@ -1411,7 +1411,10 @@ static bool repl_chat_apply_think_prefix(ds4_engine *engine,
                                          repl_chat *chat,
                                          ds4_think_mode mode) {
     ds4_tokens prefix = {0};
-    repl_chat_build_think_prefix(engine, mode, &prefix);
+    if (ds4_engine_is_hy4(engine))
+        ds4_chat_append_system_prefix(engine, &prefix, chat->initial_system_text, mode);
+    else
+        repl_chat_build_think_prefix(engine, mode, &prefix);
     if (ds4_engine_is_deepseek41(engine) && chat->initial_system_text && !prefix.len)
         ds4_chat_append_message(engine, &prefix, "system", "");
 
@@ -1457,11 +1460,11 @@ static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx
 
 static int repl_chat_init(ds4_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
-    chat->initial_system_text = cfg->gen.system && cfg->gen.system[0];
+    chat->initial_system_text = cfg->gen.system && cfg->gen.system[0] ? cfg->gen.system : NULL;
     ds4_chat_begin(engine, &chat->transcript);
     chat->think_prefix_pos = chat->transcript.len;
     repl_chat_apply_think_prefix(engine, chat, cli_effective_think_mode(&cfg->gen));
-    if (cfg->gen.system && cfg->gen.system[0]) {
+    if (!ds4_engine_is_hy4(engine) && chat->initial_system_text) {
         ds4_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
     ds4_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);

@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
         (ds4_think_mode)(DS4_THINK_LEVEL_BASE + 25), DS4_THINK_MAX,
         (ds4_think_mode)DS4_THINK_LEVEL_BASE, DS4_THINK_HIGH, DS4_THINK_NONE};
     for (int system = 0; system < 2; system++) {
-        repl_chat chat = {.initial_system_text = system != 0};
+        repl_chat chat = {.initial_system_text = system ? "System text." : NULL};
         ds4_chat_begin(engine, &chat.transcript);
         chat.think_prefix_pos = chat.transcript.len;
         repl_chat_apply_think_prefix(engine, &chat, modes[0]);

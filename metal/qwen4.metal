@@ -4323,7 +4323,7 @@ static inline float qwen4_cb_dot16(device const uchar *blk, uint il, thread cons
     }
 }
 
-template <uint T, uint BB>
+template <uint T, uint BB, bool HY4 = false>
 kernel void kernel_qwen4_moe_mid_cb(
         constant ds4_metal_args_qwen4_moe & args,
         device const char    *gate_base,
@@ -4384,13 +4384,18 @@ kernel void kernel_qwen4_moe_mid_cb(
         }
     }
     for (uint r = 0; r < NR; r++) {
-        const float g = simd_sum(sg[r]), u = simd_sum(su[r]);
+        float g = simd_sum(sg[r]), u = simd_sum(su[r]);
+        if constexpr (HY4) {
+            g = min(g, 10.0f);
+            u = clamp(u, -10.0f, 10.0f);
+        }
         if (tiisg == 0 && row0 + r < args.out_rows) out[row0 + r] = qwen4_silu(g) * u;
     }
 }
 
 typedef decltype(kernel_qwen4_moe_mid_cb<16, 66>) qwen4_moe_mid_cb_t;
 template [[host_name("kernel_qwen4_moe_mid_cb_iq2_xxs")]] kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<16, 66>;
+template [[host_name("kernel_hy4_expert_mid_iq2_xxs")]] kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<16, 66, true>;
 template [[host_name("kernel_qwen4_moe_mid_cb_iq2_xs")]]  kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<17, 74>;
 template [[host_name("kernel_qwen4_moe_mid_cb_iq2_s")]]   kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<22, 82>;
 template [[host_name("kernel_qwen4_moe_mid_cb_iq3_xxs")]] kernel qwen4_moe_mid_cb_t kernel_qwen4_moe_mid_cb<18, 98>;
@@ -5014,6 +5019,17 @@ static inline uint qwen4_moe_mm_expert(constant ds4_metal_args_qwen4_moe_mm &arg
     return grid_expert < args.n_active_expert ? args.active_expert[grid_expert] : args.n_expert;
 }
 
+constant float qwen4_moe_clamp [[function_constant(908)]];
+
+static inline float qwen4_moe_swiglu(float gate, float up) {
+    if (is_function_constant_defined(qwen4_moe_clamp)) {
+        const float limit = qwen4_moe_clamp;
+        gate = min(gate, limit);
+        up = clamp(up, -limit, limit);
+    }
+    return qwen4_silu(gate) * up;
+}
+
 /* Threadgroup -> (row block, first tile).  Expert-major order keeps one
  * expert's tiles adjacent so its rows are reused from cache; the K loop and
  * accumulation order of every tile are unchanged. */
@@ -5592,11 +5608,11 @@ static inline void qwen4_moe_mm_mid_impl(
                 if constexpr (HALF_SHADOW) {
                     /* Round the completed FP32 activation, exactly where
                      * the down kernel would round its float mid operand. */
-                    const float v = qwen4_silu(g) * u;
+                    const float v = qwen4_moe_swiglu(g, u);
                     mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = v;
                     mid_shadow[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = (half)v;
                 } else {
-                    mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = qwen4_silu(g) * u;
+                    mid[((uint64_t)t * args.n_out + slot) * args.out_rows + row] = qwen4_moe_swiglu(g, u);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5826,7 +5842,7 @@ static inline void qwen4_moe_reg_tile(
                 for (uint el = 0; el < 2; el++) {
                     if (!live[f] || !ok[j][el]) continue;
                     if constexpr (NA == 2) {
-                        const float v = qwen4_silu(acc[0][f][j][el]) * acc[NA - 1][f][j][el];
+                        const float v = qwen4_moe_swiglu(acc[0][f][j][el], acc[NA - 1][f][j][el]);
                         dst[out[j][el] + row[f]] = v;
                         if constexpr (H) dsth[out[j][el] + row[f]] = (half)v;
                     } else {
@@ -6368,7 +6384,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 #pragma unroll
-        for (uint16_t i = 0; i < cG.get_capacity(); ++i) { if (cG.is_valid_element(i)) cG[i] = qwen4_silu(cG[i]) * cU[i]; }
+        for (uint16_t i = 0; i < cG.get_capacity(); ++i) { if (cG.is_valid_element(i)) cG[i] = qwen4_moe_swiglu(cG[i], cU[i]); }
         {
             auto tC = tensor(Cs, dextents<int32_t, 2>(NR0, NR1));
             auto mC = tC.slice(0, 0);

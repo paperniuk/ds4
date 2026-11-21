@@ -49,7 +49,11 @@ usage: dstar <command> [options]
                          A second quant reuses the 27 GB n-gram table of
                          the first
   pull NAME              download another model into ./gguf (see: dstar models)
-  models                 list the other models ds4 can run
+  models                 list downloadable models
+  serve hy4              serve the cached Hy4 Flash Maya-XS text GGUF
+  chat hy4               chat with the cached Hy4 Flash Maya-XS text GGUF
+  serve hy4 --dfly2      enable DFly2 for API requests with temperature 0
+  chat hy4 --dfly2       enable DFly2 and use greedy decoding
   serve [options]        start the server on http://$HOST:$PORT/v1
       --ctx N            context: 131k, 262k (default), 400k, 524k or a number
       --quant q2|iq3|iq3s
@@ -282,6 +286,20 @@ other_models_on_disk() {
 
 model_path() {
     local found n
+    case "$1" in
+        hy4|hy4-flash|hy4-maya-xs)
+            local hub root revision part
+            hub=${HF_HUB_CACHE:-${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}/hub}
+            root=$hub/models--peasantsmith--Hy4-Flash-Maya-GGUF
+            [ -r "$root/refs/main" ] || die "Maya-XS is missing from the Hugging Face cache"
+            revision=$(cat "$root/refs/main") || return 1
+            part=$root/snapshots/$revision/Maya-XS/Hy4-Flash-Maya-XS-IQ2_XXS
+            [ -r "$part-00001-of-00002.gguf" ] && [ -r "$part-00002-of-00002.gguf" ] ||
+                die "both Maya-XS IQ2_XXS GGUF shards are required"
+            echo "$(cd "$(dirname "$part")" && pwd)/$(basename "$part")-00001-of-00002.gguf"
+            return
+            ;;
+    esac
     if [ -f "$1" ] && [ "${1%.gguf}" != "$1" ]; then
         echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
         return
@@ -291,6 +309,18 @@ model_path() {
     [ "$n" != 0 ] || die "no model file or name matches: $1"
     [ "$n" = 1 ] || die "several models match $1, give the file: $(printf '\n%s' "$found")"
     echo "$found"
+}
+
+hy4_draft_path() {
+    case ${1##*/} in
+        Hy4-Flash-Maya-XS-IQ2_XXS-00001-of-00002.gguf) ;;
+        *) die "--dfly2 requires the Maya-XS IQ2_XXS model" ;;
+    esac
+    local filename=Hy4-Flash-Maya-XS-drafter.dfly2
+    local draft=${1%/*}/$filename
+    [ -r "$draft" ] || draft=${XDG_CACHE_HOME:-$HOME/.cache}/dstar/hy4/$filename
+    [ -r "$draft" ] || die "Maya-XS DFly2 is missing; place $filename beside the GGUF or in the dstar cache"
+    echo "$draft"
 }
 
 # The model to run when none is named: DSTAR_MODEL, else Flash-Next when it
@@ -346,7 +376,7 @@ serve_other() {
 }
 
 cmd_serve() {
-    local ctx="" mtp=1 fast_mtp=0 vision=1 dry=0 model="" power="" ane=0 dflash=0
+    local ctx="" mtp=1 fast_mtp=0 vision=1 dry=0 model="" power="" ane=0 dflash=0 dfly=0
     while [ $# -gt 0 ]; do
         case $1 in
             --ctx) [ $# -ge 2 ] || die "--ctx needs a value"; ctx=$(parse_ctx "$2"); shift ;;
@@ -354,6 +384,7 @@ cmd_serve() {
             --lan) HOST=0.0.0.0 ;;
             --no-mtp) mtp=0 ;;
             --fast-mtp) fast_mtp=1 ;;
+            --dfly2) dfly=1 ;;
             --no-vision) vision=0 ;;
             --ane) ane=1; ANE_GIB=0.9 ;;
             --dflash) dflash=1; DFL_GIB=2.1 ;;
@@ -371,6 +402,11 @@ cmd_serve() {
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     [ -n "$model" ] || model=$(default_model) || exit 1
+    if [ "$dfly" = 1 ]; then
+        local draft
+        draft=$(hy4_draft_path "$model") || exit 1
+        set -- --mtp-model "$draft" "$@"
+    fi
     if [ -n "$model" ]; then serve_other "$model" "$ctx" "$dry" "$@"; return; fi
     pick_quant
     locate_files
@@ -456,7 +492,7 @@ cmd_serve() {
 }
 
 cmd_chat() {
-    local model="" power="" dflash=0
+    local model="" power="" dflash=0 dfly=0
     while :; do
         case ${1:-} in
             --quant) [ $# -ge 2 ] || die "--quant needs q2, iq3 or iq3s"; QUANT=$2; shift ;;
@@ -471,10 +507,16 @@ cmd_chat() {
         ""|-*) ;;
         *) model=$(model_path "$1") || exit 1; shift ;;
     esac
+    if [ "${1:-}" = --dfly2 ]; then dfly=1; shift; fi
     if [ "${1:-}" = -- ]; then shift; fi
     if [ -n "$power" ]; then set -- --power "$power" "$@"; fi
     check_machine
     [ -n "$model" ] || model=$(default_model) || exit 1
+    if [ "$dfly" = 1 ]; then
+        local draft
+        draft=$(hy4_draft_path "$model") || exit 1
+        set -- --mtp-model "$draft" --temp 0 "$@"
+    fi
     if [ -n "$model" ]; then
         ensure_binaries
         case " $* " in

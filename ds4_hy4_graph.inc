@@ -65,6 +65,7 @@ typedef struct {
 #undef HY4_FIELD
     float *engram_staging;
     uint32_t cap, ctx, ring, pending_ring;
+    bool decode_attention;
     hy4_draft_graph *draft;
 } ds4_hy4_graph;
 
@@ -78,12 +79,22 @@ static uint64_t hy4_index_score_bytes(uint32_t ctx, uint32_t cap) {
     return ctx > 2048 ? (uint64_t)cap * (ctx / 4) * sizeof(float) : 0;
 }
 
-// The 32-head sparse layers select at most 2048 keys. Each partition
-// carries its 512 value sums, softmax maximum and denominator.
-static uint64_t hy4_attention_partial_bytes(uint32_t ctx) {
-    if (ctx < 512) return 0;
-    const uint32_t keys = ctx < 2048 ? ctx : 2048;
-    return (uint64_t)32 * ((keys + 31) / 32) * 514 * sizeof(float);
+static bool hy4_use_decode_attention(void) {
+    const char *enabled = getenv("DS4_HY4_DECODE_ATTN");
+    return !enabled || strcmp(enabled, "0") != 0;
+}
+
+// Each partition carries 512 value sums, a softmax maximum and denominator.
+// Sparse layers have 32 heads and up to 2048 keys; windowed layers have 64 and up to 512.
+static uint64_t hy4_attention_partial_bytes(uint32_t ctx, bool decode_attention) {
+    const uint32_t sparse_keys = ctx < 2048 ? ctx : 2048;
+    const uint32_t window_keys = ctx < HY4_WINDOW ? ctx : HY4_WINDOW;
+    uint32_t partitions = ctx >= 512 ? 32 * ((sparse_keys + 31) / 32) : 0;
+    if (ctx >= 128 && decode_attention) {
+        const uint32_t window_partitions = 64 * ((window_keys + 31) / 32);
+        if (window_partitions > partitions) partitions = window_partitions;
+    }
+    return (uint64_t)partitions * 514 * sizeof(float);
 }
 
 static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested) {
@@ -104,7 +115,7 @@ static ds4_context_memory hy4_context_memory(uint32_t ctx, uint32_t requested) {
     HY4_SCRATCH_ROWS(HY4_PRICE)
 #undef HY4_PRICE
     m.scratch_bytes += (cap * HY4_ENGRAM_LAYERS * HY4_LATENT + HY4_VOCAB) * sizeof(float) + HY4_EXPERTS * sizeof(int32_t);
-    m.scratch_bytes += hy4_attention_partial_bytes(ctx);
+    m.scratch_bytes += hy4_attention_partial_bytes(ctx, hy4_use_decode_attention());
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;
     return m;
 }
@@ -190,8 +201,10 @@ static ds4_hy4_graph *hy4_graph_alloc(uint32_t ctx, uint32_t requested, bool dra
         g->scores = ds4_gpu_tensor_alloc(score_bytes);
         if (!g->scores) goto fail;
     }
-    if (hy4_attention_partial_bytes(ctx)) {
-        g->attention_partials = ds4_gpu_tensor_alloc(hy4_attention_partial_bytes(ctx));
+    g->decode_attention = hy4_use_decode_attention();
+    const uint64_t attention_bytes = hy4_attention_partial_bytes(ctx, g->decode_attention);
+    if (attention_bytes) {
+        g->attention_partials = ds4_gpu_tensor_alloc(attention_bytes);
         if (!g->attention_partials) goto fail;
     }
     g->logits = ds4_gpu_tensor_alloc((uint64_t)HY4_VOCAB * sizeof(float));
@@ -257,6 +270,12 @@ static bool hy4_head_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tenso
     const uint32_t out_dim = w->dim[1];
     const ds4_hy4_args a = {.rows = n, .width = w->dim[0], .heads = heads, .type = w->type,
                            .row_bytes = w->bytes / (heads * out_dim)};
+    const char *head_mv = getenv("DS4_HY4_DECODE_HEAD_MV");
+    if (n == 1 && (!head_mv || strcmp(head_mv, "0") != 0) &&
+        ((a.width == 192 && out_dim == 512 && a.type == DS4_TENSOR_Q8_0) ||
+         (a.width == 512 && out_dim == 256 && (a.type == DS4_TENSOR_Q8_0 || a.type == DS4_TENSOR_Q6_K)))) {
+        return HY4_OP("head_mv", a, out_dim / 16, heads, 1, 128, HY4_T(in), HY4_W(w), HY4_T(out));
+    }
     if (n > 1) {
         const char *row_mm = getenv("DS4_HY4_ROW_HEAD_MM");
         if (!row_mm || strcmp(row_mm, "1") != 0) {
@@ -462,13 +481,18 @@ static bool hy4_attention(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_
     if (!hy4_head_mm(m, g->absorbed, l->kb, g->q, heads, n))
         return false;
     a.type = sparse;
-    if (sparse && n == 1 && pos >= 511) {
-        const uint32_t count = pos < 2048 ? pos + 1 : 2045 + pos % 4;
+    const bool tiled_decode = n == 1 && pos >= 127 && g->decode_attention;
+    if (tiled_decode || (sparse && n == 1 && pos >= 511)) {
+        const uint32_t count = sparse ? (pos < 2048 ? pos + 1 : 2045 + pos % 4) :
+                                        (pos < HY4_WINDOW ? pos + 1 : HY4_WINDOW);
         ds4_hy4_args split = a;
         split.groups = (count + 31) / 32;
-        if (!HY4_OP("attention_partial", split, split.groups, heads / 4, 1, 128,
-                    HY4_T(g->absorbed), HY4_T(g->q), HY4_T(c->kv), HY4_T(g->selected),
-                    HY4_W(l->sink), HY4_T(g->attention_partials)) ||
+        const char *partial = tiled_decode ? "kernel_hy4_attention_decode_partial" :
+                                             "kernel_hy4_attention_partial";
+        if (!ds4_gpu_hy4_dispatch(partial, &split, m->map, m->size,
+                   (const ds4_hy4_binding[]){HY4_T(g->absorbed), HY4_T(g->q), HY4_T(c->kv),
+                       HY4_T(g->selected), HY4_W(l->sink), HY4_T(g->attention_partials)},
+                   6, split.groups, heads / 4, 1, 128) ||
             !HY4_OP("attention_merge", split, heads, 1, 1, 128,
                     HY4_T(g->attention_partials), HY4_T(g->attended))) return false;
     } else if (!HY4_OP("attention", a, heads, n, 1, 128, HY4_T(g->absorbed), HY4_T(g->q), HY4_T(c->kv),
@@ -490,6 +514,7 @@ static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weight
 
     if (!l->router) return hy4_norm(m, g->branch, l->ffn_post, g->shared, n);
     const hy4_ffn_weights *e = &l->experts;
+    const char *mid_r4 = getenv("DS4_HY4_DECODE_EXPERT_MID_R4");
     const ds4_hy4_args a = {.rows = n, .type = e->gate->type,
                              .row_bytes = e->gate->bytes / (HY4_EXPERTS * HY4_LATENT)};
     if (!hy4_mm(m, g->router, l->router, g->norm, n) ||
@@ -499,26 +524,38 @@ static bool hy4_ffn(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_weight
     const bool scalar = getenv("DS4_HY4_SCALAR_EXPERTS") != NULL;
     const bool tiled = n >= 32 && !scalar;
     const bool codebook = !scalar && getenv("DS4_HY4_GENERIC_DECODE") == NULL;
+    const bool down_iq2 = e->down->type == DS4_TENSOR_IQ2_XXS && codebook &&
+                          getenv("DS4_HY4_GENERIC_EXPERT_DOWN") == NULL;
+    const char *down_reduce = getenv("DS4_HY4_DECODE_EXPERT_DOWN_REDUCE");
+    const bool fused_down = down_iq2 && n == 1 && (!down_reduce || strcmp(down_reduce, "0") != 0);
     const ds4_hy4_args down = {.rows = n, .row_bytes = e->down->bytes / (HY4_EXPERTS * HY4_LATENT)};
     const bool experts_ok = tiled ?
         ds4_gpu_hy4_expert_prefill(g->expert_mid, g->expert_down, g->latent, g->experts,
                                     g->expert_lists, g->expert_counts, m->map, m->size,
                                     e->gate->abs_offset, e->up->abs_offset, e->down->abs_offset,
                                     e->gate->type, e->down->type, n) :
-        (e->gate->type == DS4_TENSOR_IQ2_XXS && codebook ?
+        (n == 1 && e->gate->type == DS4_TENSOR_IQ2_XXS && codebook &&
+             (!mid_r4 || strcmp(mid_r4, "0") != 0) ?
+            HY4_OP("expert_mid_iq2_xxs_r4", a, HY4_LATENT / 16, HY4_ACTIVE, 1, 128,
+                     HY4_T(g->latent), HY4_T(g->experts), HY4_W(e->gate), HY4_W(e->up), HY4_T(g->expert_mid)) :
+         e->gate->type == DS4_TENSOR_IQ2_XXS && codebook ?
             ds4_gpu_hy4_expert_mid(g->expert_mid, g->latent, g->experts, m->map, m->size,
                                    e->gate->abs_offset, e->up->abs_offset, n) :
             HY4_OP("expert_mid", a, HY4_LATENT / 8, HY4_ACTIVE, n, 256,
                      HY4_T(g->latent), HY4_T(g->experts), HY4_W(e->gate), HY4_W(e->up), HY4_T(g->expert_mid))) &&
-        (e->down->type == DS4_TENSOR_IQ2_XXS && codebook && getenv("DS4_HY4_GENERIC_EXPERT_DOWN") == NULL ?
+        (fused_down ?
+            HY4_OP("expert_down_reduce_iq2_xxs", down, HY4_LATENT / 4, 1, 1, 256,
+                   HY4_T(g->expert_mid), HY4_T(g->experts), HY4_W(e->down),
+                   HY4_T(g->expert_probs), HY4_T(g->latent)) :
+         down_iq2 ?
             HY4_OP("expert_down_iq2_xxs", down, HY4_LATENT / 8, HY4_ACTIVE, n, 128,
                    HY4_T(g->expert_mid), HY4_T(g->experts), HY4_W(e->down), HY4_T(g->expert_down)) :
             ds4_gpu_qwen4_moe_down_tensor(g->expert_down, g->expert_mid, g->experts,
                                      m->map, m->size, e->down->abs_offset, e->down->type,
                                      HY4_EXPERTS, n, HY4_ACTIVE, HY4_LATENT, HY4_LATENT, 0, UINT32_MAX));
     return experts_ok &&
-           ds4_gpu_qwen4_moe_reduce_tensor(g->latent, g->expert_down, g->expert_probs,
-                                           NULL, NULL, NULL, NULL, n, HY4_ACTIVE, HY4_ACTIVE, HY4_LATENT, 0) &&
+           (fused_down || ds4_gpu_qwen4_moe_reduce_tensor(g->latent, g->expert_down, g->expert_probs,
+                                           NULL, NULL, NULL, NULL, n, HY4_ACTIVE, HY4_ACTIVE, HY4_LATENT, 0)) &&
            hy4_mm(m, g->branch, l->latent_out, g->latent, n) &&
            ds4_gpu_add_tensor(g->branch, g->branch, g->shared, n * HY4_DIM) &&
            hy4_norm(m, g->branch, l->ffn_post, g->branch, n);

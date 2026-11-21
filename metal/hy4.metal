@@ -144,6 +144,47 @@ kernel void kernel_hy4_store(constant hy4_args &a,
     out[513 + 2*lane] = half(v.y);
 }
 
+// Eight lanes own one output row. Four independent rows share each SIMD
+// group, including for the short 192-element key projection.
+kernel void kernel_hy4_head_mv(constant hy4_args &a,
+                              device const float4 *in, device const char *weight, device float *out,
+                              uint2 id [[threadgroup_position_in_grid]],
+                              ushort lane [[thread_index_in_simdgroup]],
+                              ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const uint col = lane % 8;
+    const uint row = id.x * 16 + sg * 4 + lane / 8;
+    const bool key = a.width == 192;
+    const uint out_dim = key ? 512 : 256;
+    device const float4 *x = in + id.y * (key ? 64 : 128);
+    device const char *w = weight + (ulong(id.y) * out_dim + row) * a.row_bytes;
+    float sum = 0.0f;
+    if (a.type == 8) {
+        for (uint block = 0; block < a.width / 32; block++) {
+            device const char *b = w + block * 34;
+            const char4 q = *(device const packed_char4 *)(b + 2 + 4 * col);
+            sum += float(*(device const half *)b) * dot(float4(q), x[block * 8 + col]);
+        }
+    } else {
+        const short h = col / 4, part = col % 4;
+        for (uint block = 0; block < a.width / 256; block++) {
+            device const float4 *src = x + block * 64 + h * 32 + part * 2;
+            float4 y[1][8];
+#pragma unroll
+            for (uint k = 0; k < 4; k++) {
+                y[0][2 * k] = src[8 * k].xzyw;
+                y[0][2 * k + 1] = src[8 * k + 1].xzyw;
+            }
+            float partial[1];
+            ds4q_q6_K_dotn<1>((device const block_q6_K *)w + block, y, h, part, partial);
+            sum += partial[0];
+        }
+    }
+    sum += simd_shuffle_xor(sum, 1);
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    if (col == 0) out[id.y * out_dim + row] = sum;
+}
+
 // Reuse the DS4 quant row dot for MLA's two per-head projections.
 kernel void kernel_hy4_head_mm(constant hy4_args &a,
                               device const float *in, device const char *weight, device float *out,
@@ -411,6 +452,81 @@ kernel void kernel_hy4_attention_partial(constant hy4_args &a,
     if (!lane) { dst[512] = m; dst[513] = den; }
 }
 
+// Process contiguous partitions of 32 keys, sharing an eight-key tile
+// across four heads. One lane per key computes its tile softmax weight.
+kernel void kernel_hy4_attention_decode_partial(constant hy4_args &a,
+                                                device const float4 *absorbed, device const float *q,
+                                                device const half4 *cache, device const int *selected,
+                                                device const float *sink, device float *out,
+                                                uint2 id [[threadgroup_position_in_grid]],
+                                                uint tid [[thread_index_in_threadgroup]],
+                                                uint lane [[thread_index_in_simdgroup]],
+                                                uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint head = id.y * 4 + sg;
+    const uint start = a.type || a.pos < 511 ? 0 : a.pos - 511;
+    const bool indexed = a.type && a.pos >= 2048;
+    const uint tail = a.pos / 4 * 4;
+    const uint count = indexed ? 2045 + a.pos % 4 : a.pos - start + 1;
+    const uint end = min((id.x + 1) * 32, count);
+    device const float4 *z = absorbed + head * 128;
+    device const float *r = q + head * 256 + 192;
+    float4 query[4], value[4] = {};
+#pragma unroll
+    for (uint d = 0; d < 4; d++) query[d] = z[d * 32 + lane];
+    const float r0 = r[lane], r1 = r[lane + 32];
+    float best = id.x == 0 ? sink[head] : -INFINITY;
+    float den = id.x == 0 ? 1.0f : 0.0f;
+    threadgroup half4 keys[8][144];
+    threadgroup uint offsets[8];
+
+    for (uint first = id.x * 32; first < end; first += 8) {
+        const uint live = min(8u, end - first);
+        if (tid < live) {
+            const uint i = first + tid;
+            const uint token = !indexed ? start + i :
+                               i < 2044 ? uint(selected[i / 4]) * 4 + i % 4 : tail + i - 2044;
+            offsets[tid] = token % a.capacity;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < live * 144; e += 128) {
+            const uint k = e / 144, d = e % 144;
+            keys[k][d] = cache[ulong(offsets[k]) * 144 + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float score = -INFINITY;
+        for (uint k = 0; k < live; k++) {
+            const threadgroup half *rope = (const threadgroup half *)(keys[k] + 128);
+            float dot_product = r0 * float(rope[lane]) + r1 * float(rope[lane + 32]);
+#pragma unroll
+            for (uint d = 0; d < 4; d++)
+                dot_product += dot(query[d], float4(keys[k][d * 32 + lane]));
+            const float s = simd_sum(dot_product) * (1.0f / 16.0f);
+            if (lane == k) score = s;
+        }
+        const float next = max(best, simd_max(score));
+        const float keep = exp(best - next);
+        const float prob = lane < live ? exp(score - next) : 0.0f;
+        den = den * keep + simd_sum(prob);
+        best = next;
+#pragma unroll
+        for (uint d = 0; d < 4; d++) value[d] *= keep;
+        for (uint k = 0; k < live; k++) {
+            const float weight = simd_shuffle(prob, k);
+#pragma unroll
+            for (uint d = 0; d < 4; d++) value[d] += weight * float4(keys[k][d * 32 + lane]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // The 514-float partition stride is only half a float4 aligned.
+    device float *dst = out + (head * a.groups + id.x) * 514;
+#pragma unroll
+    for (uint d = 0; d < 4; d++)
+#pragma unroll
+        for (uint j = 0; j < 4; j++) dst[128 * d + 4 * lane + j] = value[d][j];
+    if (lane == 0) { dst[512] = best; dst[513] = den; }
+}
+
 kernel void kernel_hy4_attention_merge(constant hy4_args &a, device const float *partial,
                                        device float *out, uint head [[threadgroup_position_in_grid]],
                                        uint tid [[thread_index_in_threadgroup]]) {
@@ -479,6 +595,70 @@ kernel void kernel_hy4_router(constant hy4_args &a,
         for (uint i = 0; i < 16; i++) weights[row * 16 + i] *= 3.998f / max(sum, 1e-20f);
 }
 
+// Split the sign operation into two 32-bit byte vectors. No byte can
+// overflow into the next one: the IQ2 grid magnitudes are nonzero.
+static inline float hy4_iq2_dot8(uint grid, uint signs, float4 x) {
+    const uint packed = (grid ^ signs) + (signs & 0x01010101u);
+    return dot(float4(as_type<char4>(packed)), x);
+}
+
+static inline float hy4_iq2_mid_dot16(device const uchar *block, uint col,
+                                     thread const float4 (&x)[4], threadgroup const ulong *table) {
+    // The IQ2 block stride is 66 bytes, so the packed load is only 2-byte aligned.
+    const ushort4 words = *(device const packed_ushort4 *)(block + 2 + (col / 2) * 8);
+    const uint2 codes = as_type<uint2>(words);
+    const uint half_index = col % 2;
+    const uint grids = codes.x >> (half_index * 16);
+    const uint signs = codes.y >> (half_index * 14);
+    float sum = 0.0f;
+#pragma unroll
+    for (uint i = 0; i < 2; i++) {
+        const uint2 grid = as_type<uint2>(qwen4_cb_grid<16>((grids >> (8 * i)) & 255u, table));
+        const uint2 mask = as_type<uint2>(qwen4_cb_mask<16>((signs >> (7 * i)) & 127u, table));
+        sum += hy4_iq2_dot8(grid.x, mask.x, x[2 * i]) +
+               hy4_iq2_dot8(grid.y, mask.y, x[2 * i + 1]);
+    }
+    const float scale = float(*(device const half *)block) * (0.5f + float(codes.y >> 28)) * 0.25f;
+    return scale * sum;
+}
+
+// Four gate/up output rows reuse one vector of activations in each SIMD
+// group. Keep the grid and sign masks in threadgroup memory as in Qwen.
+kernel void kernel_hy4_expert_mid_iq2_xxs_r4(constant hy4_args &a,
+                                           device const float4 *x, device const int *ids,
+                                           device const uchar *gate, device const uchar *up,
+                                           device float *mid,
+                                           uint2 id [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]],
+                                           uint sg [[simdgroup_index_in_threadgroup]],
+                                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup ulong table[128 + 256];
+    qwen4_cb_load_tables<16>(table, tid, 128);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row = (id.x * 4 + sg) * 4;
+    const ulong offset = (ulong(ids[id.y]) * 1536 + row) * a.row_bytes;
+    float g[4] = {}, u[4] = {};
+    const uint col = lane % 16;
+#pragma unroll
+    for (uint step = 0; step < 3; step++) {
+        const uint block = lane / 16 + 2 * step;
+        device const float4 *p = x + block * 64 + col * 4;
+        const float4 y[4] = {p[0], p[1], p[2], p[3]};
+#pragma unroll
+        for (uint r = 0; r < 4; r++) {
+            const ulong off = offset + r * a.row_bytes + block * 66;
+            g[r] += hy4_iq2_mid_dot16(gate + off, col, y, table);
+            u[r] += hy4_iq2_mid_dot16(up + off, col, y, table);
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < 4; r++) {
+        const float gv = min(simd_sum(g[r]), 10.0f);
+        const float uv = clamp(simd_sum(u[r]), -10.0f, 10.0f);
+        if (lane == 0) mid[id.y * 1536 + row + r] = qwen4_silu(gv) * uv;
+    }
+}
+
 // Hy4 clamps routed SwiGLU before the down projection. The shared dense
 // branch has no clamp. Keep this separate from the Qwen expert kernels.
 kernel void kernel_hy4_expert_mid(constant hy4_args &a,
@@ -520,6 +700,49 @@ kernel void kernel_hy4_expert_down_iq2_xxs(constant hy4_args &a,
     if (lane == 0) {
         down[pair * 1536 + row] = y0;
         down[pair * 1536 + row + 1] = y1;
+    }
+}
+
+// Eight SIMD groups cover the 16 routed slots for four output rows.
+// Reduce the slots in the original router order after all dots are ready.
+kernel void kernel_hy4_expert_down_reduce_iq2_xxs(constant hy4_args &a,
+                                                device const float4 *mid, device const int *ids,
+                                                device const uchar *weight, device const float *probs,
+                                                device float *out,
+                                                uint group [[threadgroup_position_in_grid]],
+                                                uint tid [[thread_index_in_threadgroup]],
+                                                uint sg [[simdgroup_index_in_threadgroup]],
+                                                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup ulong table[128 + 256];
+    threadgroup float partial[16][4];
+    qwen4_cb_load_tables<16>(table, tid, 256);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row = group * 4;
+    const uint col = lane % 16;
+    for (uint slot = sg; slot < 16; slot += 8) {
+        const ulong offset = (ulong(ids[slot]) * 1536 + row) * a.row_bytes;
+        device const float4 *x = mid + slot * 384;
+        float sum[4] = {};
+#pragma unroll
+        for (uint step = 0; step < 3; step++) {
+            const uint block = lane / 16 + 2 * step;
+            device const float4 *p = x + block * 64 + col * 4;
+            const float4 y[4] = {p[0], p[1], p[2], p[3]};
+            device const uchar *w = weight + offset + block * 66;
+#pragma unroll
+            for (uint r = 0; r < 4; r++) sum[r] += qwen4_cb_dot16<16>(w + r * a.row_bytes, col, y, table);
+        }
+#pragma unroll
+        for (uint r = 0; r < 4; r++) {
+            const float value = simd_sum(sum[r]);
+            if (lane == 0) partial[slot][r] = value;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4) {
+        float value = 0.0f;
+        for (uint slot = 0; slot < 16; slot++) value += probs[slot] * partial[slot][tid];
+        out[row + tid] = value;
     }
 }
 

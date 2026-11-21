@@ -216,22 +216,32 @@ dstar serve --quant iq3
 
 dstar pull --quant iq3s    # IQ3_S: 83 GB, or 55 GB next to another quant
 dstar serve --quant iq3s
+
+dstar pull --quant coder  # Coder: 59 GB alone, 30 GB next to another quant
+dstar serve --quant coder
 ```
 
-`dstar pull --quant` downloads that quant only, there is no need to fetch
-Q2_0 first. The n-gram shard, the MTP block and the vision encoder are the
-same files for every quant, so a second quant downloads only its own
-weights. Without `--quant`, `dstar serve` takes the quant that is on disk,
-Q2_0 when there are several.
+`dstar pull --quant` downloads the selected quant. Coder keeps half the
+routed experts for code and shares the n-gram shard with the other quants.
+All four also share the MTP block and vision encoder. A second quant only
+downloads its own weights when those files are already present. Without
+`--quant`, `dstar serve` tries the quants on disk in this order: `q2`, `iq3`,
+`iq3s`, `coder`.
 
 | `--quant` | ISTA file | Weights | ISTA task average | LiveCodeBench | Plain | With MTP | Default context on 64 GB |
 |---|---|---|---|---|---|---|---|
 | `q2` | Q2_0 | 35.0 GiB | 89.07 | 81.14 | 35 tok/s | 39 to 47 | 262K |
 | `iq3` | IQ3_XXS | 43.8 GiB | 92.57 | 86.29 | 29 tok/s | 35 | 131K |
 | `iq3s` | IQ3_S | 51.0 GiB | 93.26 | 86.86 | 26 tok/s | 32 to 34 | 32K |
+| `coder` | IQ1_M | 27.6 GiB | see ISTA's card | see ISTA's card | 0.8x q2 | 0.7x q2 | 262K |
 
 The scores are ISTA's own, from their model card. The speeds are M1 Max
-numbers at a short context, on one code prompt for IQ3_S.
+numbers at a short context, on one code prompt for IQ3_S. Coder was
+measured against Q2_0 in one run on a code prompt: 32.5 against 41 tok/s
+plain, 36.7 against 52.9 with MTP. Its experts use quants with slower
+kernels than Q2_0, and the MTP block, trained on the full model, guesses
+less often. `--dflash` works with Coder too: 47 tok/s on a Python prompt,
+where Q2_0 gives 70.
 
 These files keep the experts in IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS and
 many dense projections in IQ3_S, quants that stock ds4 does not load. This

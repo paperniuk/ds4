@@ -36,20 +36,21 @@ what is not specific to M1 is listed in [Which Macs gain](docs/FLASH_NEXT_FORK.m
 ## Qwen3.8-Flash-Next: which quant for your Mac
 
 Qwen3.8-Flash-Next is the main model here and what `dstar pull` downloads.
-ISTA-DASLab publishes it in three sizes (quants); a larger one answers
-better and is slower. `--quant` picks one, in `dstar pull` and in
-`dstar serve`:
+ISTA-DASLab publishes three full model quants and a Coder model with half
+the routed experts. `--quant` picks one in `dstar pull` and `dstar serve`.
 
 | Your Mac | Quant | `--quant` | Weights | Context it runs with |
 |---|---|---|---|---|
 | 64 GB | Q2_0, the fastest | `q2` (default) | 35 GiB | 262K; up to 524K |
 | 64 GB | IQ3_XXS, better answers | `iq3` | 44 GiB | 131K; 262K with `--ctx 262k` |
 | 96 GB or more | IQ3_S, the best file | `iq3s` | 51 GiB | 262K; up to 524K from 128 GB |
+| 48 GB (untested) or 64 GB with the most room for context | IQ1_M, Coder | `coder` | 28 GiB | On 64 GB, 262K by default and up to 524K |
 
-The 64 GB rows are measured on an M1 Max. The IQ3_S row comes from the
-memory plan: on 64 GB that file runs, but only with a 32K context.
-ISTA's LiveCodeBench scores are 81.1, 86.3 and 86.9; speeds are in
-[The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants).
+The Q2_0 and IQ3_XXS rows are measured on an M1 Max. The 96 GB context for
+IQ3_S and the Coder contexts come from the memory plan. On 64 GB, IQ3_S
+defaults to 32K. ISTA's LiveCodeBench scores for the full model quants are
+81.1, 86.3 and 86.9. See [The larger quants](docs/FLASH_NEXT_FORK.md#the-larger-quants)
+for speeds.
 `dstar doctor` prints the largest context each quant can hold on your Mac.
 
 **On 64 GB the GPU memory limit has to be raised for the long contexts**
@@ -167,8 +168,8 @@ it prints the `sudo sysctl` line that unlocks the larger one. MTP and vision are
 
 | Command | What it does |
 |---|---|
-| `dstar pull` | download what is missing into `~/models/flash-next`, resumable; `--quant q2/iq3/iq3s` picks the quant, `--no-vision` skips the encoder |
-| `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
+| `dstar pull` | download what is missing into `~/models/flash-next`, resumable; `--quant q2/iq3/iq3s/coder` picks the quant, `--no-vision` skips the encoder |
+| `dstar serve` | start the server; `--ctx 131k/262k/400k/524k`, `--quant q2/iq3/iq3s/coder`, `--port N`, `--lan`, `--no-mtp`, `--no-vision`, `--power N` |
 | `dstar serve --dry-run` | print the `ds4-server` command and environment instead of running it |
 | `dstar chat` | talk to the model in the terminal |
 | `dstar doctor` | check the machine, the files, the memory limit and which contexts fit |
@@ -203,7 +204,7 @@ Everything after `--` goes to `ds4-server` unchanged. See
 [docs/MODELS.md](docs/MODELS.md) for what fits where.
 
 `DSTAR_MODELS` changes the Flash-Next directory, `DSTAR_QUANT` the default
-quant, `PORT` and `HOST` the address.
+quant (`q2`, `iq3`, `iq3s` or `coder`), `PORT` and `HOST` the address.
 See [docs/CLIENTS.md](docs/CLIENTS.md) for Claude Code and other clients;
 use port 8010 and the context the server was started with.
 

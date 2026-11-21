@@ -1072,12 +1072,11 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
         return true;
     }
     if (!strcmp(s, "low") || !strcmp(s, "minimal")) {
-        /* "minimal" is the smallest non-zero level; callers that need *no*
-         * reasoning must use "none" instead. */
+        /* "minimal" is the smallest non-zero level. */
         *out = DS4_THINK_LOW;
         return true;
     }
-    if (!strcmp(s, "none")) {
+    if (!strcmp(s, "none") || !strcmp(s, "no_think")) {
         *out = DS4_THINK_NONE;
         return true;
     }
@@ -18660,6 +18659,10 @@ static void test_api_thinking_controls_parse(void) {
     mode = DS4_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+
+    openai_effort = "\"no_think\"";
+    TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode) && *openai_effort == '\0');
+    TEST_ASSERT(mode == DS4_THINK_NONE);
 
     const int levels[] = {0, 1, 25, 50, 99, 100};
     for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {

@@ -7555,7 +7555,14 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     config_expect_epsilon("attention.layer_norm_rms_epsilon",
                           required_f32(m, "qwen4exp.attention.layer_norm_rms_epsilon"),
                           DS4_RMS_EPS);
-    config_expect_u32("expert_count", required_u32(m, "qwen4exp.expert_count"), DS4_N_EXPERT);
+    {
+        /* Expert-pruned files (ISTA's Coder keeps 256 of the 512) route over
+         * fewer experts; everything else sizes from the shape. */
+        const uint32_t n_expert = required_u32(m, "qwen4exp.expert_count");
+        if (n_expert < DS4_N_EXPERT && n_expert >= DS4_N_EXPERT_USED && n_expert % 32u == 0)
+            g_ds4_shape.n_expert = n_expert;
+        config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
+    }
     config_expect_u32("expert_used_count", required_u32(m, "qwen4exp.expert_used_count"),
                       DS4_N_EXPERT_USED);
     config_expect_u32("expert_feed_forward_length",

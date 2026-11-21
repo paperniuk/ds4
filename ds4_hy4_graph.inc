@@ -244,6 +244,26 @@ static bool hy4_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
                                        w->type, w->dim[0], w->dim[1], in, n);
 }
 
+/* Prefill MLA head projections. Other weight formats retain the row dot. */
+static bool hy4_head_mm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
+                        const ds4_gpu_tensor *in, uint32_t heads, uint32_t n) {
+    const uint32_t out_dim = w->dim[1];
+    const ds4_hy4_args a = {.rows = n, .width = w->dim[0], .heads = heads, .type = w->type,
+                           .row_bytes = w->bytes / (heads * out_dim)};
+    if (n > 1) {
+        const char *row_mm = getenv("DS4_HY4_ROW_HEAD_MM");
+        if (!row_mm || strcmp(row_mm, "1") != 0) {
+            if (w->type == DS4_TENSOR_Q8_0)
+                return HY4_OP("head_mm_batch_q8_0", a, out_dim / 32, heads, (n + 31) / 32, 128,
+                              HY4_T(in), HY4_W(w), HY4_T(out));
+            if (w->type == DS4_TENSOR_Q6_K)
+                return HY4_OP("head_mm_batch_q6_k", a, out_dim / 32, heads, (n + 31) / 32, 128,
+                              HY4_T(in), HY4_W(w), HY4_T(out));
+        }
+    }
+    return HY4_OP("head_mm", a, out_dim / 4, heads, n, 128, HY4_T(in), HY4_W(w), HY4_T(out));
+}
+
 static bool hy4_norm(const ds4_model *m, ds4_gpu_tensor *out, const ds4_tensor *w,
                      const ds4_gpu_tensor *in, uint32_t n) {
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size, w->abs_offset,
@@ -429,9 +449,7 @@ static bool hy4_attention(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_
         !HY4_OP("store", a, n, 1, 1, 32, HY4_T(g->kv), HY4_W(l->kv_norm), HY4_T(c->kv)) ||
         (sparse && !hy4_index(g, m, l, c, pos, n))) return false;
     a.width = 192;
-    a.type = l->kb->type;
-    a.row_bytes = l->kb->bytes / (heads * 512);
-    if (!HY4_OP("head_mm", a, 128, heads, n, 128, HY4_T(g->q), HY4_W(l->kb), HY4_T(g->absorbed)))
+    if (!hy4_head_mm(m, g->absorbed, l->kb, g->q, heads, n))
         return false;
     a.type = sparse;
     if (sparse && n == 1 && pos >= 511) {
@@ -445,10 +463,7 @@ static bool hy4_attention(ds4_hy4_graph *g, const ds4_model *m, const hy4_layer_
                     HY4_T(g->attention_partials), HY4_T(g->attended))) return false;
     } else if (!HY4_OP("attention", a, heads, n, 1, 128, HY4_T(g->absorbed), HY4_T(g->q), HY4_T(c->kv),
                        HY4_T(g->selected), HY4_W(l->sink), HY4_T(g->attended))) return false;
-    a.width = 512;
-    a.type = l->vb->type;
-    a.row_bytes = l->vb->bytes / (heads * 256);
-    if (!HY4_OP("head_mm", a, 64, heads, n, 128, HY4_T(g->attended), HY4_W(l->vb), HY4_T(g->q)))
+    if (!hy4_head_mm(m, g->q, l->vb, g->attended, heads, n))
         return false;
     a.width = heads * 256;
     return hy4_mm(m, g->gate, l->attn_gate, g->norm, n) &&

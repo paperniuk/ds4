@@ -160,6 +160,94 @@ kernel void kernel_hy4_head_mm(constant hy4_args &a,
     if (lane == 0) out[(row * a.heads + head) * out_dim + d] = value;
 }
 
+// Prefill MLA head projections. A threadgroup covers 32 tokens and 32 outputs
+// of one head. Each SIMD group reuses one 8x8 weight tile across four token tiles.
+template <typename Block, short Chunks, void (*deq)(device const Block *, short, thread float4x4 &)>
+kernel void kernel_hy4_head_mm_batch(constant hy4_args &a,
+                                    device const float *in, device const char *weight, device float *out,
+                                    uint3 id [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+    const uint out_dim = a.width == 192 ? 512 : 256;
+    const uint in_dim = a.width == 192 ? 256 : 512;
+    const uint in_stride = a.heads * in_dim;
+    const uint out_stride = a.heads * out_dim;
+    const uint col0 = id.x * 32, row0 = id.z * 32;
+    const uint tokens = min(a.rows - row0, 32u);
+    const uint row = tid / 4, col = tid % 4 * 8;
+    device const float *src = in + row0 * in_stride + id.y * in_dim;
+    device float *dst = out + row0 * out_stride + id.y * out_dim + col0;
+    threadgroup float4 weights[32][8], inputs[32][8];
+    simdgroup_float8x8 accum[4];
+#pragma unroll
+    for (uint t = 0; t < 4; t++) accum[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (uint k = 0; k < a.width; k += 32) {
+        // Use the same Q6_K chunks as the row dot and the same signed Q8_0 scales.
+        if (tid < 64) {
+            const uint d = tid / 2, c = k / 16 + tid % 2;
+            const ulong offset = (ulong(id.y) * out_dim + col0 + d) * a.row_bytes;
+            device const Block *blocks = (device const Block *)(weight + offset);
+            float4x4 decoded;
+            deq(blocks + c / Chunks, short(c % Chunks), decoded);
+#pragma unroll
+            for (uint i = 0; i < 4; i++)
+                weights[d][(tid % 2) * 4 + i] = decoded[i];
+        }
+        threadgroup float4 *staged = inputs[row] + col / 4;
+        if (row < tokens) {
+            device const float4 *x = (device const float4 *)(src + row * in_stride + k + col);
+            staged[0] = x[0];
+            staged[1] = x[1];
+        } else {
+            staged[0] = staged[1] = float4(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_float8x8 w;
+            simdgroup_load(w, (threadgroup float *)weights[sg * 8] + kk, 32, 0, true);
+#pragma unroll
+            for (uint t = 0; t < 4; t++) {
+                if (t * 8 < tokens) {
+                    simdgroup_float8x8 x_tile;
+                    simdgroup_load(x_tile, (threadgroup float *)inputs[t * 8] + kk, 32, 0, false);
+                    simdgroup_multiply_accumulate(accum[t], x_tile, w, accum[t]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+#pragma unroll
+    for (uint t = 0; t < 4; t++) {
+        if ((t + 1) * 8 <= tokens) {
+            simdgroup_store(accum[t], dst + t * 8 * out_stride + sg * 8, out_stride, 0, false);
+        } else if (t * 8 < tokens) {
+            // Reuse the input tile as scratch for the last partial SIMD tile.
+            simdgroup_store(accum[t], (threadgroup float *)inputs[t * 8] + sg * 8, 32, 0, false);
+        }
+    }
+    const uint tail = tokens & ~7u;
+    if (tail != tokens) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (row >= tail && row < tokens) {
+            device float4 *y = (device float4 *)(dst + row * out_stride + col);
+            const threadgroup float4 *staged = inputs[row] + col / 4;
+            y[0] = staged[0];
+            y[1] = staged[1];
+        }
+    }
+}
+
+template [[host_name("kernel_hy4_head_mm_batch_q8_0")]]
+kernel void kernel_hy4_head_mm_batch<block_q8_0, 2, dequantize_q8_0>(
+    constant hy4_args &, device const float *, device const char *, device float *, uint3, uint, uint);
+template [[host_name("kernel_hy4_head_mm_batch_q6_k")]]
+kernel void kernel_hy4_head_mm_batch<block_q6_K, 16, dequantize_q6_K>(
+    constant hy4_args &, device const float *, device const char *, device float *, uint3, uint, uint);
+
 kernel void kernel_hy4_pool_stage(constant hy4_args &a,
                                  device const float *value, device const float *gate,
                                  device float *ring, uint2 id [[thread_position_in_grid]]) {

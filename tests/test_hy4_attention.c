@@ -7,6 +7,8 @@ enum { HEADS = 32, LATENT = 512, KV = 576, CTX = 2112 };
 
 static uint32_t rng = 1;
 
+static int test_head_mm_batch(void);
+
 static ds4_gpu_tensor *random_tensor(size_t count, bool half_precision) {
     const size_t bytes = count * (half_precision ? sizeof(__fp16) : sizeof(float));
     ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(bytes);
@@ -66,9 +68,60 @@ int main(void) {
             }
         }
     }
+    const int head_mm_ok = test_head_mm_batch();
     ds4_gpu_tensor *owned[] = { z, q, cache, sink, indices, partial, ref, out };
     for (unsigned i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) ds4_gpu_tensor_free(owned[i]);
     ds4_gpu_cleanup();
     if (ok) puts("Hy4 split attention passed at all nine context positions");
-    return ok ? 0 : 1;
+    return ok && head_mm_ok ? 0 : 1;
+}
+
+/* Prefill head projections, including the second head and a partial row tile. */
+static int test_head_mm_batch(void) {
+    enum { ROWS = 35, TEST_HEADS = 2 };
+    const char *kernels[] = {"kernel_hy4_head_mm_batch_q8_0", "kernel_hy4_head_mm_batch_q6_k"};
+    int ok = 1;
+    for (unsigned q6 = 0; q6 < 2 && ok; q6++) {
+        const uint32_t in_dim = q6 ? 512 : 256, out_dim = q6 ? 256 : 512;
+        const uint32_t block_bytes = q6 ? 210 : 34;
+        const uint32_t row_bytes = q6 ? 2 * block_bytes : 6 * block_bytes;
+        const size_t weight_bytes = TEST_HEADS * out_dim * row_bytes;
+        const size_t count = ROWS * TEST_HEADS * out_dim;
+        const ds4_hy4_args a = {.rows = ROWS, .width = q6 ? 512 : 192, .heads = TEST_HEADS,
+                                .type = q6 ? 14 : 8, .row_bytes = row_bytes};
+        ds4_gpu_tensor *x = random_tensor(ROWS * TEST_HEADS * in_dim, false);
+        ds4_gpu_tensor *w = ds4_gpu_tensor_alloc(weight_bytes);
+        ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(count * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(count * sizeof(float));
+        if (!w || !ref || !out) return 0;
+        uint8_t *packed = ds4_gpu_tensor_contents(w);
+        for (size_t i = 0; i < weight_bytes; i++) {
+            rng = 1664525u * rng + 1013904223u;
+            packed[i] = rng >> 24;
+        }
+        for (size_t i = 0; i < weight_bytes; i += block_bytes) {
+            /* Keep each fp16 block scale finite and small. */
+            packed[i + (q6 ? 209 : 1)] = 0x08;
+        }
+        const ds4_hy4_binding single[] = { B(x), B(w), B(ref) };
+        const ds4_hy4_binding batch[] = { B(x), B(w), B(out) };
+        ok = ds4_gpu_hy4_dispatch("kernel_hy4_head_mm", &a, NULL, 0, single, 3,
+                                  out_dim / 4, TEST_HEADS, ROWS, 128) &&
+             ds4_gpu_hy4_dispatch(kernels[q6], &a, NULL, 0, batch, 3,
+                                  out_dim / 32, TEST_HEADS, (ROWS + 31) / 32, 128);
+        const float *expected = ds4_gpu_tensor_contents(ref), *actual = ds4_gpu_tensor_contents(out);
+        for (size_t d = 0; ok && d < count; d++) {
+            if (!isfinite(expected[d]) || !isfinite(actual[d]) ||
+                fabsf(actual[d] - expected[d]) > 4e-5f + 2e-5f * fabsf(expected[d])) {
+                fprintf(stderr, "%s element=%zu expected=%g actual=%g\n", kernels[q6], d, expected[d], actual[d]);
+                ok = 0;
+            }
+        }
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(w);
+        ds4_gpu_tensor_free(ref);
+        ds4_gpu_tensor_free(out);
+    }
+    if (ok) puts("Hy4 batch head projections matched the row kernels");
+    return ok;
 }
